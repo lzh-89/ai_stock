@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ai-stock.t1-validation</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/scripts/scheduled/run_t1_validation.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>46</integer></dict>
+    <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>5</integer></dict>
+    <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>10</integer></dict>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_ROOT__</string>
+  <key>StandardOutPath</key>
+  <string>__PROJECT_ROOT__/logs/launchd-t1-validation.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_ROOT__/logs/launchd-t1-validation.stderr.log</string>
+</dict>
+</plist>

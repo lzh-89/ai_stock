@@ -1,0 +1,12 @@
+# A 股雷达 - 日线缓存定时刷新（Linux / macOS crontab 备选方案）
+# 安装: crontab -e ，把下面两行粘贴进去，并把 /path/to/ai_stock 改成实际路径
+#
+# 每天 12:00 和 16:00 执行
+0 12 * * * /Users/zehui.lin/Documents/workplace/ai_stock/scripts/scheduled/run_daily_kline_cache.sh
+0 16 * * * /Users/zehui.lin/Documents/workplace/ai_stock/scripts/scheduled/run_daily_kline_cache.sh
+
+# T+1 正式推荐与次日验证（脚本内部会跳过周末和不适用的 run）
+40 14 * * * /Users/zehui.lin/Documents/workplace/ai_stock/scripts/scheduled/run_t1_auto.sh
+46 9 * * * /Users/zehui.lin/Documents/workplace/ai_stock/scripts/scheduled/run_t1_validation.sh 09:46
+5 10 * * * /Users/zehui.lin/Documents/workplace/ai_stock/scripts/scheduled/run_t1_validation.sh 10:05
+10 15 * * * /Users/zehui.lin/Documents/workplace/ai_stock/scripts/scheduled/run_t1_validation.sh 15:10

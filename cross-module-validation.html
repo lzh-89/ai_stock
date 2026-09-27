@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>跨模块复盘/验证</title>
+    <link rel="stylesheet" href="./src/ai-full-market-selection.css?v=20260809-fixed-module-nav2" />
+    <link rel="stylesheet" href="./src/cross-module-validation.css?v=20260719-cross-module" />
+  </head>
+  <body>
+    <main class="shell cross-shell">
+      <header class="page-top">
+        <a class="back-link" href="./index.html" title="返回交易工作台" aria-label="返回交易工作台">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11v2H7.8l5.6 5.6L12 20 4 12l8-8 1.4 1.4L7.8 11H20Z"/></svg>
+        </a>
+        <div class="title-block">
+          <span>跨模块复盘/验证</span>
+          <h1>AI 全市场 · T+1 · 个股分析</h1>
+          <p>对齐三套原始结果与后验表现，查看冲突、共振和 DeepSeek 审查，不生成新推荐。</p>
+        </div>
+        <div class="controls">
+          <label>
+            <span>样本上限</span>
+            <input id="sampleLimitInput" type="number" min="50" max="3000" step="50" value="600" />
+          </label>
+          <button id="refreshButton" class="secondary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h8V3l-3.3 3.3Z"/></svg>
+            重新聚合
+          </button>
+          <button id="reviewButton" class="primary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 3 8l9 5 9-5-9-5Zm0 7.2L5.3 7 12 3.8 18.7 7 12 10.2ZM3 11v6l9 5 9-5v-6l-9 5-9-5Z"/></svg>
+            生成 DeepSeek 审查
+          </button>
+        </div>
+      </header>
+
+      <section id="notice" class="notice" hidden></section>
+
+      <section class="stat-grid validation-stat-grid" id="summaryGrid" aria-label="跨模块摘要"></section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>总览</span>
+            <h2>对齐摘要</h2>
+          </div>
+          <small id="summaryMeta">--</small>
+        </div>
+        <div class="validation-meta-grid">
+          <article class="validation-card">
+            <span>规则口径</span>
+            <strong>结果对齐</strong>
+            <small>仅按交易日、股票、模块结果拼成审计记录，不额外改判。</small>
+          </article>
+          <article class="validation-card">
+            <span>审查方式</span>
+            <strong>手动 DeepSeek</strong>
+            <small>只审计原始模块结果和后验表现，不自动调参。</small>
+          </article>
+          <article class="validation-card">
+            <span>输出口径</span>
+            <strong id="auditScopeText">--</strong>
+            <small id="auditWarningText">--</small>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>冲突矩阵</span>
+            <h2>三模块不一致样本</h2>
+          </div>
+          <small id="conflictMeta">--</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>类型</th>
+                <th>样本</th>
+                <th>完成</th>
+                <th>严格统计</th>
+                <th>正收益率</th>
+                <th>平均收益</th>
+                <th>平均超额</th>
+                <th>平均回撤</th>
+              </tr>
+            </thead>
+            <tbody id="conflictStatRows"></tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th>股票</th>
+                <th>类型</th>
+                <th>AI 全市场</th>
+                <th>T+1</th>
+                <th>个股分析</th>
+                <th>后验结果</th>
+              </tr>
+            </thead>
+            <tbody id="conflictRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>共振表现</span>
+            <h2>双模块/三模块共振样本</h2>
+          </div>
+          <small id="confluenceMeta">--</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>类型</th>
+                <th>样本</th>
+                <th>完成</th>
+                <th>严格统计</th>
+                <th>正收益率</th>
+                <th>平均收益</th>
+                <th>平均超额</th>
+                <th>平均回撤</th>
+              </tr>
+            </thead>
+            <tbody id="confluenceStatRows"></tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th>股票</th>
+                <th>类型</th>
+                <th>AI 全市场</th>
+                <th>T+1</th>
+                <th>个股分析</th>
+                <th>后验结果</th>
+              </tr>
+            </thead>
+            <tbody id="confluenceRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>市场分层</span>
+            <h2>按市场状态统计</h2>
+          </div>
+          <small id="marketMeta">--</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>状态</th>
+                <th>样本</th>
+                <th>完成</th>
+                <th>严格统计</th>
+                <th>正收益率</th>
+                <th>平均收益</th>
+                <th>平均超额</th>
+                <th>平均回撤</th>
+              </tr>
+            </thead>
+            <tbody id="marketRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>模块矩阵</span>
+            <h2>模块间覆盖情况</h2>
+          </div>
+          <small id="matrixMeta">--</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>组合</th>
+                <th>样本</th>
+                <th>完成</th>
+                <th>严格统计</th>
+                <th>正收益率</th>
+                <th>平均收益</th>
+                <th>平均超额</th>
+                <th>平均回撤</th>
+              </tr>
+            </thead>
+            <tbody id="matrixRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>收益口径</span>
+            <h2>后验来源拆分</h2>
+          </div>
+          <small id="outcomeBasisMeta">--</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>口径</th>
+                <th>样本</th>
+                <th>完成</th>
+                <th>严格统计</th>
+                <th>正收益率</th>
+                <th>平均收益</th>
+                <th>平均超额</th>
+                <th>平均回撤</th>
+              </tr>
+            </thead>
+            <tbody id="outcomeBasisRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>DeepSeek 审查</span>
+            <h2>审查结论、证据与建议</h2>
+          </div>
+          <small id="reviewMeta">等待触发</small>
+        </div>
+        <div class="validation-review-grid">
+          <article class="validation-review-box">
+            <span>审查结论</span>
+            <strong id="reviewConclusion">--</strong>
+            <small id="reviewConfidence">--</small>
+          </article>
+          <article class="validation-review-box">
+            <span>缺失证据</span>
+            <strong id="reviewMissing">--</strong>
+            <small>DeepSeek 不会自己补齐缺失数据。</small>
+          </article>
+          <article class="validation-review-box">
+            <span>风险提示</span>
+            <strong id="reviewRisk">--</strong>
+            <small>不会自动转成配置变更。</small>
+          </article>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>发现</th>
+                <th>证据</th>
+                <th>影响模块</th>
+                <th>建议</th>
+              </tr>
+            </thead>
+            <tbody id="findingRows"></tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>模块</th>
+                <th>动作</th>
+                <th>建议</th>
+                <th>是否需人工确认</th>
+              </tr>
+            </thead>
+            <tbody id="draftRows"></tbody>
+          </table>
+        </div>
+        <div id="reviewWarnings" class="validation-warning-list"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>规则统计建议</span>
+            <h2>只读优化提示</h2>
+          </div>
+          <small id="suggestionMeta">--</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>来源</th>
+                <th>模块</th>
+                <th>动作</th>
+                <th>证据</th>
+                <th>建议</th>
+              </tr>
+            </thead>
+            <tbody id="suggestionRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>代表样本</span>
+            <h2>冲突 / 共振案例</h2>
+          </div>
+          <small id="caseMeta">--</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th>股票</th>
+                <th>类型</th>
+                <th>AI 全市场</th>
+                <th>T+1</th>
+                <th>个股分析</th>
+                <th>后验结果</th>
+              </tr>
+            </thead>
+            <tbody id="caseRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="./src/module-nav.js?v=20260809-fixed-module-nav"></script>
+    <script src="./src/cross-module-validation.js?v=20260719-cross-module"></script>
+  </body>
+</html>

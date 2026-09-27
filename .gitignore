@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.pyc
+.env
+data/*.sqlite
+data/*.sqlite-*
+logs/
+data/*.json
+/data/app.sqlite.ai-full-market-reset-20260802.bak
+/data
+/docs

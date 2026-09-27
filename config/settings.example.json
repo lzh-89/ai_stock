@@ -1,0 +1,34 @@
+{
+  "market_universe": ["main_board", "chinext"],
+  "include_bse": false,
+  "include_star_market": false,
+  "refresh_minutes": 15,
+  "kline_period": "15m",
+  "scan_scope": "all_plus_watchlist",
+  "preferred_styles": ["pullback", "breakout"],
+  "database_path": "data/app.sqlite",
+  "ai_provider": "deepseek",
+  "ai_model": "deepseek-v4-flash",
+  "ai_base_url": "https://api.deepseek.com",
+  "openai_model": "gpt-5.4-mini",
+  "stock_case_prompt": {
+    "mode": "auto",
+    "minSamples": 800,
+    "minSimilarity": 0.65,
+    "minMatchedCases": 5,
+    "recentFalseBuyWindow": 200,
+    "falseBuyAllowedDegradePoints": 5.0,
+    "falseBuyAbsoluteLimitPct": 25.0,
+    "success3dReturnPct": 3.0,
+    "success10dReturnPct": 6.0,
+    "falseBuyReturnPct": -3.0,
+    "falseBuyDrawdownPct": -5.0,
+    "missed5dReturnPct": 5.0,
+    "caseDedupeWindowDays": 5
+  },
+  "ai_policy": {
+    "allow_direct_trade_instruction": false,
+    "require_risk_disclosure": true,
+    "require_rule_evidence": true
+  }
+}

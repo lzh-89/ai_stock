@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI 全市场历史复盘</title>
+    <link rel="stylesheet" href="./src/ai-full-market-selection.css?v=20260809-fixed-module-nav2" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="page-top">
+        <a class="back-link" href="./ai-full-market-selection.html" title="返回 AI 全市场重点观察" aria-label="返回 AI 全市场重点观察">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11v2H7.8l5.6 5.6L12 20 4 12l8-8 1.4 1.4L7.8 11H20Z"/></svg>
+        </a>
+        <div class="title-block">
+          <span>AI 全市场历史复盘</span>
+          <h1>推荐验证与策略表现</h1>
+          <p>只展示已经完成未来行情回填的新版 AI 全市场样本，用于复盘和参数学习</p>
+        </div>
+        <div class="controls">
+          <a class="secondary-button" href="./cross-module-validation.html" title="查看跨模块复盘">跨模块复盘</a>
+          <button id="reviewRefreshButton" class="secondary-button" type="button">重新加载</button>
+        </div>
+      </header>
+
+      <section id="reviewNotice" class="notice" hidden></section>
+
+      <details class="panel debug-panel learning-panel">
+        <summary class="panel-head">
+          <div>
+            <span>高级</span>
+            <h2>参数学习</h2>
+          </div>
+          <div class="panel-actions">
+            <small id="learningSummaryText">默认不需要手动操作</small>
+            <small class="debug-toggle"></small>
+          </div>
+        </summary>
+        <div class="feedback-grid">
+          <article>
+            <span>用途</span>
+            <strong>更新选股参数</strong>
+            <small>只根据已完成的 AI 全市场历史验证样本判断是否调整软参数。</small>
+          </article>
+          <article>
+            <span>影响范围</span>
+            <strong>仅本功能</strong>
+            <small>不改首页 Top20、T+1、个股分析和回测逻辑。</small>
+          </article>
+          <article>
+            <span>执行条件</span>
+            <strong id="learningStateText">等待样本</strong>
+            <small id="learningReasonText">样本不足时点击也不会更新参数。</small>
+          </article>
+        </div>
+        <div class="feedback-message learning-actions">
+          <span id="learningMessage">参数学习不是每天选股的必要步骤；通常等历史样本足够后再执行。</span>
+          <button id="learningRunButton" class="secondary-button" type="button">根据历史样本更新参数</button>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>策略类型</th>
+                <th>样本</th>
+                <th>超额对比</th>
+                <th>当前权重</th>
+                <th>建议权重</th>
+                <th>原因</th>
+              </tr>
+            </thead>
+            <tbody id="learningRows"></tbody>
+          </table>
+        </div>
+      </details>
+
+      <section class="feedback-grid">
+        <article>
+          <span>完成样本</span>
+          <strong id="reviewSampleText">--</strong>
+          <small id="reviewRunText">--</small>
+        </article>
+        <article>
+          <span>Top10 7日表现</span>
+          <strong id="reviewReturnText">--</strong>
+          <small id="reviewErrorText">--</small>
+        </article>
+        <article>
+          <span>漏判对照</span>
+          <strong id="reviewMissText">--</strong>
+          <small id="reviewPromptText">--</small>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>策略类型</span>
+            <h2>7日主验证表现</h2>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>类型</th>
+                <th>Top10样本</th>
+                <th>未入选对照</th>
+                <th>平均收益</th>
+                <th>平均超额</th>
+                <th>错买</th>
+                <th>漏判</th>
+              </tr>
+            </thead>
+            <tbody id="reviewTypeRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>板块状态</span>
+            <h2>7日板块风险验证</h2>
+          </div>
+          <small id="sectorExceptionText">--</small>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>状态</th>
+                <th>Top10样本</th>
+                <th>未入选对照</th>
+                <th>平均收益</th>
+                <th>平均超额</th>
+                <th>平均回撤</th>
+                <th>错买</th>
+                <th>漏判</th>
+              </tr>
+            </thead>
+            <tbody id="reviewSectorStateRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>按 Run</span>
+            <h2>每次推荐后续表现</h2>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Run</th>
+                <th>日期</th>
+                <th>1日</th>
+                <th>3日</th>
+                <th>5日</th>
+                <th>7日</th>
+                <th>Top10均值</th>
+                <th>超额均值</th>
+              </tr>
+            </thead>
+            <tbody id="reviewRunRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>明细</span>
+            <h2>最近已完成验证</h2>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th>股票</th>
+                <th>类型</th>
+                <th>周期</th>
+                <th>范围</th>
+                <th>标签</th>
+                <th>收益</th>
+                <th>超额</th>
+              </tr>
+            </thead>
+            <tbody id="reviewDetailRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="./src/module-nav.js?v=20260809-fixed-module-nav"></script>
+    <script src="./src/ai-full-market-review.js?v=20260802-daily-1-7"></script>
+  </body>
+</html>

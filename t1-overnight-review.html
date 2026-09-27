@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>T+1 复盘</title>
+    <link rel="stylesheet" href="./src/t1-overnight-selection.css?v=20260809-nav-tree" />
+    <link rel="stylesheet" href="./src/t1-overnight-review.css?v=20260809-optimization-stats" />
+  </head>
+  <body data-t1-page="review">
+    <div class="t1-app-shell">
+      <aside class="t1-rail" aria-label="主导航">
+        <div class="t1-brand">
+          <span class="t1-brand-mark">A</span>
+          <div>
+            <strong>中短线雷达</strong>
+            <span>Rule-Locked AI</span>
+          </div>
+        </div>
+        <nav class="t1-rail-nav t1-rail-tree" aria-label="主导航">
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">交易工作台</summary>
+            <div class="t1-rail-subnav">
+              <a href="./index.html">总览</a>
+            </div>
+          </details>
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">个股分析</summary>
+            <div class="t1-rail-subnav">
+              <a href="./index.html#stock">买点与周期判断</a>
+              <a href="./index.html#ai-review">分析复盘</a>
+            </div>
+          </details>
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">AI全市场观察</summary>
+            <div class="t1-rail-subnav">
+              <a href="./ai-full-market-selection.html">重点观察</a>
+              <a href="./ai-full-market-review.html">全市场复盘</a>
+            </div>
+          </details>
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">早盘主线雷达</summary>
+            <div class="t1-rail-subnav">
+              <a href="./morning-sector-radar.html">主线扫描</a>
+            </div>
+          </details>
+          <details class="t1-rail-module" open>
+            <summary class="t1-rail-link t1-rail-parent">超短线 T+1</summary>
+            <div class="t1-rail-subnav">
+              <a data-t1-nav="selection" href="./t1-overnight-selection.html">今日推荐</a>
+              <a data-t1-nav="review" href="./t1-overnight-review.html">推荐复盘</a>
+              <a data-t1-nav="config" href="./t1-overnight-config.html">策略配置</a>
+              <a data-t1-nav="diagnostics" href="./t1-overnight-diagnostics.html">Run 诊断</a>
+              <a data-t1-nav="maintenance" href="./t1-overnight-maintenance.html">数据维护</a>
+            </div>
+          </details>
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">审计与验证</summary>
+            <div class="t1-rail-subnav">
+              <a href="./cross-module-validation.html">跨模块复盘</a>
+              <a href="./intraday-entry-audit-history.html">进场审计历史</a>
+            </div>
+          </details>
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">基础数据</summary>
+            <div class="t1-rail-subnav">
+              <a href="./index.html#retail">散户榜</a>
+              <a href="./index.html#universe">重点池</a>
+            </div>
+          </details>
+        </nav>
+      </aside>
+    <main class="shell review-shell">
+      <header class="page-top">
+        <a class="back-link" href="./t1-overnight-selection.html" title="返回 T+1 筛选" aria-label="返回 T+1 筛选">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11v2H7.8l5.6 5.6L12 20 4 12l8-8 1.4 1.4L7.8 11H20Z"/></svg>
+        </a>
+        <div class="title-block">
+          <span>T+1 专属复盘</span>
+          <h1>隔夜 Top3 验证记录</h1>
+          <p>按 run 查看最终推荐、次日 open_15m 主 KPI、各卖出时点和失败原因；这里只读复盘数据，不触发新的推荐。</p>
+        </div>
+        <div class="controls">
+          <label>
+            <span>数据用途</span>
+            <select id="statusSelect">
+              <option value="learnable">可用于优化</option>
+              <option value="reviewable">可看结果</option>
+              <option value="partial">部分缺数据</option>
+              <option value="waiting">等待数据</option>
+              <option value="diagnostic">仅排查</option>
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label>
+            <span>列表加载数量</span>
+            <input id="limitInput" type="number" min="10" max="200" step="10" value="60" title="只影响下方历史 run 列表，不影响顶部可用于优化样本统计" />
+          </label>
+          <button id="refreshButton" class="secondary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h8V3l-3.3 3.3Z"/></svg>
+            刷新页面数据
+          </button>
+        </div>
+      </header>
+
+      <nav class="t1-subnav" aria-label="T+1 功能导航">
+        <a href="./t1-overnight-selection.html">今日推荐</a>
+        <a class="active" href="./t1-overnight-review.html">推荐复盘</a>
+        <a href="./t1-overnight-config.html">策略配置</a>
+        <a href="./t1-overnight-diagnostics.html">Run 诊断</a>
+        <a href="./t1-overnight-maintenance.html">数据维护</a>
+      </nav>
+
+      <section id="notice" class="notice"></section>
+      <section id="summaryGrid" class="stat-grid"></section>
+      <section id="reviewNote" class="review-note"></section>
+      <section class="panel optimization-stats-panel">
+        <div class="panel-head">
+          <div>
+            <span>只统计“可用于优化”</span>
+            <h2>可用于优化样本统计</h2>
+          </div>
+          <small id="optimizationStatsMeta">--</small>
+        </div>
+        <div id="optimizationStatsGrid" class="metric-grid"></div>
+        <div class="timing-table-wrap">
+          <table class="data-table timing-stats-table">
+            <thead>
+              <tr>
+                <th>卖出时点</th>
+                <th>平均净收益</th>
+                <th>中位数净收益</th>
+                <th>成功率</th>
+                <th>强成功率</th>
+                <th>跑赢基准</th>
+                <th>样本 / 缺数据</th>
+              </tr>
+            </thead>
+            <tbody id="exitTimingStatsRows"></tbody>
+          </table>
+        </div>
+        <div id="metricNotes" class="metric-notes"></div>
+      </section>
+
+      <section class="review-layout">
+        <aside class="panel review-runs-panel">
+          <div class="panel-head">
+            <div>
+              <span>历史 run</span>
+              <h2>推荐记录</h2>
+            </div>
+            <small id="runListMeta">--</small>
+          </div>
+          <div id="runList" class="run-list"></div>
+        </aside>
+
+        <section class="review-detail">
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <span id="detailEyebrow">请选择 run</span>
+                <h2 id="detailTitle">复盘明细</h2>
+              </div>
+              <div class="panel-actions">
+                <button id="verifyRunButton" class="secondary-button" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h8V3l-3.3 3.3Z"/></svg>
+                  刷新该 run 验证
+                </button>
+                <button id="backfillMinuteButton" class="secondary-button" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v4H4V4Zm0 6h7v10H4V10Zm9 0h7v10h-7V10Zm-7 2v2h3v-2H6Zm9 0v2h3v-2h-3Zm-9 4v2h3v-2H6Zm9 0v2h3v-2h-3Z"/></svg>
+                  补拉验证分钟线
+                </button>
+              </div>
+            </div>
+            <div id="actionProgress" class="action-progress hidden" role="status" aria-live="polite">
+              <div class="action-progress-head">
+                <strong id="actionProgressTitle">正在处理</strong>
+                <span id="actionProgressHint">请稍等</span>
+              </div>
+              <div class="action-progress-track">
+                <span></span>
+              </div>
+            </div>
+            <div id="detailMetrics" class="metric-grid"></div>
+            <div id="usageExplanation" class="usage-explanation"></div>
+            <div id="pickSummary" class="review-pick-summary"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <span>主 KPI 固定 open_15m</span>
+                <h2>个股验证</h2>
+              </div>
+              <small id="outcomeMeta">--</small>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table review-outcome-table">
+                <thead>
+                  <tr>
+                    <th>股票</th>
+                    <th>买入参考</th>
+                    <th>次日</th>
+                    <th>主KPI</th>
+                    <th>开盘</th>
+                    <th>5m</th>
+                    <th>15m</th>
+                    <th>30m</th>
+                    <th>10:30</th>
+                    <th>午盘</th>
+                    <th>下午</th>
+                    <th>13:30</th>
+                    <th>2点</th>
+                    <th>14:30</th>
+                    <th>收盘</th>
+                    <th>标签</th>
+                  </tr>
+                </thead>
+                <tbody id="outcomeRows"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <span>组合与基准</span>
+                <h2>复盘摘要</h2>
+              </div>
+            </div>
+            <div id="baselinePanel" class="baseline-grid"></div>
+          </section>
+        </section>
+      </section>
+    </main>
+    </div>
+
+    <div id="actionModal" class="action-modal hidden" role="dialog" aria-modal="true" aria-labelledby="actionModalTitle">
+      <div class="action-modal-card">
+        <div class="action-modal-head">
+          <span id="actionModalTone" class="status-pill neutral">结果</span>
+          <button id="actionModalClose" class="icon-button" type="button" aria-label="关闭弹窗">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+          </button>
+        </div>
+        <h2 id="actionModalTitle">操作完成</h2>
+        <p id="actionModalMessage"></p>
+        <button id="actionModalOk" class="primary-button" type="button">知道了</button>
+      </div>
+    </div>
+
+    <script src="./src/t1-overnight-review.js?v=20260809-optimization-stats"></script>
+  </body>
+</html>

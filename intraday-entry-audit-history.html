@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>进场审计历史</title>
+    <link rel="stylesheet" href="./src/ai-full-market-selection.css?v=20260809-fixed-module-nav2" />
+    <link rel="stylesheet" href="./src/intraday-entry-audit-history.css?v=20260719-entry-audit-history" />
+  </head>
+  <body>
+    <main class="shell entry-history-shell">
+      <header class="page-top">
+        <a class="back-link" href="./index.html" title="返回交易工作台" aria-label="返回交易工作台">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11v2H7.8l5.6 5.6L12 20 4 12l8-8 1.4 1.4L7.8 11H20Z"/></svg>
+        </a>
+        <div class="title-block">
+          <span>当天进场审计</span>
+          <h1>审计快照与参考验证</h1>
+          <p>查看从 AI 全市场/T+1 触发的审计结论、证据质量和 1/3/5 日参考表现；不改写原始推荐。</p>
+        </div>
+        <div class="controls">
+          <label>
+            <span>股票</span>
+            <input id="codeInput" type="search" placeholder="股票代码" autocomplete="off" />
+          </label>
+          <label>
+            <span>状态</span>
+            <select id="entryStatusSelect">
+              <option value="">全部</option>
+              <option value="block_entry">禁止进场</option>
+              <option value="wait_confirm">等待确认</option>
+              <option value="pullback_only">只允许低吸</option>
+              <option value="small_test">小仓试错</option>
+              <option value="watch_priority">重点观察</option>
+              <option value="t1_only">仅适合 T+1</option>
+              <option value="manual_review">人工判断</option>
+            </select>
+          </label>
+          <label>
+            <span>上限</span>
+            <input id="limitInput" type="number" min="20" max="500" step="20" value="100" />
+          </label>
+          <button id="refreshOutcomesButton" class="secondary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h8V3l-3.3 3.3Z"/></svg>
+            刷新验证
+          </button>
+          <button id="loadButton" class="primary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4a6 6 0 1 0 3.7 10.7l3.6 3.6 1.4-1.4-3.6-3.6A6 6 0 0 0 10 4Zm0 2a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z"/></svg>
+            查询
+          </button>
+        </div>
+      </header>
+
+      <section id="notice" class="notice" hidden></section>
+
+      <section id="summaryGrid" class="stat-grid entry-history-stats"></section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>手动入口</span>
+            <h2>单票审计与批量审计</h2>
+          </div>
+          <small id="actionMeta">--</small>
+        </div>
+        <div class="entry-history-action-grid">
+          <form id="manualAuditForm" class="entry-history-form">
+            <label>
+              <span>股票代码</span>
+              <input id="manualCodeInput" type="search" placeholder="如 600010" autocomplete="off" required />
+            </label>
+            <label>
+              <span>名称</span>
+              <input id="manualNameInput" type="text" placeholder="可选" autocomplete="off" />
+            </label>
+            <label>
+              <span>主链路</span>
+              <select id="manualSourceSelect">
+                <option value="ai_full_market">AI 全市场 + 个股分析</option>
+                <option value="t1">T+1 + 个股分析</option>
+              </select>
+            </label>
+            <label>
+              <span>持仓状态</span>
+              <select id="manualPositionStateSelect">
+                <option value="none">未持仓</option>
+                <option value="holding">已持仓</option>
+                <option value="planned">计划买入</option>
+              </select>
+            </label>
+            <button id="manualRunButton" class="primary-button" type="submit">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5Z"/></svg>
+              审计单票
+            </button>
+          </form>
+          <form id="batchAuditForm" class="entry-history-form">
+            <label>
+              <span>批量来源</span>
+              <select id="batchSourceSelect">
+                <option value="ai_full_market">AI 全市场当天入选</option>
+                <option value="t1">T+1 当天入选</option>
+              </select>
+            </label>
+            <label>
+              <span>数量</span>
+              <input id="batchLimitInput" type="number" min="1" max="10" step="1" value="3" />
+            </label>
+            <button id="batchRunButton" class="secondary-button" type="submit">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4V4Zm9 0h7v7h-7V4ZM4 13h7v7H4v-7Zm9 0h7v7h-7v-7Z"/></svg>
+              批量审计
+            </button>
+          </form>
+        </div>
+        <div id="actionResult" class="entry-history-action-result" hidden></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <span>历史快照</span>
+            <h2>审计结论与后验参考</h2>
+          </div>
+          <small id="historyMeta">--</small>
+        </div>
+        <div class="entry-history-note">
+          参考验证按审计日收盘价和后续日 K 估算，用来发现审计是否值得复查；不是自动成交记录，也不会反向修改审计结论。
+        </div>
+        <div class="table-wrap">
+          <table class="data-table entry-history-table">
+            <thead>
+              <tr>
+                <th>审计时间</th>
+                <th>股票</th>
+                <th>来源</th>
+                <th>结论</th>
+                <th>仓位</th>
+                <th>AI 状态</th>
+                <th>反馈</th>
+                <th>T+1</th>
+                <th>1 日</th>
+                <th>3 日</th>
+                <th>5 日</th>
+              </tr>
+            </thead>
+            <tbody id="historyRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="./src/module-nav.js?v=20260809-fixed-module-nav"></script>
+    <script src="./src/intraday-entry-audit-history.js?v=20260719-entry-audit-history"></script>
+  </body>
+</html>

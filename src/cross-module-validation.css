@@ -1,0 +1,92 @@
+.cross-shell {
+  max-width: 1480px;
+}
+
+.validation-stat-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.validation-meta-grid,
+.validation-review-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.validation-card,
+.validation-review-box {
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 8px;
+  padding: 14px;
+  background: rgba(15, 23, 42, 0.32);
+}
+
+.validation-card span,
+.validation-review-box span {
+  display: block;
+  color: #94a3b8;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.validation-card strong,
+.validation-review-box strong {
+  display: block;
+  color: #e5e7eb;
+  font-size: 18px;
+  line-height: 1.35;
+  margin-bottom: 6px;
+}
+
+.validation-card small,
+.validation-review-box small,
+.data-table small {
+  display: block;
+  color: #94a3b8;
+  line-height: 1.45;
+  margin-top: 4px;
+}
+
+.validation-warning-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.validation-warning-list span {
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 999px;
+  color: #fbbf24;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.muted {
+  color: #64748b;
+}
+
+.positive {
+  color: #22c55e;
+}
+
+.negative {
+  color: #f87171;
+}
+
+.stock-analysis-name-link {
+  color: #dbeafe;
+  text-decoration: none;
+}
+
+.stock-analysis-name-link:hover {
+  color: #93c5fd;
+}
+
+@media (max-width: 980px) {
+  .validation-stat-grid,
+  .validation-meta-grid,
+  .validation-review-grid {
+    grid-template-columns: 1fr;
+  }
+}

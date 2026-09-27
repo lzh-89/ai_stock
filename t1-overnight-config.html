@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>T+1 策略配置</title>
+    <link rel="stylesheet" href="./src/t1-overnight-selection.css?v=20260809-nav-tree" />
+    <link rel="stylesheet" href="./src/intraday-entry-audit.css?v=20260719-entry-audit" />
+  </head>
+  <body data-t1-page="config">
+    <div class="t1-app-shell">
+      <aside class="t1-rail" aria-label="主导航">
+        <div class="t1-brand">
+          <span class="t1-brand-mark">A</span>
+          <div>
+            <strong>中短线雷达</strong>
+            <span>Rule-Locked AI</span>
+          </div>
+        </div>
+        <nav class="t1-rail-nav t1-rail-tree" aria-label="主导航">
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">交易工作台</summary>
+            <div class="t1-rail-subnav">
+              <a href="./index.html">总览</a>
+            </div>
+          </details>
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">个股分析</summary>
+            <div class="t1-rail-subnav">
+              <a href="./index.html#stock">买点与周期判断</a>
+              <a href="./index.html#ai-review">分析复盘</a>
+            </div>
+          </details>
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">AI全市场观察</summary>
+            <div class="t1-rail-subnav">
+              <a href="./ai-full-market-selection.html">重点观察</a>
+              <a href="./ai-full-market-review.html">全市场复盘</a>
+            </div>
+          </details>
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">早盘主线雷达</summary>
+            <div class="t1-rail-subnav">
+              <a href="./morning-sector-radar.html">主线扫描</a>
+            </div>
+          </details>
+          <details class="t1-rail-module" open>
+            <summary class="t1-rail-link t1-rail-parent">超短线 T+1</summary>
+            <div class="t1-rail-subnav">
+              <a data-t1-nav="selection" href="./t1-overnight-selection.html">今日推荐</a>
+              <a data-t1-nav="review" href="./t1-overnight-review.html">推荐复盘</a>
+              <a data-t1-nav="config" href="./t1-overnight-config.html">策略配置</a>
+              <a data-t1-nav="diagnostics" href="./t1-overnight-diagnostics.html">Run 诊断</a>
+              <a data-t1-nav="maintenance" href="./t1-overnight-maintenance.html">数据维护</a>
+            </div>
+          </details>
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">审计与验证</summary>
+            <div class="t1-rail-subnav">
+              <a href="./cross-module-validation.html">跨模块复盘</a>
+              <a href="./intraday-entry-audit-history.html">进场审计历史</a>
+            </div>
+          </details>
+          <details class="t1-rail-module">
+            <summary class="t1-rail-link t1-rail-parent">基础数据</summary>
+            <div class="t1-rail-subnav">
+              <a href="./index.html#retail">散户榜</a>
+              <a href="./index.html#universe">重点池</a>
+            </div>
+          </details>
+        </nav>
+      </aside>
+    <main class="shell">
+      <header class="page-top">
+        <a class="back-link" href="./index.html" title="返回推荐总览" aria-label="返回推荐总览">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11v2H7.8l5.6 5.6L12 20 4 12l8-8 1.4 1.4L7.8 11H20Z"/></svg>
+        </a>
+        <div class="title-block">
+          <span id="pageEyebrow">T+1 独立配置</span>
+          <h1>T+1 策略配置</h1>
+          <p>集中管理日常运行参数、专业复盘口径、AI 自检和阶段实验开关；新 run 会按保存后的配置执行。</p>
+        </div>
+        <div class="controls">
+          <label>
+            <span>数据源</span>
+            <select id="sourceSelect">
+              <option value="auto">自动</option>
+              <option value="sina">新浪</option>
+              <option value="akshare">AKShare/东财</option>
+              <option value="mock">Mock</option>
+            </select>
+          </label>
+          <label>
+            <span>触发时间</span>
+            <input id="scanTimeInput" type="time" value="14:40" />
+          </label>
+          <label>
+            <span>候选池</span>
+            <input id="poolSizeInput" type="number" min="300" max="600" step="20" value="500" />
+          </label>
+          <button id="latestButton" class="secondary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3C7.6 3 4 4.3 4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6c0-1.7-3.6-3-8-3Zm0 2c3.8 0 6 .9 6 1s-2.2 1-6 1-6-.9-6-1 2.2-1 6-1Zm0 14c-3.8 0-6-.9-6-1v-2.2c1.4.8 3.7 1.2 6 1.2s4.6-.4 6-1.2V18c0 .1-2.2 1-6 1Zm0-4c-3.8 0-6-.9-6-1v-2.2c1.4.8 3.7 1.2 6 1.2s4.6-.4 6-1.2V14c0 .1-2.2 1-6 1Zm0-4c-3.8 0-6-.9-6-1V7.8C7.4 8.6 9.7 9 12 9s4.6-.4 6-1.2V10c0 .1-2.2 1-6 1Z"/></svg>
+            查看最近结果
+          </button>
+          <button id="preheatEvidenceButton" class="secondary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h14v2H5V3Zm0 16h14v2H5v-2Zm2-4h10a3 3 0 1 0 0-6H7a3 3 0 1 0 0 6Zm0-2a1 1 0 1 1 0-2h10a1 1 0 1 1 0 2H7Z"/></svg>
+            预热今日证据
+          </button>
+          <button id="runButton" class="primary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5Z"/></svg>
+            开始 T+1 筛选
+          </button>
+          <label class="force-check">
+            <input id="forceCheck" type="checkbox" />
+            <span>强制重新生成</span>
+          </label>
+        </div>
+      </header>
+
+      <nav class="t1-subnav" aria-label="T+1 功能导航">
+        <a href="./t1-overnight-selection.html">今日推荐</a>
+        <a href="./t1-overnight-review.html">推荐复盘</a>
+        <a class="active" href="./t1-overnight-config.html">策略配置</a>
+        <a href="./t1-overnight-diagnostics.html">Run 诊断</a>
+        <a href="./t1-overnight-maintenance.html">数据维护</a>
+      </nav>
+
+      <section id="notice" class="notice"></section>
+      <div id="actionProgress" class="action-progress hidden" role="status" aria-live="polite">
+        <div class="action-progress-head">
+          <strong id="actionProgressTitle">正在处理</strong>
+          <span id="actionProgressHint">请稍等</span>
+        </div>
+        <div class="action-progress-track"><span></span></div>
+      </div>
+
+      <section class="stat-grid" data-t1-scope="selection diagnostics">
+        <article>
+          <span>任务状态</span>
+          <strong id="statusText">--</strong>
+          <small id="modeText">--</small>
+        </article>
+        <article>
+          <span>候选池</span>
+          <strong id="poolText">--</strong>
+          <small id="universeText">--</small>
+        </article>
+        <article>
+          <span>AI 批次</span>
+          <strong id="batchText">--</strong>
+          <small id="stageText">--</small>
+        </article>
+        <article>
+          <span>最终结果</span>
+          <strong id="finalText">--</strong>
+          <small id="elapsedText">--</small>
+        </article>
+      </section>
+
+      <section class="progress-panel" data-t1-scope="selection diagnostics">
+        <div class="progress-bar"><i id="progressBar"></i></div>
+        <div id="progressMeta" class="progress-meta"></div>
+        <div id="batchList" class="batch-list"></div>
+      </section>
+
+      <section class="panel" data-t1-scope="selection diagnostics">
+        <div class="panel-head">
+          <div>
+            <span>阶段 0.5</span>
+            <h2>市场环境与策略状态</h2>
+          </div>
+        </div>
+        <div id="marketContextPanel" class="market-context-panel"></div>
+      </section>
+
+      <section class="panel" data-t1-scope="config">
+        <div class="panel-head">
+          <div>
+            <span>T+1 专属</span>
+            <h2>T+1 策略阶段控制</h2>
+          </div>
+          <div class="panel-actions">
+            <button id="saveStageConfigButton" class="secondary-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4ZM7 5h8v4H7V5Zm10 14H7v-6h10v6Z"/></svg>
+              保存阶段配置
+            </button>
+          </div>
+        </div>
+        <div class="stage-help">
+          <article>
+            <strong>这个配置是干什么的</strong>
+            <span>控制“板块退潮”和“风格轮动”是否参与 T+1 选股判断。它不是 DeepSeek 开关，也不是收益计算配置。</span>
+          </article>
+          <article>
+            <strong>默认为什么先影子观察</strong>
+            <span>新规则先只记录不改结果，等 official 交易日和 open_15m 样本够了，再决定是否让它影响正式推荐。</span>
+          </article>
+          <article>
+            <strong>开启后会影响什么</strong>
+            <span>板块退潮会降低普通后排候选权重；风格轮动会作为证据进入 AI 比较。实验模式只生成研究 run，不进严格学习。</span>
+          </article>
+        </div>
+        <div class="config-grid">
+          <label class="toggle-row">
+            <input id="stageSectorShadowCheck" type="checkbox" checked />
+            <span>板块状态影子观察</span>
+          </label>
+          <label>
+            <span>板块退潮降权</span>
+            <select id="stageSectorRetreatMode">
+              <option value="off">关闭</option>
+              <option value="auto">样本达标后生效</option>
+              <option value="experimental">实验模式，标记研究 run</option>
+            </select>
+          </label>
+          <label class="toggle-row">
+            <input id="stageStyleShadowCheck" type="checkbox" checked />
+            <span>风格轮动影子观察</span>
+          </label>
+          <label>
+            <span>风格轮动参与 AI</span>
+            <select id="stageStylePromptMode">
+              <option value="off">关闭</option>
+              <option value="auto">样本达标后生效</option>
+              <option value="experimental">实验模式，标记研究 run</option>
+            </select>
+          </label>
+          <label>
+            <span>阶段2 official 交易日门槛</span>
+            <input id="stage2OfficialDaysInput" type="number" min="1" max="250" step="1" value="30" />
+          </label>
+          <label>
+            <span>阶段2 open_15m 样本门槛</span>
+            <input id="stage2TradeableInput" type="number" min="1" max="1000" step="1" value="30" />
+          </label>
+          <label>
+            <span>阶段3 official 交易日门槛</span>
+            <input id="stage3OfficialDaysInput" type="number" min="1" max="250" step="1" value="60" />
+          </label>
+          <label>
+            <span>阶段3 open_15m 样本门槛</span>
+            <input id="stage3TradeableInput" type="number" min="1" max="1000" step="1" value="60" />
+          </label>
+        </div>
+        <p class="config-help">阶段2主要处理“板块退潮降权”；阶段3主要处理“风格轮动是否给 DeepSeek 使用”。两个阶段都需要样本门槛，不建议直接手动强行生效。</p>
+        <div id="stageStatusLine" class="status-line stage-status-line"></div>
+      </section>
+
+      <section class="panel" data-t1-scope="config">
+        <div class="panel-head">
+          <div>
+            <span>阶段 2</span>
+            <h2>AI 自检配置</h2>
+          </div>
+          <div class="panel-actions">
+            <button id="saveCriticConfigButton" class="secondary-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4ZM7 5h8v4H7V5Zm10 14H7v-6h10v6Z"/></svg>
+              保存配置
+            </button>
+          </div>
+        </div>
+        <div class="config-grid">
+          <label>
+            <span>介入模式</span>
+            <select id="criticModeSelect">
+              <option value="auto">样本达标后自动</option>
+              <option value="rule_only">仅规则审查</option>
+              <option value="always">总是介入</option>
+              <option value="off">关闭</option>
+            </select>
+          </label>
+          <label>
+            <span>推荐次数门槛</span>
+            <input id="criticMinRunsInput" type="number" min="0" max="200" step="1" value="10" />
+          </label>
+          <label>
+            <span>验证样本门槛</span>
+            <input id="criticMinOutcomesInput" type="number" min="0" max="600" step="1" value="20" />
+          </label>
+          <label>
+            <span>专业验证门槛</span>
+            <input id="criticMinTradeableInput" type="number" min="0" max="600" step="1" value="20" />
+          </label>
+          <label>
+            <span>最多替换</span>
+            <input id="criticMaxReplacementsInput" type="number" min="0" max="2" step="1" value="1" />
+          </label>
+          <label>
+            <span>复盘窗口</span>
+            <input id="criticHistoryWindowInput" type="number" min="5" max="120" step="1" value="20" />
+          </label>
+          <label class="toggle-row">
+            <input id="criticRequireOutcomesCheck" type="checkbox" checked />
+            <span>要求验证样本</span>
+          </label>
+          <label class="toggle-row">
+            <input id="criticAllowReduceCheck" type="checkbox" checked />
+            <span>允许减少推荐数</span>
+          </label>
+          <label class="toggle-row">
+            <input id="criticAllowZeroCheck" type="checkbox" checked />
+            <span>极端行情允许 Top0</span>
+          </label>
+        </div>
+        <div id="criticStatusLine" class="status-line"></div>
+      </section>
+
+      <section class="panel" data-t1-scope="config">
+        <div class="panel-head">
+          <div>
+            <span>阶段 1</span>
+            <h2>专业复盘配置</h2>
+          </div>
+          <div class="panel-actions">
+            <button id="saveExecutionConfigButton" class="secondary-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4ZM7 5h8v4H7V5Zm10 14H7v-6h10v6Z"/></svg>
+              保存复盘配置
+            </button>
+          </div>
+        </div>
+        <div class="config-grid">
+          <label>
+            <span>买入滑点%</span>
+            <input id="buySlippageInput" type="number" min="0" max="2" step="0.01" value="0.10" />
+          </label>
+          <label>
+            <span>卖出滑点%</span>
+            <input id="sellSlippageInput" type="number" min="0" max="2" step="0.01" value="0.10" />
+          </label>
+          <label>
+            <span>佣金%</span>
+            <input id="commissionInput" type="number" min="0" max="1" step="0.001" value="0.025" />
+          </label>
+          <label>
+            <span>印花税%</span>
+            <input id="stampTaxInput" type="number" min="0" max="1" step="0.001" value="0.05" />
+          </label>
+          <label>
+            <span>买入时间</span>
+            <input id="buyTimesInput" type="text" value="14:30,14:40,14:50" />
+          </label>
+          <label>
+            <span>固定卖出</span>
+            <input id="sellTimesInput" type="text" value="open,open_5m,open_15m,open_30m,midday_close,afternoon_open,two_pm,close" />
+          </label>
+        </div>
+      </section>
+
+      <section class="panel" data-t1-scope="selection">
+        <div class="panel-head">
+          <div>
+            <span id="resultEyebrow">T+1 Top3</span>
+            <h2>最终入选</h2>
+          </div>
+          <div class="panel-actions">
+            <button id="setOfficialButton" class="secondary-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 15 8l7 .9-5 4.8 1.2 6.8L12 17.3 5.8 20.5 7 13.7 2 8.9 9 8l3-6Z"/></svg>
+              设为正式 run
+            </button>
+            <button id="setResearchButton" class="secondary-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v2H4V5Zm0 6h10v2H4v-2Zm0 6h16v2H4v-2Z"/></svg>
+              改为研究 run
+            </button>
+          </div>
+        </div>
+        <p class="run-role-help">
+          正式 run：进入严格复盘、策略统计和后续可优化样本；同一推荐日期只保留一个正式 run。研究 run：只用于查看和排查，不进入策略学习，也不影响 DeepSeek 后续经验。
+        </p>
+        <div id="pickGrid" class="pick-grid"></div>
+      </section>
+
+      <section class="panel" data-t1-scope="diagnostics maintenance">
+        <div class="panel-head">
+          <div>
+            <span>验证与维护</span>
+            <h2>结果验证</h2>
+          </div>
+          <div class="panel-actions">
+            <button id="verifyRunButton" class="secondary-button" type="button" data-action-scope="diagnostics">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z"/></svg>
+              刷新当前 run
+            </button>
+            <button id="verifyPendingButton" class="secondary-button" type="button" data-action-scope="maintenance">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6V3L8 7l4 4V8a4 4 0 1 1-4 4H6a6 6 0 1 0 6-6Z"/></svg>
+              批量验证
+            </button>
+            <button id="historyDryRunButton" class="secondary-button" type="button" data-action-scope="maintenance">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v2H4V5Zm0 6h16v2H4v-2Zm0 6h10v2H4v-2Z"/></svg>
+              历史预演
+            </button>
+            <button id="historySoftCleanupButton" class="secondary-button" type="button" data-action-scope="maintenance">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v2H5V4Zm2 4h10v12H7V8Zm3 2v8h2v-8h-2Zm4 0v8h2v-8h-2Z"/></svg>
+              执行软清理
+            </button>
+          </div>
+        </div>
+        <div class="diagnostic-action-help">
+          <article data-action-scope="diagnostics"><strong>刷新当前 run</strong><span>只重新验证当前选中的 run，刷新次日收益、标签和基准结果；会更新该 run 的验证数据。</span></article>
+          <article data-action-scope="maintenance"><strong>批量验证</strong><span>批量处理还没完成验证的 official run，用来补齐复盘列表；会写入对应验证结果。</span></article>
+          <article data-action-scope="maintenance"><strong>历史预演</strong><span>只做 dry-run 报告，告诉你旧数据如果处理会怎样；不会写数据库。</span></article>
+          <article data-action-scope="maintenance"><strong>执行软清理</strong><span>把旧口径或异常历史标成只展示/仅排查，避免影响策略学习；不会删除原始记录。</span></article>
+        </div>
+        <div id="outcomeSummary" class="metric-strip"></div>
+        <div id="baselineComparison" class="baseline-grid"></div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>股票</th>
+                <th>买入参考</th>
+                <th>次日交易日</th>
+                <th>主场景净收益</th>
+                <th>开盘</th>
+                <th>5分钟</th>
+                <th>15分钟</th>
+                <th>30分钟</th>
+                <th>上午收盘</th>
+                <th>13:00</th>
+                <th>14:00</th>
+                <th>收盘</th>
+                <th>规则卖出</th>
+                <th>交易质量</th>
+                <th>标签</th>
+              </tr>
+            </thead>
+            <tbody id="outcomeRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" data-t1-scope="config maintenance">
+        <div class="panel-head">
+          <div>
+            <span>阶段 3</span>
+            <h2>策略复盘</h2>
+          </div>
+          <div class="panel-actions">
+            <a class="secondary-button" href="./cross-module-validation.html" title="查看跨模块复盘">跨模块复盘</a>
+            <a class="secondary-button" href="./intraday-entry-audit-history.html" title="查看进场审计历史">进场审计历史</a>
+            <button id="refreshFeedbackButton" class="secondary-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.2L13 11h8V3l-3.3 3.3Z"/></svg>
+              刷新复盘
+            </button>
+          </div>
+        </div>
+        <div id="feedbackStats" class="metric-strip"></div>
+        <div id="feedbackPatterns" class="pattern-grid"></div>
+        <div id="feedbackSuggestions" class="suggestion-grid"></div>
+        <pre id="feedbackPrompt" class="feedback-prompt"></pre>
+      </section>
+
+      <section class="panel" data-t1-scope="diagnostics">
+        <div class="panel-head">
+          <div>
+            <span>候选池与半决赛</span>
+            <h2>明细</h2>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>AI排名</th>
+                <th>候选池</th>
+                <th>股票</th>
+                <th>T+1分</th>
+                <th>类型 / 风险画像</th>
+                <th>今日买入条件</th>
+                <th>明日卖出计划</th>
+                <th>风险 / 失效</th>
+              </tr>
+            </thead>
+            <tbody id="detailRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    </div>
+
+    <div id="actionModal" class="action-modal hidden" role="dialog" aria-modal="true" aria-labelledby="actionModalTitle">
+      <div class="action-modal-card">
+        <div class="action-modal-head">
+          <span id="actionModalTone" class="status-pill neutral">结果</span>
+          <button id="actionModalClose" class="icon-button" type="button" aria-label="关闭弹窗">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+          </button>
+        </div>
+        <h2 id="actionModalTitle">操作完成</h2>
+        <p id="actionModalMessage"></p>
+        <button id="actionModalOk" class="primary-button" type="button">知道了</button>
+      </div>
+    </div>
+
+    <script src="./src/intraday-entry-audit.js?v=20260719-entry-audit"></script>
+    <script src="./src/t1-overnight-selection.js?v=20260809-p0-p1-shadow"></script>
+  </body>
+</html>
