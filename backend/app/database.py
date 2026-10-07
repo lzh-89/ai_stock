@@ -1,10 +1,57 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sqlite3
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+LOGGER = logging.getLogger("ai_stock.database")
+SQLITE_BUSY_TIMEOUT_SECONDS = float(os.getenv("SQLITE_BUSY_TIMEOUT_SECONDS", "30"))
+SQLITE_LOCK_RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5, 1.0, 2.0)
+
+
+def _is_sqlite_lock_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return isinstance(error, sqlite3.OperationalError) and ("database is locked" in message or "database is busy" in message)
+
+
+class _RetryConnection(sqlite3.Connection):
+    """SQLite connection with bounded retries for transient writer contention."""
+
+    def _retry(self, operation: Any, operation_name: str) -> Any:
+        for attempt, delay in enumerate((0.0, *SQLITE_LOCK_RETRY_DELAYS_SECONDS), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                return operation()
+            except sqlite3.OperationalError as error:
+                if not _is_sqlite_lock_error(error) or attempt >= len(SQLITE_LOCK_RETRY_DELAYS_SECONDS) + 1:
+                    raise
+                LOGGER.warning(
+                    "sqlite lock retry operation=%s attempt=%s delay_ms=%.0f error=%s",
+                    operation_name,
+                    attempt,
+                    delay * 1000,
+                    error,
+                )
+        raise RuntimeError("unreachable sqlite retry state")
+
+    def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+        return self._retry(lambda: sqlite3.Connection.execute(self, sql, parameters), "execute")
+
+    def executemany(self, sql: str, parameters: Any, /) -> sqlite3.Cursor:
+        return self._retry(lambda: sqlite3.Connection.executemany(self, sql, parameters), "executemany")
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        return self._retry(lambda: sqlite3.Connection.executescript(self, sql_script), "executescript")
+
+    def commit(self) -> None:
+        return self._retry(lambda: sqlite3.Connection.commit(self), "commit")
 
 
 class Database:
@@ -14,12 +61,26 @@ class Database:
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(
+            self.path,
+            timeout=max(1.0, SQLITE_BUSY_TIMEOUT_SECONDS),
+            factory=_RetryConnection,
+        )
         connection.row_factory = sqlite3.Row
+        # busy_timeout applies to lock waits inside SQLite; the connection wrapper
+        # below handles the remaining short-lived contention after that wait.
+        connection.execute(f"PRAGMA busy_timeout={int(max(1.0, SQLITE_BUSY_TIMEOUT_SECONDS) * 1000)}")
+        # synchronous is connection-scoped, so apply it to every connection as
+        # well as during schema initialization.
+        connection.execute("PRAGMA synchronous=NORMAL")
         return connection
 
     def _init_schema(self) -> None:
         with self.connect() as connection:
+            # Configure WAL once during schema initialization. Do not toggle the
+            # journal mode on every connection, which itself can contend on locks.
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS watchlist (
@@ -953,6 +1014,24 @@ class Database:
             self._ensure_column(connection, "t1_overnight_sector_snapshots", "as_of_time", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(connection, "t1_overnight_sector_snapshots", "snapshot_scope", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(connection, "t1_overnight_sector_snapshots", "sector_state_version", "TEXT NOT NULL DEFAULT ''")
+            for table in ("t1_overnight_selection_runs", "t1_overnight_evidence_runs"):
+                self._ensure_column(connection, table, "heartbeat_at", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column(connection, table, "lease_expires_at", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column(connection, table, "worker_id", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column(connection, table, "last_stage_at", "TEXT NOT NULL DEFAULT ''")
+                connection.execute(
+                    f"""
+                    UPDATE {table}
+                    SET heartbeat_at = CASE WHEN heartbeat_at = '' THEN updated_at ELSE heartbeat_at END,
+                        last_stage_at = CASE WHEN last_stage_at = '' THEN updated_at ELSE last_stage_at END,
+                        lease_expires_at = CASE
+                          WHEN lease_expires_at = '' AND status IN ('pending', 'running')
+                          THEN replace(datetime(updated_at, '+15 minutes'), ' ', 'T')
+                          ELSE lease_expires_at
+                        END
+                    WHERE heartbeat_at = '' OR last_stage_at = '' OR lease_expires_at = ''
+                    """
+                )
 
     def _ensure_column(self, connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -2162,15 +2241,18 @@ class Database:
 
     def create_t1_overnight_evidence_run(self, run: Dict[str, Any]) -> int:
         now = datetime.now().isoformat(timespec="seconds")
+        heartbeat_at = str(run.get("heartbeatAt") or now)
+        lease_expires_at = str(run.get("leaseExpiresAt") or _lease_expiry(now))
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO t1_overnight_evidence_runs(
                   recommendation_date, scan_time, requested_source, actual_source, status,
                   market_source, sector_source, minute_source, quality_status,
-                  missing_json, request_json, market_json, error, started_at, created_at, updated_at
+                  missing_json, request_json, market_json, error, started_at,
+                  heartbeat_at, lease_expires_at, worker_id, last_stage_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run.get("recommendationDate") or date.today().isoformat()),
@@ -2187,6 +2269,10 @@ class Database:
                     json.dumps(run.get("market") or {}, ensure_ascii=False),
                     str(run.get("error") or ""),
                     str(run.get("startedAt") or now),
+                    heartbeat_at,
+                    lease_expires_at,
+                    str(run.get("workerId") or ""),
+                    str(run.get("lastStageAt") or now),
                     now,
                     now,
                 ),
@@ -2212,6 +2298,10 @@ class Database:
             "error": "error",
             "startedAt": "started_at",
             "finishedAt": "finished_at",
+            "heartbeatAt": "heartbeat_at",
+            "leaseExpiresAt": "lease_expires_at",
+            "workerId": "worker_id",
+            "lastStageAt": "last_stage_at",
         }
         sets = []
         params: List[Any] = []
@@ -2228,7 +2318,17 @@ class Database:
         if not sets:
             return
         sets.append("updated_at = ?")
-        params.append(datetime.now().isoformat(timespec="seconds"))
+        now = datetime.now().isoformat(timespec="seconds")
+        params.append(now)
+        if "heartbeatAt" not in updates:
+            sets.append("heartbeat_at = ?")
+            params.append(now)
+        if "lastStageAt" not in updates:
+            sets.append("last_stage_at = ?")
+            params.append(now)
+        if "leaseExpiresAt" not in updates:
+            sets.append("lease_expires_at = ?")
+            params.append(_lease_expiry(now))
         params.append(run_id)
         with self.connect() as connection:
             connection.execute(f"UPDATE t1_overnight_evidence_runs SET {', '.join(sets)} WHERE id = ?", params)
@@ -2293,6 +2393,95 @@ class Database:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM t1_overnight_evidence_runs WHERE id = ?", (run_id,)).fetchone()
         return self._t1_overnight_evidence_run_from_row(row) if row else None
+
+    def recover_stale_t1_runs(self, now: Optional[datetime] = None) -> Dict[str, Any]:
+        """Close expired T+1 leases so no run can remain pending/running forever."""
+        now_dt = now or datetime.now()
+        now_text = now_dt.isoformat(timespec="seconds")
+        recovered_selection: List[Dict[str, Any]] = []
+        recovered_evidence: List[Dict[str, Any]] = []
+        with self.connect() as connection:
+            evidence_rows = connection.execute(
+                """
+                SELECT id, status, market_snapshot_count, sector_count, stock_map_count, minute_count,
+                       (SELECT COUNT(*) FROM t1_overnight_market_snapshots item WHERE item.run_id = run.id) AS market_rows,
+                       (SELECT COUNT(*) FROM t1_overnight_sector_snapshots item WHERE item.run_id = run.id) AS sector_rows,
+                       (SELECT COUNT(*) FROM t1_overnight_stock_sector_map item WHERE item.run_id = run.id) AS stock_map_rows,
+                       (SELECT COUNT(*) FROM t1_overnight_minute_snapshots item WHERE item.run_id = run.id) AS minute_rows
+                FROM t1_overnight_evidence_runs run
+                WHERE status IN ('pending', 'running')
+                  AND lease_expires_at != ''
+                  AND datetime(lease_expires_at) < datetime(?)
+                ORDER BY id
+                """,
+                (now_text,),
+            ).fetchall()
+            for row in evidence_rows:
+                has_evidence = any(
+                    int(row[column] or 0) > 0
+                    for column in (
+                        "market_snapshot_count",
+                        "sector_count",
+                        "stock_map_count",
+                        "minute_count",
+                        "market_rows",
+                        "sector_rows",
+                        "stock_map_rows",
+                        "minute_rows",
+                    )
+                )
+                status = "partial" if has_evidence else "failed_timeout"
+                error = "T+1 Evidence 租约过期，watchdog 已自动收口。"
+                cursor = connection.execute(
+                    """
+                    UPDATE t1_overnight_evidence_runs
+                    SET status = ?, quality_status = CASE WHEN ? = 'partial' THEN 'C' ELSE quality_status END,
+                        error = CASE WHEN error = '' THEN ? ELSE error || '；' || ? END,
+                        finished_at = ?, heartbeat_at = ?, last_stage_at = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE id = ? AND status IN ('pending', 'running')
+                    """,
+                    (status, status, error, error, now_text, now_text, now_text, now_text, now_text, int(row["id"])),
+                )
+                if cursor.rowcount:
+                    recovered_evidence.append({"id": int(row["id"]), "status": status})
+
+            selection_rows = connection.execute(
+                """
+                SELECT id, status, pool_size, semifinal_count, final_count
+                FROM t1_overnight_selection_runs
+                WHERE status IN ('pending', 'running')
+                  AND lease_expires_at != ''
+                  AND datetime(lease_expires_at) < datetime(?)
+                ORDER BY id
+                """,
+                (now_text,),
+            ).fetchall()
+            for row in selection_rows:
+                has_evidence = any(
+                    int(row[column] or 0) > 0 for column in ("pool_size", "semifinal_count", "final_count")
+                )
+                status = "partial" if has_evidence else "failed_timeout"
+                error = "T+1 选股租约过期，watchdog 已自动收口。"
+                cursor = connection.execute(
+                    """
+                    UPDATE t1_overnight_selection_runs
+                    SET status = ?, selection_mode = CASE WHEN selection_mode = '' THEN 'watchdog_timeout' ELSE selection_mode END,
+                        current_stage = 'watchdog_timeout',
+                        error = CASE WHEN error = '' THEN ? ELSE error || '；' || ? END,
+                        finished_at = ?, heartbeat_at = ?, last_stage_at = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE id = ? AND status IN ('pending', 'running')
+                    """,
+                    (status, error, error, now_text, now_text, now_text, now_text, now_text, int(row["id"])),
+                )
+                if cursor.rowcount:
+                    recovered_selection.append({"id": int(row["id"]), "status": status})
+        if recovered_selection or recovered_evidence:
+            LOGGER.warning(
+                "t1 watchdog recovered selection=%s evidence=%s",
+                len(recovered_selection),
+                len(recovered_evidence),
+            )
+        return {"selection": recovered_selection, "evidence": recovered_evidence}
 
     def upsert_t1_overnight_market_snapshots(self, run_id: int, snapshots: List[Dict[str, Any]]) -> int:
         if not snapshots:
@@ -2720,15 +2909,18 @@ class Database:
 
     def create_t1_overnight_selection_run(self, run: Dict[str, Any], pool_items: List[Dict[str, Any]]) -> int:
         now = datetime.now().isoformat(timespec="seconds")
+        heartbeat_at = str(run.get("heartbeatAt") or now)
+        lease_expires_at = str(run.get("leaseExpiresAt") or _lease_expiry(now))
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO t1_overnight_selection_runs(
                   recommendation_date, scan_time, risk_mode, requested_source, actual_source, evidence_run_id, status, selection_mode,
                   total_count, hard_filtered_count, pool_size, batch_size, batch_pick, final_limit,
-                  batch_count, request_json, market_json, created_at, updated_at
+                  batch_count, request_json, market_json, heartbeat_at, lease_expires_at, worker_id,
+                  last_stage_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run.get("recommendationDate") or date.today().isoformat()),
@@ -2748,6 +2940,10 @@ class Database:
                     int(run.get("batchCount") or 0),
                     json.dumps(run.get("request") or {}, ensure_ascii=False),
                     json.dumps(run.get("market") or {}, ensure_ascii=False),
+                    heartbeat_at,
+                    lease_expires_at,
+                    str(run.get("workerId") or ""),
+                    str(run.get("lastStageAt") or now),
                     now,
                     now,
                 ),
@@ -2801,6 +2997,10 @@ class Database:
             "error": "error",
             "startedAt": "started_at",
             "finishedAt": "finished_at",
+            "heartbeatAt": "heartbeat_at",
+            "leaseExpiresAt": "lease_expires_at",
+            "workerId": "worker_id",
+            "lastStageAt": "last_stage_at",
         }
         sets = []
         params: List[Any] = []
@@ -2817,7 +3017,17 @@ class Database:
         if not sets:
             return
         sets.append("updated_at = ?")
-        params.append(datetime.now().isoformat(timespec="seconds"))
+        now = datetime.now().isoformat(timespec="seconds")
+        params.append(now)
+        if "heartbeatAt" not in updates:
+            sets.append("heartbeat_at = ?")
+            params.append(now)
+        if "lastStageAt" not in updates:
+            sets.append("last_stage_at = ?")
+            params.append(now)
+        if "leaseExpiresAt" not in updates:
+            sets.append("lease_expires_at = ?")
+            params.append(_lease_expiry(now))
         params.append(run_id)
         with self.connect() as connection:
             connection.execute(f"UPDATE t1_overnight_selection_runs SET {', '.join(sets)} WHERE id = ?", params)
@@ -3726,6 +3936,10 @@ class Database:
             "error": row["error"],
             "startedAt": row["started_at"],
             "finishedAt": row["finished_at"],
+            "heartbeatAt": row["heartbeat_at"],
+            "leaseExpiresAt": row["lease_expires_at"],
+            "workerId": row["worker_id"],
+            "lastStageAt": row["last_stage_at"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -3753,6 +3967,10 @@ class Database:
             "error": row["error"],
             "startedAt": row["started_at"],
             "finishedAt": row["finished_at"],
+            "heartbeatAt": row["heartbeat_at"],
+            "leaseExpiresAt": row["lease_expires_at"],
+            "workerId": row["worker_id"],
+            "lastStageAt": row["last_stage_at"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -4056,3 +4274,12 @@ def _row_has(row: sqlite3.Row, key: str) -> bool:
         return key in row.keys()
     except AttributeError:
         return False
+
+
+def _lease_expiry(now_text: str, seconds: Optional[float] = None) -> str:
+    lease_seconds = max(30.0, float(seconds or os.getenv("T1_RUN_LEASE_SECONDS", "900")))
+    try:
+        current = datetime.fromisoformat(now_text)
+    except ValueError:
+        current = datetime.now()
+    return (current + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")

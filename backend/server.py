@@ -42,6 +42,7 @@ STOCK_FEEDBACK_V2 = StockAnalysisFeedbackService(SETTINGS, DATABASE, version="v2
 STOCK_ANALYSIS_V2 = StockAnalysisService(SETTINGS, DATABASE, feedback_version="v2")
 AI_FULL_MARKET_SELECTION = AIFullMarketSelectionService(SETTINGS, ANALYSIS, DATABASE)
 T1_OVERNIGHT_SELECTION = T1OvernightSelectionService(SETTINGS, ANALYSIS, DATABASE)
+T1_OVERNIGHT_SELECTION.start_watchdog()
 DAILY_KLINE_CACHE = DailyKlineCacheService(AnalysisService(SETTINGS, DATABASE), DATABASE)
 MORNING_SECTOR_RADAR = MorningSectorRadarService(SETTINGS, DATABASE)
 CROSS_MODULE_VALIDATION = CrossModuleValidationService(SETTINGS, DATABASE)
@@ -181,6 +182,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/t1-overnight-selection/auto-run":
             self._json(T1_OVERNIGHT_SELECTION.auto_run_status())
+            return
+        if parsed.path == "/api/t1-overnight-selection/watchdog":
+            self._json(T1_OVERNIGHT_SELECTION.watchdog_status(recover=False))
             return
         if parsed.path == "/api/t1-overnight-selection/validation-auto-freeze":
             self._json(T1_OVERNIGHT_SELECTION.validation_auto_freeze_status())

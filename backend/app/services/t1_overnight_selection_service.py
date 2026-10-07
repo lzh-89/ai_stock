@@ -101,6 +101,8 @@ T1_INTERNAL_MIN_SECTOR_SAMPLE_COUNT = int(os.getenv("T1_INTERNAL_MIN_SECTOR_SAMP
 T1_INTERNAL_SECTOR_STRENGTH_CAP = int(os.getenv("T1_INTERNAL_SECTOR_STRENGTH_CAP", "68"))
 T1_EVIDENCE_CONSTITUENT_TIMEOUT_SECONDS = int(os.getenv("T1_EVIDENCE_CONSTITUENT_TIMEOUT_SECONDS", str(7 * 60)))
 T1_EVIDENCE_STOCK_PROFILE_TIMEOUT_SECONDS = int(os.getenv("T1_EVIDENCE_STOCK_PROFILE_TIMEOUT_SECONDS", str(2 * 60)))
+T1_RUN_LEASE_SECONDS = max(60, int(os.getenv("T1_RUN_LEASE_SECONDS", str(15 * 60))))
+T1_WATCHDOG_INTERVAL_SECONDS = max(15, int(os.getenv("T1_WATCHDOG_INTERVAL_SECONDS", "30")))
 T1_STOCK_IDENTITY_CACHE_TTL_DAYS = int(os.getenv("T1_STOCK_IDENTITY_CACHE_TTL_DAYS", "30"))
 T1_STOCK_PROFILE_MAX_WORKERS = int(os.getenv("T1_STOCK_PROFILE_MAX_WORKERS", "4"))
 T1_MINUTE_FETCH_CHUNK_SIZE = int(os.getenv("T1_MINUTE_FETCH_CHUNK_SIZE", "80"))
@@ -267,6 +269,67 @@ class T1OvernightSelectionService:
         self._validation_auto_freeze_lock = threading.Lock()
         self._auto_run_thread: Optional[threading.Thread] = None
         self._auto_run_lock = threading.Lock()
+        self.worker_id = f"{socket.gethostname()}:{os.getpid()}"
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._watchdog_stop = threading.Event()
+
+    def start_watchdog(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._watchdog_thread and self._watchdog_thread.is_alive():
+                return {"alive": True, "workerId": self.worker_id}
+            self._watchdog_stop.clear()
+            self._watchdog_thread = threading.Thread(target=self._watchdog_loop, name="t1-watchdog", daemon=True)
+            self._watchdog_thread.start()
+        return {"alive": True, "workerId": self.worker_id}
+
+    def watchdog_status(self, recover: bool = False) -> Dict[str, Any]:
+        result = self.database.recover_stale_t1_runs() if recover else {"selection": [], "evidence": []}
+        return {
+            "alive": bool(self._watchdog_thread and self._watchdog_thread.is_alive()),
+            "workerId": self.worker_id,
+            "intervalSeconds": T1_WATCHDOG_INTERVAL_SECONDS,
+            "leaseSeconds": T1_RUN_LEASE_SECONDS,
+            "recovered": result,
+        }
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(T1_WATCHDOG_INTERVAL_SECONDS):
+            try:
+                self.database.recover_stale_t1_runs()
+            except Exception as error:  # noqa: BLE001 - watchdog must keep running.
+                LOGGER.warning("t1 watchdog failed error=%s", error)
+
+    def _start_run_heartbeat(self, run_id: int) -> tuple[threading.Event, threading.Thread]:
+        stop = threading.Event()
+        interval = max(5.0, min(30.0, T1_RUN_LEASE_SECONDS / 3))
+
+        def refresh() -> None:
+            while not stop.wait(interval):
+                now = datetime.now()
+                heartbeat = now.isoformat(timespec="seconds")
+                lease = (now + timedelta(seconds=T1_RUN_LEASE_SECONDS)).isoformat(timespec="seconds")
+                try:
+                    run = self.database.load_t1_overnight_selection_run(run_id)
+                    if not run or run.get("status") not in {"pending", "running"}:
+                        return
+                    self.database.update_t1_overnight_selection_run(
+                        run_id,
+                        {"heartbeatAt": heartbeat, "leaseExpiresAt": lease},
+                    )
+                    evidence_id = int(run.get("evidenceRunId") or 0)
+                    if evidence_id > 0:
+                        evidence = self.database.load_t1_overnight_evidence_run(evidence_id)
+                        if evidence and evidence.get("status") in {"pending", "running"}:
+                            self.database.update_t1_overnight_evidence_run(
+                                evidence_id,
+                                {"heartbeatAt": heartbeat, "leaseExpiresAt": lease},
+                            )
+                except Exception as error:  # noqa: BLE001 - watchdog handles a missed beat.
+                    LOGGER.warning("t1 heartbeat refresh failed id=%s error=%s", run_id, error)
+
+        thread = threading.Thread(target=refresh, name=f"t1-heartbeat-{run_id}", daemon=True)
+        thread.start()
+        return stop, thread
 
     def start_run(
         self,
@@ -355,6 +418,8 @@ class T1OvernightSelectionService:
                     "stageConfig": stage_config,
                     "stageControls": stage_status,
                 },
+                "workerId": self.worker_id,
+                "leaseExpiresAt": (datetime.now() + timedelta(seconds=T1_RUN_LEASE_SECONDS)).isoformat(timespec="seconds"),
                 "market": {
                     "scanTime": scan_time,
                     "recommendedFinalTime": DEFAULT_SCAN_TIME,
@@ -2723,6 +2788,8 @@ class T1OvernightSelectionService:
                 },
                 "market": market,
                 "startedAt": now,
+                "workerId": self.worker_id,
+                "leaseExpiresAt": (datetime.now() + timedelta(seconds=T1_RUN_LEASE_SECONDS)).isoformat(timespec="seconds"),
             }
         )
         missing: List[str] = []
@@ -3123,10 +3190,21 @@ class T1OvernightSelectionService:
             self._start_thread(int(run["id"]))
 
     def _run_worker(self, run_id: int) -> None:
-        self.database.update_t1_overnight_selection_run(
-            run_id,
-            {"status": "running", "startedAt": datetime.now().isoformat(timespec="seconds"), "currentStage": "loading_market"},
-        )
+        try:
+            self.database.update_t1_overnight_selection_run(
+                run_id,
+                {
+                    "status": "running",
+                    "startedAt": datetime.now().isoformat(timespec="seconds"),
+                    "currentStage": "loading_market",
+                    "workerId": self.worker_id,
+                    "leaseExpiresAt": (datetime.now() + timedelta(seconds=T1_RUN_LEASE_SECONDS)).isoformat(timespec="seconds"),
+                },
+            )
+        except Exception as error:  # noqa: BLE001 - watchdog will close the pending lease.
+            LOGGER.error("t1 overnight run could not claim lease id=%s error=%s", run_id, error)
+            return
+        heartbeat_stop, heartbeat_thread = self._start_run_heartbeat(run_id)
         try:
             run = self.database.load_t1_overnight_selection_run(run_id)
             if not run:
@@ -3373,17 +3451,23 @@ class T1OvernightSelectionService:
             )
             LOGGER.info("t1 overnight select saved selection_mode=%s top=%s", selection_mode, len(final_selected))
         except Exception as error:  # noqa: BLE001
-            self.database.update_t1_overnight_selection_run(
-                run_id,
-                {
-                    "status": "failed",
-                    "selectionMode": "ai_failed",
-                    "currentStage": "failed",
-                    "error": str(error),
-                    "finishedAt": datetime.now().isoformat(timespec="seconds"),
-                },
-            )
+            try:
+                self.database.update_t1_overnight_selection_run(
+                    run_id,
+                    {
+                        "status": "failed",
+                        "selectionMode": "ai_failed",
+                        "currentStage": "failed",
+                        "error": str(error),
+                        "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                    },
+                )
+            except Exception as state_error:  # noqa: BLE001 - leave recovery to watchdog.
+                LOGGER.error("t1 overnight failure state could not be saved id=%s error=%s", run_id, state_error)
             LOGGER.exception("t1 overnight run failed id=%s error=%s", run_id, error)
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1.0)
 
     def _ai_available(self) -> bool:
         return bool(self.settings.enable_ai and self.settings.ai_api_key and self.settings.ai_base_url)

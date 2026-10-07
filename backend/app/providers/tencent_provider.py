@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import os
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
@@ -20,6 +21,9 @@ from backend.app.providers.provider_common import (
 )
 from backend.app.schema import Catalyst, RawStock
 from backend.app.universe_store import load_universe_items
+
+
+TENCENT_SNAPSHOT_TIMEOUT_SECONDS = float(os.getenv("TENCENT_SNAPSHOT_TIMEOUT_SECONDS", "8"))
 
 
 class TencentProvider:
@@ -57,7 +61,7 @@ class TencentProvider:
     def _fetch_symbols(self, symbols: List[str]) -> List[Dict[str, Any]]:
         url = f"https://qt.gtimg.cn/q={','.join(symbols)}"
         request = urllib.request.Request(url, headers={"Referer": "https://gu.qq.com/", "User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(request, timeout=12) as response:
+        with urllib.request.urlopen(request, timeout=TENCENT_SNAPSHOT_TIMEOUT_SECONDS) as response:
             body = response.read().decode("gbk", errors="ignore")
         rows: List[Dict[str, Any]] = []
         for line in body.split(";"):
