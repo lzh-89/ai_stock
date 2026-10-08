@@ -51,6 +51,7 @@ AI_RESULT_CACHE_KEY = "t1_overnight_ai_result_cache"
 HISTORY_SOFT_CLEANUP_SETTING_KEY = "t1_overnight_history_soft_cleanup"
 VALIDATION_AUTO_FREEZE_STATE_KEY = "t1_overnight_validation_auto_freeze_state"
 AUTO_RUN_STATE_KEY = "t1_overnight_auto_run_state"
+MARKET_PREFETCH_STATE_KEY = "t1_overnight_market_prefetch_state"
 TRADEABLE_VALIDATION_VERSION = "v2_tradeable"
 THEORETICAL_VALIDATION_VERSION = "v1_theoretical"
 HISTORY_SOFT_CLEANUP_VERSION = "v2_semantic_evidence_isolation"
@@ -109,6 +110,8 @@ T1_MINUTE_FETCH_CHUNK_SIZE = int(os.getenv("T1_MINUTE_FETCH_CHUNK_SIZE", "80"))
 T1_MINUTE_FETCH_ATTEMPTS = int(os.getenv("T1_MINUTE_FETCH_ATTEMPTS", "2"))
 T1_MINUTE_FETCH_CHUNK_SLEEP_SECONDS = float(os.getenv("T1_MINUTE_FETCH_CHUNK_SLEEP_SECONDS", "0.15"))
 T1_MINUTE_FETCH_RETRY_SLEEP_SECONDS = float(os.getenv("T1_MINUTE_FETCH_RETRY_SLEEP_SECONDS", "0.8"))
+T1_MINUTE_MAX_CODES = max(1, int(os.getenv("T1_MINUTE_MAX_CODES", "120")))
+T1_TAIL_MINUTE_MAX_CODES = max(1, int(os.getenv("T1_TAIL_MINUTE_MAX_CODES", "30")))
 T1_ENABLE_THS_CONSTITUENTS = str(os.getenv("T1_ENABLE_THS_CONSTITUENTS", "0")).lower() in {"1", "true", "yes"}
 
 AI_SELECTION_OUTPUT_PROTOCOL = "structured_selection_slip"
@@ -145,6 +148,7 @@ def _env_bool(value: Optional[str], default: bool) -> bool:
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
 
+T1_IDENTITY_LIVE_FETCH_ENABLED = _env_bool(os.getenv("T1_IDENTITY_LIVE_FETCH_ENABLED"), False)
 T1_TRADING_DAY_GUARD_ENV = os.getenv("T1_TRADING_DAY_GUARD_ENABLED")
 T1_SECTOR_STATE_SHADOW_ENV = os.getenv("T1_SECTOR_STATE_SHADOW_ENABLED")
 T1_SECTOR_STATE_PROMPT_ENV = os.getenv("T1_SECTOR_STATE_PROMPT_ENABLED")
@@ -256,6 +260,13 @@ DEFAULT_AUTO_RUN_CONFIG = {
     "force": False,
     "retainDays": 10,
 }
+DEFAULT_MARKET_PREFETCH_CONFIG = {
+    "enabled": True,
+    "scheduleTimes": ["14:20", "14:25", "14:30", "14:35", "14:39", "14:40"],
+    "pollIntervalSeconds": 45,
+    "source": "auto",
+    "retainDays": 10,
+}
 
 
 class T1OvernightSelectionService:
@@ -269,6 +280,10 @@ class T1OvernightSelectionService:
         self._validation_auto_freeze_lock = threading.Lock()
         self._auto_run_thread: Optional[threading.Thread] = None
         self._auto_run_lock = threading.Lock()
+        self._market_prefetch_thread: Optional[threading.Thread] = None
+        self._market_prefetch_lock = threading.Lock()
+        self._identity_backfill_lock = threading.Lock()
+        self._identity_backfill_codes: set[str] = set()
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}"
         self._watchdog_thread: Optional[threading.Thread] = None
         self._watchdog_stop = threading.Event()
@@ -298,6 +313,153 @@ class T1OvernightSelectionService:
                 self.database.recover_stale_t1_runs()
             except Exception as error:  # noqa: BLE001 - watchdog must keep running.
                 LOGGER.warning("t1 watchdog failed error=%s", error)
+
+    def market_prefetch_status(self) -> Dict[str, Any]:
+        state = _normalize_market_prefetch_state(self.database.get_app_setting(MARKET_PREFETCH_STATE_KEY, {}))
+        state["schedulerAlive"] = bool(self._market_prefetch_thread and self._market_prefetch_thread.is_alive())
+        state["nextSlots"] = _market_prefetch_due_slots(
+            datetime.now(), state.get("config") or DEFAULT_MARKET_PREFETCH_CONFIG, state, include_future=True
+        )
+        return state
+
+    def start_market_prefetch_scheduler(self) -> Dict[str, Any]:
+        state = _normalize_market_prefetch_state(self.database.get_app_setting(MARKET_PREFETCH_STATE_KEY, {}))
+        config = state.get("config") or DEFAULT_MARKET_PREFETCH_CONFIG
+        if not bool(config.get("enabled")):
+            state["schedulerAlive"] = False
+            return state
+        with self._market_prefetch_lock:
+            if self._market_prefetch_thread and self._market_prefetch_thread.is_alive():
+                state["schedulerAlive"] = True
+                return state
+            self._market_prefetch_thread = threading.Thread(
+                target=self._market_prefetch_loop,
+                name="t1-market-prefetch",
+                daemon=True,
+            )
+            self._market_prefetch_thread.start()
+        state["schedulerAlive"] = True
+        return state
+
+    def run_market_prefetch_due(
+        self,
+        trigger_source: str = "manual",
+        now: Optional[datetime] = None,
+        slot: str = "",
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        now_dt = now or datetime.now()
+        with self._market_prefetch_lock:
+            state = _normalize_market_prefetch_state(self.database.get_app_setting(MARKET_PREFETCH_STATE_KEY, {}))
+            config = state.get("config") or DEFAULT_MARKET_PREFETCH_CONFIG
+            checked_at = now_dt.isoformat(timespec="seconds")
+            state["lastCheckAt"] = checked_at
+            if not bool(config.get("enabled")) and not force:
+                state["lastStatus"] = "disabled"
+                self.database.set_app_setting(MARKET_PREFETCH_STATE_KEY, state)
+                return {**state, "processed": []}
+            today = now_dt.date().isoformat()
+            if now_dt.weekday() >= 5 and not force:
+                state["lastStatus"] = "non_trading_day_skipped"
+                state["lastMessage"] = "今天是周末，全市场 T+1 预取跳过。"
+                self.database.set_app_setting(MARKET_PREFETCH_STATE_KEY, state)
+                return {**state, "processed": []}
+            slots = [_normalize_scan_time(slot)] if slot else _market_prefetch_due_slots(now_dt, config, state)
+            processed: List[Dict[str, Any]] = []
+            for due_slot in slots:
+                try:
+                    snapshot = self.analysis_service.full_market_context_store.prefetch(
+                        source=str(config.get("source") or "auto"), force=True
+                    )
+                    meta = market_context_meta(snapshot)
+                    event = {
+                        "status": "done",
+                        "slot": due_slot,
+                        "tradeDate": today,
+                        "triggerSource": trigger_source,
+                        "checkedAt": checked_at,
+                        "snapshotVersion": meta.get("snapshotVersion") or "",
+                        "source": meta.get("source") or "",
+                        "snapshotStatus": meta.get("status") or "",
+                        "coverage": meta.get("coverage") or {},
+                        "failedPages": meta.get("failedPages") or [],
+                        "message": f"{today} {due_slot} 全市场快照预取完成。",
+                    }
+                except Exception as error:  # noqa: BLE001 - scheduler must remain alive.
+                    LOGGER.warning("t1 market prefetch failed slot=%s error=%s", due_slot, error)
+                    event = {
+                        "status": "failed",
+                        "slot": due_slot,
+                        "tradeDate": today,
+                        "triggerSource": trigger_source,
+                        "checkedAt": checked_at,
+                        "message": str(error),
+                    }
+                processed.append(event)
+                _record_market_prefetch_event(state, today, due_slot, event, config)
+            state["lastStatus"] = processed[-1].get("status") if processed else "waiting"
+            state["lastMessage"] = processed[-1].get("message", "") if processed else "未到全市场预取时间。"
+            self.database.set_app_setting(MARKET_PREFETCH_STATE_KEY, state)
+            return {**state, "processed": processed}
+
+    def _market_prefetch_loop(self) -> None:
+        while True:
+            try:
+                state = _normalize_market_prefetch_state(self.database.get_app_setting(MARKET_PREFETCH_STATE_KEY, {}))
+                config = state.get("config") or DEFAULT_MARKET_PREFETCH_CONFIG
+                if bool(config.get("enabled")):
+                    self.run_market_prefetch_due(trigger_source="scheduler")
+                interval = _clamp_int(config.get("pollIntervalSeconds"), 15, 300, 45)
+            except Exception as error:  # noqa: BLE001 - scheduler must not kill the server.
+                LOGGER.warning("t1 market prefetch scheduler tick failed error=%s", error)
+                interval = 45
+            time.sleep(interval)
+
+    def _queue_t1_identity_backfill(self, stocks: List[RawStock], source: str = "auto") -> int:
+        """Refresh missing identity rows off the formal T+1 critical path."""
+        candidates = []
+        with self._identity_backfill_lock:
+            for stock in stocks:
+                code = _normalize_code(stock.code)
+                if code and code not in self._identity_backfill_codes:
+                    self._identity_backfill_codes.add(code)
+                    candidates.append(stock)
+        if not candidates:
+            return 0
+
+        def worker() -> None:
+            try:
+                provider = get_sector_provider("mock" if source == "mock" else "auto")
+                fetcher = getattr(provider, "fetch_stock_sector_profile", None)
+                if not callable(fetcher):
+                    return
+                rows: List[Dict[str, Any]] = []
+                for stock in candidates:
+                    try:
+                        profile = fetcher(_normalize_code(stock.code))
+                        mapped = _profile_map_from_identity(
+                            profile,
+                            stock,
+                            evidence_run_id=0,
+                            recommendation_date=date.today().isoformat(),
+                            scan_time=DEFAULT_SCAN_TIME,
+                            identity_status="available",
+                        )
+                        if mapped:
+                            rows.extend(_identity_cache_rows_from_profile_maps([mapped]))
+                    except Exception as error:  # noqa: BLE001 - one missing identity must not stop the queue.
+                        LOGGER.warning("t1 async identity backfill failed code=%s error=%s", stock.code, error)
+                if rows:
+                    self.database.upsert_t1_stock_sector_identity_cache(rows)
+            except Exception as error:  # noqa: BLE001 - background refresh is best effort.
+                LOGGER.warning("t1 async identity backfill failed error=%s", error)
+            finally:
+                with self._identity_backfill_lock:
+                    for stock in candidates:
+                        self._identity_backfill_codes.discard(_normalize_code(stock.code))
+
+        threading.Thread(target=worker, name="t1-identity-backfill", daemon=True).start()
+        return len(candidates)
 
     def _start_run_heartbeat(self, run_id: int) -> tuple[threading.Event, threading.Thread]:
         stop = threading.Event()
@@ -2481,15 +2643,22 @@ class T1OvernightSelectionService:
         preliminary_candidates = _layered_t1_pool([candidate for _, candidate in preliminary], pool_size)
         preliminary_by_code = {candidate.get("code"): candidate for candidate in preliminary_candidates}
         preliminary = [(stock, preliminary_by_code[stock.code]) for stock, _ in preliminary if stock.code in preliminary_by_code]
+        evidence_stocks = [stock for stock, _ in preliminary]
+        minute_layer_codes = _unique_codes([stock.code for stock in evidence_stocks[:T1_MINUTE_MAX_CODES]])
+        tail_minute_layer_codes = minute_layer_codes[:T1_TAIL_MINUTE_MAX_CODES]
+        if str(self.settings.kline_period or "").lower() == T1_TAIL_MINUTE_PERIOD:
+            minute_layer_codes = tail_minute_layer_codes
         evidence = self._prepare_t1_evidence_run(
             requested_source=source,
             actual_source=provider.source,
             scan_time=scan_time,
             market=market,
-            stocks=[stock for stock, _ in preliminary],
+            stocks=evidence_stocks,
             force=force,
             recommendation_date=recommendation_date,
             stage_controls=stage_controls,
+            minute_codes=minute_layer_codes,
+            tail_minute_codes=tail_minute_layer_codes,
         )
         evidence_run = evidence.get("run") or {}
         evidence_run_id = int(evidence_run.get("id") or 0)
@@ -2517,7 +2686,10 @@ class T1OvernightSelectionService:
                 sector_evidence=sector_evidence_by_code.get(_normalize_code(stock.code)),
             )
             enriched = _apply_data_quality(annotated, provider.source, market)
-            minute = tail_minute_by_code.get(_normalize_code(stock.code)) or minute_by_code.get(_normalize_code(stock.code)) or {}
+            code = _normalize_code(stock.code)
+            minute = tail_minute_by_code.get(code) or {}
+            if not minute and str(self.settings.kline_period or "").lower() == T1_TAIL_MINUTE_PERIOD:
+                minute = minute_by_code.get(code) or {}
             enriched.update(
                 _p1_shadow_features(
                     candidate=enriched,
@@ -2541,7 +2713,7 @@ class T1OvernightSelectionService:
         market["dataQualityStats"] = data_quality_stats
         market["minuteKlineStatus"] = _minute_kline_status(
             provider=getattr(self.analysis_service, "kline_provider", None),
-            requested=len(preliminary),
+            requested=len(minute_layer_codes),
             attached=attached_kline_count,
             period=self.settings.kline_period,
         )
@@ -2599,10 +2771,13 @@ class T1OvernightSelectionService:
             market["mockStatus"] = {"used": True, "reason": "用户手动选择 Mock 数据源"}
             return provider, market, raw_stocks, provider_warning
 
-        frozen = self.analysis_service.full_market_context_store.latest_cached()
+        context_store = self.analysis_service.full_market_context_store
+        frozen = context_store.latest_for_scan(date.today().isoformat(), scan_time, source=source)
+        if not frozen:
+            frozen = context_store.latest_cached()
         frozen_stocks = frozen.get("stocks") or []
         frozen_meta = market_context_meta(frozen) if frozen else {}
-        if _usable_t1_full_market_freeze(frozen, source):
+        if _usable_t1_full_market_freeze(frozen, source, scan_time=scan_time):
             market = dict(frozen.get("market") or {})
             generated_at = str(frozen_meta.get("generatedAt") or "")
             actual = str(frozen_meta.get("source") or "unknown")
@@ -2619,12 +2794,24 @@ class T1OvernightSelectionService:
                 "count": len(frozen_stocks),
                 "source": actual,
                 "scanTime": scan_time,
+                "snapshotVersion": frozen_meta.get("snapshotVersion") or "",
+                "status": frozen_meta.get("status") or "",
+                "tradeDate": frozen_meta.get("tradeDate") or "",
+                "asOfTime": frozen_meta.get("asOfTime") or generated_at,
+                "coverage": frozen_meta.get("coverage") or {},
+                "failedPages": frozen_meta.get("failedPages") or [],
             }
             market["marketSnapshotFreeze"] = {
                 "enabled": True,
                 "reused": True,
                 "source": actual,
                 "generatedAt": generated_at,
+                "snapshotVersion": frozen_meta.get("snapshotVersion") or "",
+                "status": frozen_meta.get("status") or "",
+                "tradeDate": frozen_meta.get("tradeDate") or "",
+                "asOfTime": frozen_meta.get("asOfTime") or generated_at,
+                "coverage": frozen_meta.get("coverage") or {},
+                "failedPages": frozen_meta.get("failedPages") or [],
                 "ageSeconds": int(frozen_meta.get("ageSeconds") or 0),
                 "reuseWindowSeconds": T1_FULL_MARKET_FREEZE_REUSE_SECONDS,
                 "count": len(frozen_stocks),
@@ -2643,27 +2830,43 @@ class T1OvernightSelectionService:
                 market_stocks = self.analysis_service._confirmed_universe(stocks)
                 market = dict(provider.fetch_market(market_stocks) or {})
                 generated_at = datetime.now().isoformat(timespec="seconds")
+                cache_meta: Dict[str, Any] = {}
                 try:
                     context = self.analysis_service.full_market_context_store._write_cache(
                         stocks=stocks,
                         requested_source=refresh_source,
                         actual_source=refresh_source,
                         warning="",
+                        provider_meta=dict(getattr(provider, "last_meta", {}) or {}),
                     )
-                    meta = market_context_meta(context)
-                    generated_at = str(meta.get("generatedAt") or generated_at)
+                    cache_meta = market_context_meta(context)
+                    generated_at = str(cache_meta.get("generatedAt") or generated_at)
                 except Exception as cache_error:  # noqa: BLE001 - cache write must not break live T+1 selection.
                     LOGGER.warning("t1 full market cache write failed source=%s error=%s", refresh_source, cache_error)
                 warning = _join_warning(
                     f"已使用 {refresh_source} 真实全市场行情，生成时间 {generated_at or '--'}。",
                 )
                 market["providerWarning"] = warning
-                market["cacheStatus"] = {"used": False, "generatedAt": generated_at, "count": len(stocks)}
+                market["cacheStatus"] = {
+                    "used": False,
+                    "generatedAt": generated_at,
+                    "count": len(stocks),
+                    "snapshotVersion": cache_meta.get("snapshotVersion") or "",
+                    "status": cache_meta.get("status") or "",
+                    "coverage": cache_meta.get("coverage") or {},
+                    "failedPages": cache_meta.get("failedPages") or [],
+                }
                 market["marketSnapshotFreeze"] = {
                     "enabled": True,
                     "reused": False,
                     "source": refresh_source,
                     "generatedAt": generated_at,
+                    "snapshotVersion": cache_meta.get("snapshotVersion") or "",
+                    "status": cache_meta.get("status") or "",
+                    "tradeDate": cache_meta.get("tradeDate") or date.today().isoformat(),
+                    "asOfTime": cache_meta.get("asOfTime") or generated_at,
+                    "coverage": cache_meta.get("coverage") or {},
+                    "failedPages": cache_meta.get("failedPages") or [],
                     "reuseWindowSeconds": T1_FULL_MARKET_FREEZE_REUSE_SECONDS,
                     "count": len(stocks),
                 }
@@ -2676,7 +2879,7 @@ class T1OvernightSelectionService:
         cached = self.analysis_service.full_market_context_store.latest_cached()
         cached_stocks = cached.get("stocks") or []
         try:
-            if len(cached_stocks) >= 1200:
+            if len(cached_stocks) >= 1200 and _usable_t1_full_market_freeze(cached, source, scan_time=scan_time, allow_stale=True):
                 meta = market_context_meta(cached)
                 market = dict(cached.get("market") or {})
                 warning = _join_warning(
@@ -2692,8 +2895,29 @@ class T1OvernightSelectionService:
                     "ageSeconds": int(meta.get("ageSeconds") or 0),
                     "count": len(cached_stocks),
                     "fallbackReason": "；".join(refresh_errors),
+                    "snapshotVersion": meta.get("snapshotVersion") or "",
+                    "status": meta.get("status") or "",
+                    "tradeDate": meta.get("tradeDate") or "",
+                    "asOfTime": meta.get("asOfTime") or meta.get("generatedAt") or "",
+                    "coverage": meta.get("coverage") or {},
+                    "failedPages": meta.get("failedPages") or [],
                 }
                 provider = SimpleNamespace(source=f"cache:{meta.get('source') or 'unknown'}")
+                market["marketSnapshotFreeze"] = {
+                    "enabled": True,
+                    "reused": True,
+                    "source": meta.get("source") or "unknown",
+                    "generatedAt": meta.get("generatedAt") or "",
+                    "snapshotVersion": meta.get("snapshotVersion") or "",
+                    "status": meta.get("status") or "",
+                    "tradeDate": meta.get("tradeDate") or "",
+                    "asOfTime": meta.get("asOfTime") or meta.get("generatedAt") or "",
+                    "coverage": meta.get("coverage") or {},
+                    "failedPages": meta.get("failedPages") or [],
+                    "ageSeconds": int(meta.get("ageSeconds") or 0),
+                    "reuseWindowSeconds": T1_FULL_MARKET_FREEZE_REUSE_SECONDS,
+                    "count": len(cached_stocks),
+                }
                 return provider, market, cached_stocks, warning
             provider, market, raw_stocks, provider_warning = self.analysis_service._load_market_data("mock")
             market = dict(market or {})
@@ -2729,11 +2953,18 @@ class T1OvernightSelectionService:
         force: bool = False,
         recommendation_date: str = "",
         stage_controls: Optional[Dict[str, Any]] = None,
+        minute_codes: Optional[List[str]] = None,
+        tail_minute_codes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         recommendation_date = str(recommendation_date or date.today().isoformat())
         stage_controls = stage_controls or market.get("stageControls") or self.stage_status()
         market["stageControls"] = stage_controls
         codes = _unique_codes([stock.code for stock in stocks])
+        code_set = set(codes)
+        minute_codes = [code for code in _unique_codes(minute_codes or codes) if code in code_set]
+        tail_minute_codes = [code for code in _unique_codes(tail_minute_codes or minute_codes) if code in set(minute_codes)]
+        minute_candidate_count = len(minute_codes)
+        tail_minute_candidate_count = len(tail_minute_codes)
         existing = self.database.latest_reusable_t1_overnight_evidence_run(
             recommendation_date=recommendation_date,
             scan_time=scan_time,
@@ -2743,8 +2974,8 @@ class T1OvernightSelectionService:
         if existing:
             existing_request = existing.get("request") or {}
             sector_maps = self.database.load_t1_overnight_stock_sector_maps(int(existing["id"]), codes)
-            minute_maps = self.database.load_t1_overnight_minute_snapshots(int(existing["id"]), codes, period=self.settings.kline_period)
-            tail_minute_maps = self.database.load_t1_overnight_minute_snapshots(int(existing["id"]), codes, period=T1_TAIL_MINUTE_PERIOD)
+            minute_maps = self.database.load_t1_overnight_minute_snapshots(int(existing["id"]), minute_codes, period=self.settings.kline_period)
+            tail_minute_maps = self.database.load_t1_overnight_minute_snapshots(int(existing["id"]), tail_minute_codes, period=T1_TAIL_MINUTE_PERIOD)
             requires_sector_state = _stage_control_enabled(
                 market.get("stageControls") or {},
                 "sectorStateShadow",
@@ -2754,9 +2985,9 @@ class T1OvernightSelectionService:
                 existing_request.get("version") == T1_EVIDENCE_VERSION
                 and existing_request.get("evidenceCoverage")
                 and len(sector_maps) >= len(codes)
-                and len(minute_maps) >= len(codes)
-                and len(tail_minute_maps) >= len(codes)
-                and _t1_evidence_run_is_reusable(existing, len(codes))
+                and len(minute_maps) >= len(minute_codes)
+                and len(tail_minute_maps) >= len(tail_minute_codes)
+                and _t1_evidence_run_is_reusable(existing, len(codes), requested_minute_count=minute_candidate_count)
                 and (not requires_sector_state or _t1_sector_maps_have_state_field(sector_maps))
             ):
                 return {
@@ -2784,6 +3015,10 @@ class T1OvernightSelectionService:
                     "actualSource": actual_source,
                     "scanTime": scan_time,
                     "candidateCount": len(codes),
+                    "minuteCandidateCount": minute_candidate_count,
+                    "tailMinuteCandidateCount": tail_minute_candidate_count,
+                    "minuteCodes": minute_codes,
+                    "tailMinuteCodes": tail_minute_codes,
                     "force": bool(force),
                 },
                 "market": market,
@@ -2841,13 +3076,18 @@ class T1OvernightSelectionService:
         sector_provider = None
         try:
             sector_provider = get_sector_provider("mock" if requested_source == "mock" or actual_source == "mock" else "auto")
-            profile_maps = _fetch_t1_stock_sector_profile_maps(
-                provider=sector_provider,
-                stocks=stocks_requiring_profile_fetch,
-                evidence_run_id=evidence_run_id,
-                recommendation_date=recommendation_date,
-                scan_time=scan_time,
-            )
+            if T1_IDENTITY_LIVE_FETCH_ENABLED:
+                profile_maps = _fetch_t1_stock_sector_profile_maps(
+                    provider=sector_provider,
+                    stocks=stocks_requiring_profile_fetch,
+                    evidence_run_id=evidence_run_id,
+                    recommendation_date=recommendation_date,
+                    scan_time=scan_time,
+                )
+            else:
+                queued = self._queue_t1_identity_backfill(stocks_requiring_profile_fetch, source=actual_source)
+                if queued:
+                    warnings.append(f"{queued} 只股票行业/概念身份缺失，已进入异步补拉队列")
             identity_cache_stats["fetchSucceeded"] = len(profile_maps)
             cache_rows = _identity_cache_rows_from_profile_maps(profile_maps)
             if cache_rows:
@@ -2914,14 +3154,19 @@ class T1OvernightSelectionService:
             LOGGER.warning("t1 evidence sector collection failed run=%s error=%s", evidence_run_id, error)
             missing.append(message)
             if not profile_maps:
-                profile_maps = _fetch_t1_stock_sector_profile_maps(
-                    provider=sector_provider,
-                    stocks=stocks_requiring_profile_fetch,
-                    evidence_run_id=evidence_run_id,
-                    recommendation_date=recommendation_date,
-                    scan_time=scan_time,
-                    base_reason=message,
-                )
+                if T1_IDENTITY_LIVE_FETCH_ENABLED:
+                    profile_maps = _fetch_t1_stock_sector_profile_maps(
+                        provider=sector_provider,
+                        stocks=stocks_requiring_profile_fetch,
+                        evidence_run_id=evidence_run_id,
+                        recommendation_date=recommendation_date,
+                        scan_time=scan_time,
+                        base_reason=message,
+                    )
+                else:
+                    queued = self._queue_t1_identity_backfill(stocks_requiring_profile_fetch, source=actual_source)
+                    if queued:
+                        missing.append(f"{queued} 只股票行业/概念身份缺失，已进入异步补拉队列")
                 identity_cache_stats["fetchSucceeded"] = len(profile_maps)
                 cache_rows = _identity_cache_rows_from_profile_maps(profile_maps)
                 if cache_rows:
@@ -2989,6 +3234,8 @@ class T1OvernightSelectionService:
 
         minute_source = ""
         minute_rows: List[Dict[str, Any]] = []
+        minute_code_set = set(minute_codes)
+        tail_minute_code_set = set(tail_minute_codes)
         if actual_source == "mock" or requested_source == "mock":
             missing.append("Mock 数据不采集真实分钟线")
             minute_rows = [
@@ -2996,8 +3243,8 @@ class T1OvernightSelectionService:
                     "code": code,
                     "period": self.settings.kline_period,
                     "source": "mock",
-                    "qualityStatus": "unavailable",
-                    "error": "Mock 数据不采集真实分钟线",
+                    "qualityStatus": "research_only" if code not in minute_code_set else "unavailable",
+                    "error": "未进入 15m 候选层级" if code not in minute_code_set else "Mock 数据不采集真实分钟线",
                     "series": [],
                 }
                 for code in codes
@@ -3007,7 +3254,7 @@ class T1OvernightSelectionService:
                 minute_rows_by_code = _fetch_t1_minute_rows_with_retries(
                     self.database,
                     self.analysis_service.kline_provider,
-                    codes=codes,
+                    codes=minute_codes,
                     period=self.settings.kline_period,
                     recommendation_date=recommendation_date,
                     exclude_run_id=evidence_run_id,
@@ -3017,6 +3264,19 @@ class T1OvernightSelectionService:
                 if provider_warning:
                     warnings.append(provider_warning)
                 for code in codes:
+                    if code not in minute_code_set:
+                        minute_rows.append(
+                            {
+                                "code": code,
+                                "period": self.settings.kline_period,
+                                "source": "",
+                                "qualityStatus": "research_only",
+                                "error": "未进入 15m 候选层级，未请求分钟线",
+                                "series": [],
+                                "pointCount": 0,
+                            }
+                        )
+                        continue
                     row = dict(minute_rows_by_code.get(code) or {})
                     if row:
                         row["code"] = code
@@ -3036,8 +3296,9 @@ class T1OvernightSelectionService:
                             "pointCount": 0,
                         }
                     minute_rows.append(row)
-                if len([item for item in minute_rows if item.get("series")]) < len(codes):
-                    missing.append(f"真实分钟线缺失 {len(codes) - len([item for item in minute_rows if item.get('series')])}/{len(codes)}")
+                minute_count = len([item for item in minute_rows if item.get("series")])
+                if minute_count < len(minute_codes):
+                    missing.append(f"真实 15m 分钟线缺失 {len(minute_codes) - minute_count}/{len(minute_codes)}")
             except Exception as error:  # noqa: BLE001
                 message = f"T+1 分钟线采集失败：{error}"
                 LOGGER.warning("t1 evidence minute collection failed run=%s error=%s", evidence_run_id, error)
@@ -3047,8 +3308,8 @@ class T1OvernightSelectionService:
                         "code": code,
                         "period": self.settings.kline_period,
                         "source": "",
-                        "qualityStatus": "unavailable",
-                        "error": message,
+                        "qualityStatus": "research_only" if code not in minute_code_set else "unavailable",
+                        "error": "未进入 15m 候选层级" if code not in minute_code_set else message,
                         "series": [],
                         "pointCount": 0,
                     }
@@ -3062,13 +3323,26 @@ class T1OvernightSelectionService:
                 tail_rows_by_code = _fetch_t1_minute_rows_with_retries(
                     self.database,
                     self.analysis_service.kline_provider,
-                    codes=codes,
+                    codes=tail_minute_codes,
                     period=T1_TAIL_MINUTE_PERIOD,
                     recommendation_date=recommendation_date,
                     exclude_run_id=evidence_run_id,
                 )
                 tail_minute_rows = []
                 for code in codes:
+                    if code not in tail_minute_code_set:
+                        tail_minute_rows.append(
+                            {
+                                "code": code,
+                                "period": T1_TAIL_MINUTE_PERIOD,
+                                "source": "",
+                                "qualityStatus": "research_only",
+                                "error": "未进入 1m 尾盘候选层级，未请求分钟线",
+                                "series": [],
+                                "pointCount": 0,
+                            }
+                        )
+                        continue
                     row = dict(tail_rows_by_code.get(code) or {})
                     if row:
                         row["code"] = code
@@ -3089,8 +3363,8 @@ class T1OvernightSelectionService:
                         }
                     tail_minute_rows.append(row)
                 tail_count = len([item for item in tail_minute_rows if item.get("series")])
-                if tail_count < len(codes):
-                    missing.append(f"T+1 尾盘 1m 证据缺失 {len(codes) - tail_count}/{len(codes)}；缺失候选只做尾盘影子数据不足")
+                if tail_count < len(tail_minute_codes):
+                    missing.append(f"T+1 尾盘 1m 证据缺失 {len(tail_minute_codes) - tail_count}/{len(tail_minute_codes)}；缺失候选只做尾盘影子数据不足")
             except Exception as error:  # noqa: BLE001
                 message = f"T+1 尾盘 1m 证据采集失败：{error}"
                 LOGGER.warning("t1 evidence tail minute collection failed run=%s error=%s", evidence_run_id, error)
@@ -3100,8 +3374,8 @@ class T1OvernightSelectionService:
                         "code": code,
                         "period": T1_TAIL_MINUTE_PERIOD,
                         "source": "",
-                        "qualityStatus": "unavailable",
-                        "error": message,
+                        "qualityStatus": "research_only" if code not in tail_minute_code_set else "unavailable",
+                        "error": "未进入 1m 尾盘候选层级" if code not in tail_minute_code_set else message,
                         "series": [],
                         "pointCount": 0,
                     }
@@ -3133,6 +3407,10 @@ class T1OvernightSelectionService:
             "actualSource": actual_source,
             "scanTime": scan_time,
             "candidateCount": len(codes),
+            "minuteCandidateCount": minute_candidate_count,
+            "tailMinuteCandidateCount": tail_minute_candidate_count,
+            "minuteCodes": minute_codes,
+            "tailMinuteCodes": tail_minute_codes,
             "force": bool(force),
             "evidenceCoverage": coverage,
             "identityCache": identity_cache_stats,
@@ -5455,7 +5733,11 @@ def _t1_evidence_quality_status(
     return "D"
 
 
-def _t1_evidence_run_is_reusable(run: Dict[str, Any], requested_count: int) -> bool:
+def _t1_evidence_run_is_reusable(
+    run: Dict[str, Any],
+    requested_count: int,
+    requested_minute_count: Optional[int] = None,
+) -> bool:
     quality = str(run.get("qualityStatus") or "").upper()
     if quality in {"A", "B"}:
         return True
@@ -5464,7 +5746,8 @@ def _t1_evidence_run_is_reusable(run: Dict[str, Any], requested_count: int) -> b
     request = run.get("request") or {}
     coverage = request.get("evidenceCoverage") or {}
     candidate_count = max(1, int(request.get("candidateCount") or requested_count or 0))
-    minute_ratio = int(run.get("minuteCount") or 0) / candidate_count
+    minute_candidate_count = max(1, int(requested_minute_count or request.get("minuteCandidateCount") or candidate_count))
+    minute_ratio = int(run.get("minuteCount") or 0) / minute_candidate_count
     identity_ratio = int(((coverage.get("identity") or {}).get("available")) or 0) / candidate_count
     return (
         minute_ratio >= T1_REUSABLE_LIMITED_MIN_MINUTE_RATIO
@@ -5514,6 +5797,8 @@ def _compact_t1_evidence_meta(run: Dict[str, Any], missing: List[str]) -> Dict[s
         "constituentCount": int(run.get("constituentCount") or 0),
         "stockMapCount": int(run.get("stockMapCount") or 0),
         "minuteCount": int(run.get("minuteCount") or 0),
+        "minuteCandidateCount": int(request.get("minuteCandidateCount") or 0),
+        "tailMinuteCandidateCount": int(request.get("tailMinuteCandidateCount") or 0),
         "evidenceCoverage": request.get("evidenceCoverage") or {},
         "identityCache": request.get("identityCache") or {},
         "tradeDateStatus": market.get("tradeDateStatus") or {},
@@ -5547,23 +5832,48 @@ def _sector_snapshot_mode_from_source(source: Any) -> str:
     return "unavailable"
 
 
-def _usable_t1_full_market_freeze(payload: Dict[str, Any], requested_source: str) -> bool:
+def _usable_t1_full_market_freeze(
+    payload: Dict[str, Any],
+    requested_source: str,
+    scan_time: str = DEFAULT_SCAN_TIME,
+    allow_stale: bool = False,
+) -> bool:
     if not payload:
         return False
     stocks = payload.get("stocks") or []
     if len(stocks) < 1200:
         return False
     meta = market_context_meta(payload)
-    if meta.get("stale"):
+    if not allow_stale and meta.get("stale"):
         return False
-    generated_at = str(meta.get("generatedAt") or "")
-    if not generated_at.startswith(date.today().isoformat()):
+    trade_date = str(meta.get("tradeDate") or "")
+    if trade_date != date.today().isoformat():
+        return False
+    if str(meta.get("status") or "") != "ready":
+        return False
+    coverage = meta.get("coverage") or {}
+    if int(coverage.get("rows") or len(stocks)) < 1200:
+        return False
+    as_of = str(meta.get("asOfTime") or meta.get("generatedAt") or "")
+    if not _snapshot_not_later_than_scan(as_of, trade_date, scan_time):
         return False
     if int(meta.get("ageSeconds") or 0) > T1_FULL_MARKET_FREEZE_REUSE_SECONDS:
-        return False
+        if not allow_stale:
+            return False
     requested = str(requested_source or "auto")
     actual = str(meta.get("source") or "")
     return requested == "auto" or requested == actual
+
+
+def _snapshot_not_later_than_scan(as_of: str, trade_date: str, scan_time: str) -> bool:
+    if not as_of:
+        return False
+    try:
+        captured = datetime.fromisoformat(as_of)
+        cutoff = datetime.fromisoformat(f"{trade_date}T{_normalize_scan_time(scan_time)}:59")
+    except ValueError:
+        return False
+    return captured <= cutoff
 
 
 def _ai_participation_mode(
@@ -11120,6 +11430,77 @@ def _normalize_auto_run_state(state: Any) -> Dict[str, Any]:
         "lastMessage": str(raw.get("lastMessage") or ""),
         "lastEvent": raw.get("lastEvent") if isinstance(raw.get("lastEvent"), dict) else {},
     }
+
+
+def _normalize_market_prefetch_config(config: Any) -> Dict[str, Any]:
+    raw = dict(config or {}) if isinstance(config, dict) else {}
+    normalized = dict(DEFAULT_MARKET_PREFETCH_CONFIG)
+    normalized.update({key: value for key, value in raw.items() if key in normalized})
+    schedule_times = raw.get("scheduleTimes", normalized.get("scheduleTimes"))
+    if not isinstance(schedule_times, list):
+        schedule_times = DEFAULT_MARKET_PREFETCH_CONFIG["scheduleTimes"]
+    normalized["scheduleTimes"] = _unique_strings(
+        [_normalize_scan_time(item) for item in schedule_times if str(item or "").strip()]
+    ) or list(DEFAULT_MARKET_PREFETCH_CONFIG["scheduleTimes"])
+    normalized["enabled"] = bool(normalized.get("enabled"))
+    normalized["pollIntervalSeconds"] = _clamp_int(normalized.get("pollIntervalSeconds"), 15, 300, 45)
+    normalized["source"] = str(normalized.get("source") or "auto") if str(normalized.get("source") or "") in {"auto", "sina", "tencent", "akshare"} else "auto"
+    normalized["retainDays"] = _clamp_int(normalized.get("retainDays"), 3, 60, 10)
+    return normalized
+
+
+def _normalize_market_prefetch_state(state: Any) -> Dict[str, Any]:
+    raw = dict(state or {}) if isinstance(state, dict) else {}
+    config = _normalize_market_prefetch_config(raw.get("config") or DEFAULT_MARKET_PREFETCH_CONFIG)
+    days = raw.get("days") if isinstance(raw.get("days"), dict) else {}
+    return {
+        "version": "v1_t1_market_prefetch",
+        "config": config,
+        "days": days,
+        "lastCheckAt": str(raw.get("lastCheckAt") or ""),
+        "lastStatus": str(raw.get("lastStatus") or "unknown"),
+        "lastMessage": str(raw.get("lastMessage") or ""),
+        "lastEvent": raw.get("lastEvent") if isinstance(raw.get("lastEvent"), dict) else {},
+    }
+
+
+def _market_prefetch_due_slots(
+    now_dt: datetime,
+    config: Dict[str, Any],
+    state: Dict[str, Any],
+    include_future: bool = False,
+) -> List[str]:
+    today = now_dt.date().isoformat()
+    current_time = now_dt.strftime("%H:%M")
+    day_state = (state.get("days") or {}).get(today) or {}
+    slots = []
+    for slot in config.get("scheduleTimes") or []:
+        normalized = _normalize_scan_time(slot)
+        if not normalized or normalized in day_state:
+            continue
+        if include_future and normalized >= current_time:
+            slots.append(normalized)
+        elif not include_future and normalized <= current_time:
+            slots.append(normalized)
+    return slots
+
+
+def _record_market_prefetch_event(
+    state: Dict[str, Any],
+    trade_date: str,
+    slot: str,
+    event: Dict[str, Any],
+    config: Dict[str, Any],
+) -> None:
+    days = state.setdefault("days", {})
+    day_state = days.setdefault(trade_date, {})
+    day_state[slot] = event
+    state["lastEvent"] = event
+    retain_days = int(config.get("retainDays") or DEFAULT_MARKET_PREFETCH_CONFIG["retainDays"])
+    cutoff = (date.today() - timedelta(days=retain_days)).isoformat()
+    for day_key in list(days.keys()):
+        if str(day_key) < cutoff:
+            days.pop(day_key, None)
 
 
 def _auto_run_skip_event(

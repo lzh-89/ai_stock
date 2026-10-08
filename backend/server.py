@@ -183,6 +183,9 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/t1-overnight-selection/auto-run":
             self._json(T1_OVERNIGHT_SELECTION.auto_run_status())
             return
+        if parsed.path == "/api/t1-overnight-selection/prefetch":
+            self._json(T1_OVERNIGHT_SELECTION.market_prefetch_status())
+            return
         if parsed.path == "/api/t1-overnight-selection/watchdog":
             self._json(T1_OVERNIGHT_SELECTION.watchdog_status(recover=False))
             return
@@ -753,6 +756,21 @@ class AppHandler(SimpleHTTPRequestHandler):
                 LOGGER.info("request t1 auto-run done status=%s elapsed_ms=%.0f", data.get("lastStatus"), (time.perf_counter() - started) * 1000)
                 self._json(data)
             return
+        if parsed.path == "/api/t1-overnight-selection/prefetch/run":
+            payload = self._read_json()
+            started = time.perf_counter()
+            try:
+                data = T1_OVERNIGHT_SELECTION.run_market_prefetch_due(
+                    trigger_source=str(payload.get("triggerSource") or "manual_api"),
+                    slot=str(payload.get("slot") or ""),
+                    force=bool(payload.get("force", True)),
+                )
+            except Exception as error:  # noqa: BLE001 - keep manual prefetch API readable.
+                LOGGER.warning("request t1 market prefetch failed elapsed_ms=%.0f error=%s", (time.perf_counter() - started) * 1000, error)
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
+            else:
+                self._json(data)
+            return
         if parsed.path == "/api/t1-overnight-selection/strategy-feedback/refresh":
             payload = self._read_json()
             try:
@@ -1173,6 +1191,7 @@ def main() -> None:
     args = parser.parse_args()
 
     T1_OVERNIGHT_SELECTION.start_auto_run_scheduler()
+    T1_OVERNIGHT_SELECTION.start_market_prefetch_scheduler()
     T1_OVERNIGHT_SELECTION.start_validation_auto_freeze_scheduler()
     DAILY_KLINE_CACHE.start_scheduler()
     server = ThreadingHTTPServer((args.host, args.port), AppHandler)

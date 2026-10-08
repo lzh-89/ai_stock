@@ -13,7 +13,10 @@ from io import StringIO
 from typing import Any, Callable, Dict, List
 from urllib.parse import quote, urlencode
 
-import requests
+try:
+    import requests
+except ImportError:  # pragma: no cover - optional at process startup; provider reports the runtime limitation.
+    requests = None  # type: ignore[assignment]
 
 
 THS_CONCEPT_SCAN_TIMEOUT_SECONDS = 35

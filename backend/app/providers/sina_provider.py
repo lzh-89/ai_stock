@@ -89,6 +89,7 @@ class SinaProvider:
             "mode": stats.get("mode", "unknown"),
             "pagesOk": stats.get("pagesOk", 0),
             "pagesFailed": stats.get("pagesFailed", 0),
+            "failures": list(stats.get("failures") or []),
             "rows": len(rows),
             "minRows": SINA_FULL_MIN_ROWS if stats.get("mode") == "full" else 0,
         }

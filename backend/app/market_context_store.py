@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import uuid
 from dataclasses import fields
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -18,11 +20,15 @@ from backend.app.schema import Catalyst, RawStock
 LOGGER = logging.getLogger("ai_stock.market_context")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FULL_MARKET_CONTEXT_CACHE_PATH = PROJECT_ROOT / "data" / "full_market_context_cache.json"
+FULL_MARKET_CONTEXT_SNAPSHOT_DIR = PROJECT_ROOT / "data" / "full_market_context_snapshots"
 FULL_MARKET_CONTEXT_CACHE_VERSION = 1
 FULL_MARKET_CONTEXT_TTL_SECONDS = int(os.getenv("FULL_MARKET_CONTEXT_TTL_SECONDS", str(60 * 60)))
 FULL_MARKET_CONTEXT_MIN_ROWS = int(os.getenv("FULL_MARKET_CONTEXT_MIN_ROWS", "1200"))
+FULL_MARKET_CONTEXT_EXPECTED_ROWS = int(os.getenv("FULL_MARKET_CONTEXT_EXPECTED_ROWS", "5000"))
+FULL_MARKET_CONTEXT_SNAPSHOT_RETAIN_DAYS = int(os.getenv("FULL_MARKET_CONTEXT_SNAPSHOT_RETAIN_DAYS", "10"))
 TENCENT_FULL_MARKET_MAX_WORKERS = int(os.getenv("TENCENT_FULL_MARKET_MAX_WORKERS", "8"))
 TENCENT_FULL_MARKET_BATCH_SIZE = int(os.getenv("TENCENT_FULL_MARKET_BATCH_SIZE", "60"))
+_PUBLISH_LOCK = threading.Lock()
 
 
 class FullMarketContextStore:
@@ -56,6 +62,36 @@ class FullMarketContextStore:
             return {}
         return _runtime_payload(cached, cache_hit=True, stale=_is_stale(cached))
 
+    def prefetch(self, source: str = "auto", force: bool = False) -> Dict[str, Any]:
+        """Refresh and atomically publish a full-market snapshot for T+1."""
+        cached = self._read_cache()
+        if cached and not force and _is_same_day_ready_snapshot(cached):
+            return _runtime_payload(cached, cache_hit=True, stale=False)
+        return self.refresh(source=source)
+
+    def latest_for_scan(self, trade_date: str, scan_time: str, source: str = "auto") -> Dict[str, Any]:
+        """Select a published snapshot whose data predates the formal scan."""
+        cutoff = f"{trade_date}T{scan_time}:59"
+        snapshots = [self._read_cache()]
+        for path in FULL_MARKET_CONTEXT_SNAPSHOT_DIR.glob(f"{trade_date}-*.json"):
+            snapshots.append(self._read_payload(path))
+        candidates = [
+            item for item in snapshots
+            if item
+            and str(item.get("tradeDate") or "") == trade_date
+            and str(item.get("status") or "") == "ready"
+            and str(item.get("asOfTime") or "") <= cutoff
+            and str(item.get("capturedAt") or "") <= cutoff
+            and int((item.get("coverage") or {}).get("rows") or 0) >= FULL_MARKET_CONTEXT_MIN_ROWS
+            and (source == "auto" or str(item.get("source") or "") == source)
+        ]
+        if not candidates:
+            return {}
+        chosen = max(candidates, key=lambda item: (str(item.get("asOfTime") or ""), item.get("status") == "ready"))
+        payload = _runtime_payload(chosen, cache_hit=True, stale=_is_stale(chosen))
+        payload["stale"] = payload["stale"] or _age_seconds(payload.get("generatedAt") or "") > FULL_MARKET_CONTEXT_TTL_SECONDS
+        return payload
+
     def refresh(self, source: str = "auto") -> Dict[str, Any]:
         requested_source = source or "auto"
         warnings: List[str] = []
@@ -66,11 +102,13 @@ class FullMarketContextStore:
                 stocks = self._fetch_by_provider(provider_name)
                 if len(stocks) < FULL_MARKET_CONTEXT_MIN_ROWS:
                     raise RuntimeError(f"全市场快照样本过少：{len(stocks)}")
+                provider_meta = self._provider_meta(provider_name)
                 payload = self._write_cache(
                     stocks=stocks,
                     requested_source=requested_source,
                     actual_source=provider_name,
                     warning="；".join(warnings),
+                    provider_meta=provider_meta,
                 )
                 elapsed_ms = (datetime.now() - started).total_seconds() * 1000
                 LOGGER.info(
@@ -92,6 +130,14 @@ class FullMarketContextStore:
                 )
                 warnings.append(f"{provider_name} 全市场刷新失败：{error}")
         raise RuntimeError("；".join(warnings) if warnings else "没有可用的全市场行情源")
+
+    def _provider_meta(self, provider_name: str) -> Dict[str, Any]:
+        provider = {
+            "sina": self.sina_provider,
+            "tencent": self.tencent_provider,
+            "akshare": self.akshare_provider,
+        }.get(provider_name)
+        return dict(getattr(provider, "last_meta", {}) or {})
 
     def public_latest(self, source: str = "auto", force: bool = False) -> Dict[str, Any]:
         return market_context_public_response(self.latest_or_refresh(source=source, force=force))
@@ -149,10 +195,13 @@ class FullMarketContextStore:
         return result
 
     def _read_cache(self) -> Dict[str, Any]:
-        if not FULL_MARKET_CONTEXT_CACHE_PATH.exists():
+        return self._read_payload(FULL_MARKET_CONTEXT_CACHE_PATH)
+
+    def _read_payload(self, path: Path) -> Dict[str, Any]:
+        if not path.exists():
             return {}
         try:
-            with FULL_MARKET_CONTEXT_CACHE_PATH.open("r", encoding="utf-8") as file:
+            with path.open("r", encoding="utf-8") as file:
                 payload = json.load(file)
         except (OSError, json.JSONDecodeError):
             return {}
@@ -162,35 +211,87 @@ class FullMarketContextStore:
             return {}
         return payload
 
-    def _write_cache(self, stocks: List[RawStock], requested_source: str, actual_source: str, warning: str = "") -> Dict[str, Any]:
+    def _write_cache(
+        self,
+        stocks: List[RawStock],
+        requested_source: str,
+        actual_source: str,
+        warning: str = "",
+        provider_meta: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         generated_at = datetime.now().isoformat(timespec="seconds")
+        provider_meta = dict(provider_meta or {})
+        expected_rows = max(FULL_MARKET_CONTEXT_EXPECTED_ROWS, len(stocks))
+        coverage_pct = round(min(100.0, len(stocks) / expected_rows * 100), 2) if expected_rows else 0.0
+        status = "ready" if coverage_pct >= 90.0 else "partial"
+        failed_pages = int(provider_meta.get("pagesFailed") or 0)
         market = market_from_stocks(stocks)
         payload = {
             "version": FULL_MARKET_CONTEXT_CACHE_VERSION,
+            "snapshotVersion": f"{date.today().isoformat()}-{uuid.uuid4().hex[:12]}",
+            "status": status,
+            "tradeDate": date.today().isoformat(),
+            "asOfTime": generated_at,
+            "capturedAt": generated_at,
+            "publishedAt": generated_at,
             "generatedAt": generated_at,
             "requestedSource": requested_source,
             "source": actual_source,
             "ttlSeconds": FULL_MARKET_CONTEXT_TTL_SECONDS,
             "count": len(stocks),
+            "coverage": {
+                "rows": len(stocks),
+                "expectedRows": expected_rows,
+                "coveragePct": coverage_pct,
+                "pagesOk": int(provider_meta.get("pagesOk") or 0),
+                "pagesFailed": failed_pages,
+            },
+            "failedPages": provider_meta.get("failures") or [],
             "warning": warning,
             "market": market,
             "stocks": [stock.to_dict() for stock in stocks],
         }
-        FULL_MARKET_CONTEXT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = FULL_MARKET_CONTEXT_CACHE_PATH.with_suffix(".json.tmp")
-        with tmp_path.open("w", encoding="utf-8") as file:
-            json.dump(payload, file, ensure_ascii=False, indent=2)
-            file.write("\n")
-        tmp_path.replace(FULL_MARKET_CONTEXT_CACHE_PATH)
+        with _PUBLISH_LOCK:
+            FULL_MARKET_CONTEXT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            FULL_MARKET_CONTEXT_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            snapshot_path = FULL_MARKET_CONTEXT_SNAPSHOT_DIR / f"{payload['snapshotVersion']}.json"
+            for path in (snapshot_path, FULL_MARKET_CONTEXT_CACHE_PATH):
+                tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+                with tmp_path.open("w", encoding="utf-8") as file:
+                    json.dump(payload, file, ensure_ascii=False, indent=2)
+                    file.write("\n")
+                tmp_path.replace(path)
+            self._prune_snapshot_history()
         return _runtime_payload(payload, cache_hit=False, stale=False)
+
+    def _prune_snapshot_history(self) -> None:
+        """Keep the published snapshot directory bounded for long-running services."""
+        cutoff = date.today().toordinal() - max(1, FULL_MARKET_CONTEXT_SNAPSHOT_RETAIN_DAYS)
+        for path in FULL_MARKET_CONTEXT_SNAPSHOT_DIR.glob("*.json"):
+            try:
+                snapshot_date = date.fromisoformat(path.name[:10])
+            except ValueError:
+                continue
+            if snapshot_date.toordinal() < cutoff:
+                try:
+                    path.unlink()
+                except OSError:
+                    LOGGER.warning("unable to prune market snapshot path=%s", path)
 
 
 def market_context_public_response(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "source": payload.get("source", ""),
         "requestedSource": payload.get("requestedSource", ""),
+        "snapshotVersion": payload.get("snapshotVersion", ""),
+        "status": payload.get("status", ""),
+        "tradeDate": payload.get("tradeDate", ""),
+        "asOfTime": payload.get("asOfTime", payload.get("generatedAt", "")),
+        "capturedAt": payload.get("capturedAt", payload.get("generatedAt", "")),
         "generatedAt": payload.get("generatedAt", ""),
         "count": payload.get("count", 0),
+        "coverage": payload.get("coverage") or {},
+        "failedPages": payload.get("failedPages") or [],
         "ttlSeconds": payload.get("ttlSeconds", FULL_MARKET_CONTEXT_TTL_SECONDS),
         "ageSeconds": payload.get("ageSeconds", 0),
         "cacheHit": bool(payload.get("cacheHit")),
@@ -206,8 +307,15 @@ def market_context_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
         "scope": "full_market",
         "source": payload.get("source", ""),
         "requestedSource": payload.get("requestedSource", ""),
+        "snapshotVersion": payload.get("snapshotVersion", ""),
+        "status": payload.get("status", ""),
+        "tradeDate": payload.get("tradeDate", ""),
+        "asOfTime": payload.get("asOfTime", payload.get("generatedAt", "")),
+        "capturedAt": payload.get("capturedAt", payload.get("generatedAt", "")),
         "generatedAt": payload.get("generatedAt", ""),
         "count": payload.get("count", 0),
+        "coverage": payload.get("coverage") or {},
+        "failedPages": payload.get("failedPages") or [],
         "ttlSeconds": payload.get("ttlSeconds", FULL_MARKET_CONTEXT_TTL_SECONDS),
         "ageSeconds": payload.get("ageSeconds", 0),
         "cacheHit": bool(payload.get("cacheHit")),
@@ -227,9 +335,16 @@ def _runtime_payload(payload: Dict[str, Any], cache_hit: bool, stale: bool) -> D
     return {
         "source": payload.get("source", ""),
         "requestedSource": payload.get("requestedSource", ""),
+        "snapshotVersion": payload.get("snapshotVersion", ""),
+        "status": payload.get("status", ""),
+        "tradeDate": payload.get("tradeDate", ""),
+        "asOfTime": payload.get("asOfTime", generated_at),
+        "capturedAt": payload.get("capturedAt", generated_at),
         "generatedAt": generated_at,
         "count": len(stocks) or int(payload.get("count") or 0),
         "ttlSeconds": int(payload.get("ttlSeconds") or FULL_MARKET_CONTEXT_TTL_SECONDS),
+        "coverage": payload.get("coverage") or {},
+        "failedPages": payload.get("failedPages") or [],
         "ageSeconds": age_seconds,
         "cacheHit": cache_hit,
         "stale": stale,
@@ -268,6 +383,14 @@ def _is_stale(payload: Dict[str, Any]) -> bool:
     age_seconds = _age_seconds(generated_at)
     ttl_seconds = int(payload.get("ttlSeconds") or FULL_MARKET_CONTEXT_TTL_SECONDS)
     return age_seconds < 0 or age_seconds >= ttl_seconds
+
+
+def _is_same_day_ready_snapshot(payload: Dict[str, Any]) -> bool:
+    if str(payload.get("tradeDate") or "") != date.today().isoformat():
+        return False
+    if str(payload.get("status") or "") != "ready":
+        return False
+    return not _is_stale(payload)
 
 
 def _age_seconds(value: str) -> int:
