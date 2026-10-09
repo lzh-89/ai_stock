@@ -1228,6 +1228,12 @@ class T1OvernightSelectionService:
             "marketContext": market.get("marketContext") or {},
             "recommendationPolicy": market.get("recommendationPolicy") or {},
             "baselineComparison": baseline_comparison,
+            # The review endpoint intentionally returns a compact run payload, but
+            # shadow recommendations are part of the per-run audit record and must
+            # remain available to the review UI.
+            "shadowTop3": _review_shadow_top3(market.get("shadowTop3") or {}),
+            "shadowDeepSeekTailTop3": _review_shadow_top3(market.get("shadowDeepSeekTailTop3") or {}),
+            "shadowComparison": _review_shadow_comparison(market.get("shadowComparison") or {}),
         }
         return {
             "id": run_id,
@@ -12833,6 +12839,51 @@ def _review_baseline_comparison(baseline: Dict[str, Any]) -> Dict[str, Any]:
         if field in critic_pair
     }
     return compact
+
+
+def _review_shadow_pick(pick: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the shadow audit payload useful without returning the full candidate."""
+    tail = pick.get("tailSupportShadow") or pick.get("tailSupportPackV2") or {}
+    gap = pick.get("gapDownRiskShadow") or pick.get("gapDownRiskPack") or {}
+    return {
+        "code": str(pick.get("code") or "").zfill(6),
+        "name": str(pick.get("name") or ""),
+        "shadowRank": pick.get("shadowRank") or pick.get("aiRank") or pick.get("rank"),
+        "shadowT1Score": pick.get("shadowT1Score") or pick.get("t1Score") or pick.get("score"),
+        "tailSupportShadow": {
+            key: tail.get(key)
+            for key in ("status", "label", "score", "tailChangePct", "vwapDeviationPct", "recoveredVwap", "reasons")
+            if key in tail
+        },
+        "gapDownRiskShadow": {
+            key: gap.get(key)
+            for key in ("status", "label", "score", "target", "reasons")
+            if key in gap
+        },
+    }
+
+
+def _review_shadow_top3(shadow: Dict[str, Any]) -> Dict[str, Any]:
+    result = {
+        key: shadow.get(key)
+        for key in ("version", "stage", "label", "description", "enabled", "status", "reason", "error", "affectsOfficialTop3")
+        if key in shadow
+    }
+    result["picks"] = [_review_shadow_pick(item) for item in shadow.get("picks") or [] if isinstance(item, dict)]
+    return result
+
+
+def _review_shadow_comparison(comparison: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose only the review-safe shadow comparison and outcome rows."""
+    keys = (
+        "version", "stage", "affectsOfficialTop3", "primaryScenarioKey", "finalCodes",
+        "shadowCodes", "deepSeekTailCodes", "overlapCodes", "deepSeekTailOverlapCodes",
+        "changedCount", "deepSeekTailChangedCount", "final", "shadow", "deepSeekTail",
+        "deltaPortfolioReturnPct", "deepSeekTailDeltaPortfolioReturnPct", "reason",
+    )
+    result = {key: comparison.get(key) for key in keys if key in comparison}
+    result["outcomeComparison"] = comparison.get("outcomeComparison") or {}
+    return result
 
 
 def _outcome_summary(outcomes: List[Dict[str, Any]]) -> Dict[str, Any]:

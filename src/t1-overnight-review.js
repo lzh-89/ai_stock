@@ -30,6 +30,7 @@ const els = {
   detailMetrics: document.querySelector("#detailMetrics"),
   usageExplanation: document.querySelector("#usageExplanation"),
   pickSummary: document.querySelector("#pickSummary"),
+  shadowPanel: document.querySelector("#shadowPanel"),
   outcomeRows: document.querySelector("#outcomeRows"),
   outcomeMeta: document.querySelector("#outcomeMeta"),
   baselinePanel: document.querySelector("#baselinePanel"),
@@ -304,6 +305,7 @@ function renderDetail(run) {
     els.detailMetrics.innerHTML = "";
     els.usageExplanation.innerHTML = "";
     els.pickSummary.innerHTML = "";
+    els.shadowPanel.innerHTML = "";
     els.outcomeRows.innerHTML = `<tr><td colspan="16" class="empty">暂无数据。</td></tr>`;
     els.outcomeMeta.textContent = "--";
     return;
@@ -325,6 +327,7 @@ function renderDetail(run) {
   ].join("");
   renderUsageExplanation(run);
   renderPickSummary(run);
+  renderShadow(run);
   renderOutcomes(run);
 }
 
@@ -375,6 +378,73 @@ function renderPickSummary(run) {
       #${formatInteger(index + 1)} ${escapeHtml(pick.name || "--")} ${escapeHtml(pick.code || "")}
     </a>
   `).join("");
+}
+
+function renderShadow(run) {
+  if (!els.shadowPanel) return;
+  const market = run?.market || {};
+  const rule = market.shadowTop3 || {};
+  const ai = market.shadowDeepSeekTailTop3 || {};
+  const comparison = market.shadowComparison || {};
+  const outcome = comparison.outcomeComparison || {};
+  const rulePicks = Array.isArray(rule.picks) ? rule.picks : [];
+  const aiPicks = Array.isArray(ai.picks) ? ai.picks : [];
+  const rows = Array.isArray(outcome.rows) ? outcome.rows : [];
+  const aiRows = Array.isArray(outcome.deepSeekTailRows) ? outcome.deepSeekTailRows : [];
+  if (!rulePicks.length && !aiPicks.length && !rows.length && !aiRows.length) {
+    els.shadowPanel.innerHTML = `<section class="review-shadow-box"><strong>影子 Top3</strong><span>该 run 未记录影子推荐数据（旧 run 或生成时未启用影子链路）。</span></section>`;
+    return;
+  }
+  const cards = [
+    shadowReviewGroup("规则尾盘影子", rulePicks, rows),
+    shadowReviewGroup("AI 尾盘影子", aiPicks, aiRows)
+  ].filter(Boolean).join("");
+  const finalReturn = outcome.final?.portfolioReturnPct;
+  const shadowReturn = outcome.shadow?.portfolioReturnPct;
+  const aiReturn = outcome.deepSeekTail?.portfolioReturnPct;
+  els.shadowPanel.innerHTML = `
+    <section class="review-shadow-box">
+      <div class="review-shadow-head">
+        <div><strong>影子 Top3 对比</strong><small>旁路验证尾盘承接和低开风险，不影响正式推荐或策略学习</small></div>
+        <span class="review-shadow-badge">观察口径</span>
+      </div>
+      <div class="review-shadow-returns">
+        ${shadowReturnCard("正式 Top3", finalReturn, "正式推荐组合", "formal")}
+        ${shadowReturnCard("规则尾盘影子", shadowReturn, "尾盘承接加权", "rule")}
+        ${shadowReturnCard("AI 尾盘影子", aiReturn, "DeepSeek 额外读取 T1", "ai")}
+      </div>
+      ${cards}
+      ${outcome.reason ? `<small class="review-shadow-note">${escapeHtml(outcome.reason)}</small>` : ""}
+    </section>
+  `;
+}
+
+function shadowReturnCard(label, value, note, tone) {
+  return `<div class="review-shadow-return ${tone}"><small>${escapeHtml(label)}</small><strong>${formatPct(value)}</strong><span>${escapeHtml(note)}</span></div>`;
+}
+
+function shadowReviewGroup(title, picks, outcomeRows) {
+  if (!picks.length && !outcomeRows.length) return "";
+  const outcomeByCode = new Map(outcomeRows.map((row) => [String(row.code || "").padStart(6, "0"), row]));
+  const rows = picks.map((pick) => {
+    const code = String(pick.code || "").padStart(6, "0");
+    const tail = pick.tailSupportShadow || {};
+    const gap = pick.gapDownRiskShadow || {};
+    const result = outcomeByCode.get(code) || {};
+    return `<article class="review-shadow-pick">
+      <div class="review-shadow-pick-head">
+        <a class="stock-link" href="${escapeHtml(stockAnalysisHref(pick))}"><span class="review-shadow-rank">#${formatInteger(pick.shadowRank)}</span><strong>${escapeHtml(pick.name || code)}</strong><small>${escapeHtml(code)}</small></a>
+        <span class="review-shadow-role">${escapeHtml(result.selectionRole || "未验证")}</span>
+      </div>
+      <div class="review-shadow-score"><span>影子分</span><strong>${formatNumber(pick.shadowT1Score)}</strong></div>
+      <div class="review-shadow-metrics">
+        <span><small>尾盘承接</small><b>${escapeHtml(tail.label || "--")}</b><em>${formatNumber(tail.score)}</em></span>
+        <span><small>低开风险</small><b>${escapeHtml(gap.label || "--")}</b><em>${formatNumber(gap.score)}</em></span>
+        <span><small>次日 open_15m</small><b class="${Number(result.open15mReturnPct) >= 0 ? "positive" : "negative"}">${formatPct(result.open15mReturnPct)}</b></span>
+      </div>
+    </article>`;
+  }).join("");
+  return `<div class="review-shadow-group"><div class="review-shadow-group-head"><strong>${escapeHtml(title)}</strong><small>${picks.length ? `${formatInteger(picks.length)} 个候选` : "暂无候选"}</small></div><div class="review-shadow-pick-grid">${rows || `<span class="review-shadow-empty">已生成但暂无候选明细</span>`}</div></div>`;
 }
 
 function renderOutcomes(run) {
@@ -763,6 +833,12 @@ function formatPrice(value) {
 
 function formatInteger(value) {
   return Number(value || 0).toLocaleString("zh-CN");
+}
+
+function formatNumber(value, digits = 1) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return number.toFixed(digits).replace(/\.0+$/, "");
 }
 
 function formatIntegerRaw(value) {
