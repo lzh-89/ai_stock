@@ -157,6 +157,7 @@ def _normalize_row(row: Dict[str, Any], index: int, all_rows: List[Dict[str, Any
         st=("ST" in name.upper()),
         limit_status=limit_status,
         amount=amount,
+        open=open_price or None, high=high or None, low=low or None, pre_close=prev_close or None,
     )
 
 

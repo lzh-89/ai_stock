@@ -59,6 +59,8 @@ class Database:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        from backend.app.t1_candidate_store import init_candidate_schema
+        init_candidate_schema(self)
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>T+1 复盘</title>
     <link rel="stylesheet" href="./src/t1-overnight-selection.css?v=20260809-nav-tree" />
-    <link rel="stylesheet" href="./src/t1-overnight-review.css?v=20261009-shadow-layout" />
+    <link rel="stylesheet" href="./src/t1-overnight-review.css?v=20261012-official-picks" />
   </head>
   <body data-t1-page="review">
     <div class="t1-app-shell">
@@ -187,6 +187,42 @@
             <div id="shadowPanel" class="review-shadow-panel"></div>
           </section>
 
+          <section class="panel candidate-archive-panel">
+            <div class="panel-head"><div><span>冻结候选 · 分层验证</span><h2>候选筛选档案</h2></div>
+              <button id="archiveReload" class="secondary-button" type="button" hidden>重试加载</button></div>
+            <p id="archiveMeta" class="archive-note" role="status" aria-live="polite">选择 Run 后加载</p>
+            <div id="archiveFunnel" class="archive-funnel"></div>
+            <details id="archiveDetails" hidden>
+              <summary>查看候选、筛选依据与次日代理收益</summary>
+              <form id="archiveFilters" class="archive-toolbar">
+                <input id="archiveQuery" aria-label="搜索候选股票" placeholder="代码 / 名称" maxlength="80">
+                <select id="archiveGroup" aria-label="验证分组"><option value="">全部分组</option><option value="core">核心</option><option value="single">单项突出</option><option value="boundary">边界分歧</option><option value="coverage">行业覆盖</option><option value="explore">探索</option></select>
+                <select id="archiveStage" aria-label="候选阶段"><option value="">全部阶段</option><option value="not_requested">未分配15m</option><option value="request_failed">15m失败</option><option value="quality_rejected">门禁淘汰</option><option value="semifinal">半决赛</option><option value="official">正式入选</option><option value="shadow">影子入选</option></select>
+                <select id="archiveSort" aria-label="候选排序"><option value="preliminary_rank">初始排名</option><option value="verified_rank">真实评分排名</option><option value="open_proxy">开盘代理降序</option><option value="close_proxy">收盘代理降序</option></select>
+                <button class="secondary-button" type="submit">查询</button>
+              </form>
+              <div class="table-wrap"><table class="data-table candidate-archive-table"><thead><tr>
+                <th>股票</th><th>初始排名 / 分</th><th>分组 / 轮次</th><th>15m / 1m</th><th>决策去向</th><th>开盘代理</th><th>收盘代理</th><th>依据</th>
+              </tr></thead><tbody id="archiveRows"></tbody></table></div>
+              <div class="archive-pagination"><button id="archivePrev" class="secondary-button" type="button">上一页</button><span id="archivePageMeta"></span><button id="archiveNext" class="secondary-button" type="button">下一页</button></div>
+              <div id="archiveEvidence" class="archive-evidence" hidden></div>
+            </details>
+          </section>
+
+          <section class="panel candidate-next-day-panel">
+            <div class="panel-head"><div><span>宽召回与验证子集对比</span><h2>次日效果 · 机会代理</h2></div>
+              <div class="archive-actions"><button id="nextDayReload" class="secondary-button" type="button" hidden>重试加载</button><button id="nextDayRetry" class="secondary-button" type="button" disabled>补齐日行情</button></div></div>
+            <p id="nextDayMeta" class="archive-note" role="status" aria-live="polite">选择 Run 后加载</p>
+            <dl id="nextDayMetrics" class="archive-metrics"></dl>
+            <details id="nextDayCollectionDetails" class="archive-collection" hidden><summary>采集记录</summary><p id="nextDayCollection" class="archive-note"></p></details>
+            <p id="nextDayNote" class="archive-note"></p>
+            <div id="nextDayCoverage" class="archive-funnel"></div>
+            <div class="table-wrap"><table class="data-table next-day-group-table"><thead><tr>
+              <th>观察组</th><th>候选 / 有效样本</th><th>验证分配</th><th>开盘代理</th><th>收盘代理</th><th>收盘正代理比例</th>
+            </tr></thead><tbody id="nextDayGroups"></tbody></table></div>
+            <div id="nextDayMissed" class="archive-note"></div>
+          </section>
+
           <section class="panel">
             <div class="panel-head">
               <div>
@@ -250,6 +286,7 @@
       </div>
     </div>
 
-    <script src="./src/t1-overnight-review.js?v=20261009-shadow-layout"></script>
+    <script src="./src/t1-overnight-review.js?v=20261012-official-picks"></script>
+    <script src="./src/t1-candidate-review.js?v=20261010-candidate-review"></script>
   </body>
 </html>

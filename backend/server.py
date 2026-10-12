@@ -203,6 +203,35 @@ class AppHandler(SimpleHTTPRequestHandler):
             review_status = query.get("reviewStatus", query.get("review_status", [""]))[0]
             self._json(T1_OVERNIGHT_SELECTION.review(limit=limit, run_id=run_id, status=status, review_status=review_status))
             return
+        if parsed.path.startswith("/api/t1-overnight-selection/runs/"):
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) >= 5 and parts[4] in {"archive-summary", "candidates", "candidate", "next-day-summary"}:
+                run_id = _parse_int(parts[3], 0)
+                query = parse_qs(parsed.query)
+                try:
+                    if run_id <= 0 or not DATABASE.load_t1_overnight_selection_run(run_id):
+                        raise ValueError("未找到 T+1 Run")
+                    store = T1_OVERNIGHT_SELECTION.candidate_store
+                    if parts[4] == "archive-summary":
+                        data = store.summary(run_id)
+                    elif parts[4] == "next-day-summary":
+                        data = T1_OVERNIGHT_SELECTION.candidate_tracking.summary(run_id)
+                    elif parts[4] == "candidate" and len(parts) == 6:
+                        data = store.detail(run_id, parts[5])
+                    elif parts[4] == "candidates":
+                        data = store.page(run_id, page=_parse_int(query.get("page", ["1"])[0], 1),
+                            page_size=_parse_int(query.get("pageSize", ["50"])[0], 50),
+                            query=query.get("query", [""])[0], group=query.get("group", [""])[0],
+                            stage=query.get("stage", [""])[0], sort=query.get("sort", ["preliminary_rank"])[0])
+                    else:
+                        raise ValueError("无效档案路径")
+                    self._json(data)
+                except ValueError as error:
+                    self._json({"error": str(error)}, status=HTTPStatus.NOT_FOUND)
+                except Exception as error:
+                    LOGGER.exception("candidate archive query failed run=%s", run_id)
+                    self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
+                return
         if parsed.path.startswith("/api/t1-overnight-selection/runs/") and parsed.path.endswith("/outcomes"):
             parts = parsed.path.strip("/").split("/")
             run_id = _parse_int(parts[-2] if len(parts) >= 2 else "", 0)
@@ -368,6 +397,17 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/t1-overnight-selection/runs/") and parsed.path.endswith("/backfill-next-day"):
+            parts = parsed.path.strip("/").split("/")
+            try:
+                self._read_json()
+                self._json(T1_OVERNIGHT_SELECTION.candidate_tracking.retry(_parse_int(parts[3], 0)))
+            except ValueError as error:
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_REQUEST)
+            except Exception as error:
+                LOGGER.exception("candidate next-day repair failed")
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
+            return
         if parsed.path == "/api/universe/default/refresh":
             payload = self._read_json()
             source = payload.get("source", "auto")
@@ -1193,6 +1233,7 @@ def main() -> None:
     T1_OVERNIGHT_SELECTION.start_auto_run_scheduler()
     T1_OVERNIGHT_SELECTION.start_market_prefetch_scheduler()
     T1_OVERNIGHT_SELECTION.start_validation_auto_freeze_scheduler()
+    T1_OVERNIGHT_SELECTION.candidate_tracking.start_scheduler()
     DAILY_KLINE_CACHE.start_scheduler()
     server = ThreadingHTTPServer((args.host, args.port), AppHandler)
     LOGGER.info("Serving A-share radar at http://%s:%s", args.host, args.port)

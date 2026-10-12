@@ -29,6 +29,9 @@ TENCENT_SNAPSHOT_TIMEOUT_SECONDS = float(os.getenv("TENCENT_SNAPSHOT_TIMEOUT_SEC
 class TencentProvider:
     source = "tencent"
 
+    def __init__(self, timeout_seconds: Optional[float] = None):
+        self.timeout_seconds = TENCENT_SNAPSHOT_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+
     def fetch_snapshot(self) -> List[RawStock]:
         return self.fetch_codes([code for code, _ in load_universe_items()])
 
@@ -61,7 +64,7 @@ class TencentProvider:
     def _fetch_symbols(self, symbols: List[str]) -> List[Dict[str, Any]]:
         url = f"https://qt.gtimg.cn/q={','.join(symbols)}"
         request = urllib.request.Request(url, headers={"Referer": "https://gu.qq.com/", "User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(request, timeout=TENCENT_SNAPSHOT_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
             body = response.read().decode("gbk", errors="ignore")
         rows: List[Dict[str, Any]] = []
         for line in body.split(";"):
@@ -137,4 +140,7 @@ def _normalize_row(row: Dict[str, Any], all_rows: List[Dict[str, Any]]) -> Optio
         st=("ST" in name.upper()),
         limit_status=stock_limit_status,
         amount=amount,
+        open=open_price or None, high=high or None, low=low or None, pre_close=prev_close or None,
+        trade_date=(f"{fields[30][:4]}-{fields[30][4:6]}-{fields[30][6:8]}" if len(fields[30]) >= 14 else ""),
+        quote_time=(f"{fields[30][:4]}-{fields[30][4:6]}-{fields[30][6:8]}T{fields[30][8:10]}:{fields[30][10:12]}:{fields[30][12:14]}" if len(fields[30]) >= 14 else ""),
     )

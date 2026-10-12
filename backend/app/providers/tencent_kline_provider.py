@@ -25,6 +25,7 @@ class TencentKlineProvider:
         self.last_meta: Dict[str, Any] = {}
         self.last_errors: Dict[str, str] = {}
         self.last_warning = ""
+        self._trade_dates: Dict[str, str] = {}
 
     def fetch_many(self, codes: List[str], period: str = "15m") -> Dict[str, List[Dict[str, float]]]:
         unique_codes = []
@@ -40,6 +41,8 @@ class TencentKlineProvider:
         self.last_errors = {}
         self.last_warning = ""
         results: Dict[str, List[Dict[str, float]]] = {}
+        for code in unique_codes:
+            self._trade_dates.pop(code, None)
         started = time.perf_counter()
         with ThreadPoolExecutor(max_workers=min(TENCENT_KLINE_MAX_WORKERS, max(1, len(unique_codes)))) as executor:
             futures = {executor.submit(self.fetch_series, code, period): code for code in unique_codes}
@@ -88,6 +91,11 @@ class TencentKlineProvider:
 
         raw = self._fetch_minute_rows(code)
         minute_series = _minute_rows_to_series(raw)
+        trade_date = self._trade_dates.get(code, "")
+        if trade_date:
+            for point in minute_series:
+                point["time"] = f"{trade_date} {point['time']}"
+                point["timeLabel"] = "end"
         series = _aggregate_series(minute_series, _period_minutes(period))
         if series:
             self._cache[cache_key] = (time.time(), series)
@@ -100,7 +108,13 @@ class TencentKlineProvider:
         with urllib.request.urlopen(request, timeout=TENCENT_MINUTE_TIMEOUT_SECONDS) as response:
             body = response.read().decode("utf-8", errors="ignore")
         data = json.loads(body)
-        rows = data.get("data", {}).get(symbol, {}).get("data", {}).get("data", [])
+        container = data.get("data", {}).get(symbol, {}).get("data", {})
+        raw_date = str(container.get("date") or "")
+        if len(raw_date) == 8 and raw_date.isdigit():
+            self._trade_dates[code] = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+        elif len(raw_date) == 10:
+            self._trade_dates[code] = raw_date
+        rows = container.get("data", [])
         return rows if isinstance(rows, list) else []
 
 
@@ -163,6 +177,10 @@ def _aggregate_series(series: List[Dict[str, float]], period_minutes: int) -> Li
                 "low": min(item["low"] for item in bucket),
                 "close": bucket[-1]["close"],
                 "time": bucket[-1].get("time", ""),
+                "timeLabel": "end",
+                "bucketStart": bucket[0].get("time", ""),
+                "bucketEnd": bucket[-1].get("time", ""),
+                "bucketComplete": len(bucket) == period_minutes,
                 "volume": sum(item["volume"] for item in bucket),
                 "amount": sum(item.get("amount", 0.0) for item in bucket),
             }

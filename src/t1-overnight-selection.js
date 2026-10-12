@@ -139,7 +139,7 @@ function bindEvents() {
     renderTimeNotice();
   });
   on(els.poolSizeInput, "change", (event) => {
-    state.poolSize = clampNumber(event.currentTarget?.value, OFFICIAL_MIN_POOL_SIZE, 600, DEFAULT_T1_POOL_SIZE);
+    state.poolSize = clampNumber(event.currentTarget?.value, OFFICIAL_MIN_POOL_SIZE, 500, DEFAULT_T1_POOL_SIZE);
     if (event.currentTarget) event.currentTarget.value = String(state.poolSize);
     state.preheat = null;
     syncUrl();
@@ -961,6 +961,7 @@ function renderMarketContext(run) {
   const minuteKline = market.minuteKlineStatus || {};
   const evidence = market.t1Evidence || {};
   const evidenceCoverage = evidence.evidenceCoverage || sectorLayerCounts;
+  const allocation = market.validationAllocation || {};
   const aiParticipation = market.aiParticipation || {};
   const indexView = marketIndexView(market, metrics);
   const realIndices = indexView.realIndices;
@@ -984,6 +985,8 @@ function renderMarketContext(run) {
     return;
   }
   els.marketContextPanel.innerHTML = `
+    ${(allocation.rounds || []).map((round) => `<div class="market-status-card neutral"><span>15m 验证第 ${formatInteger(round.round)} 轮</span><strong>计划 ${formatInteger(round.planned)} · 合格 ${formatInteger(round.eligible)}</strong><small>请求 ${formatInteger(round.requested)} · 真实可用 ${formatInteger(round.available)}</small></div>`).join("")}
+    ${allocation.version ? `<div class="market-status-card neutral"><span>尾盘 1m 影子验证</span><strong>计划 ${formatInteger(allocation.tail1m?.planned)} · 可用 ${formatInteger(allocation.tail1m?.available)}</strong><small>请求 ${formatInteger(allocation.tail1m?.requested)} · AI 批次后按需验证</small><a class="market-archive-link" href="./t1-overnight-review.html?runId=${Number(run.id || run.runId || 0)}&reviewStatus=all">查看筛选档案与次日效果</a></div>` : ""}
     <div class="market-status-card ${marketContextTone(context)}">
       <span>市场状态</span>
       <strong>${escapeHtml(context.label || context.state || "--")}</strong>
@@ -2885,7 +2888,7 @@ function inputRunProfileLabel() {
 function normalizeInitialPoolSize(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number < OFFICIAL_MIN_POOL_SIZE) return DEFAULT_T1_POOL_SIZE;
-  return clampNumber(number, OFFICIAL_MIN_POOL_SIZE, 600, DEFAULT_T1_POOL_SIZE);
+  return clampNumber(number, OFFICIAL_MIN_POOL_SIZE, 500, DEFAULT_T1_POOL_SIZE);
 }
 
 function syncUrl() {

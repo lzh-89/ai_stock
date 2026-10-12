@@ -15,6 +15,7 @@ import urllib.request
 import copy
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from statistics import median
 from types import SimpleNamespace
@@ -24,12 +25,22 @@ from backend.app.database import Database
 from backend.app.engines.filter_engine import hard_filter_reason
 from backend.app.engines.scoring_engine import score_stock
 from backend.app.engines.timing_engine import attach_plan
-from backend.app.market_context_store import market_context_meta
+from backend.app.engines.t1_candidate_allocation import (
+    VERSION as T1_ALLOCATION_VERSION,
+    allocate_round,
+    build_preliminary_pool,
+    clip_minute_series,
+    preliminary_candidate,
+    select_tail_codes,
+)
+from backend.app.market_context_store import market_context_meta, _stock_from_dict
 from backend.app.providers.sector_provider import get_sector_provider
 from backend.app.schema import RawStock
 from backend.app.services.ai_narrator import _chat_completions_url, _extract_chat_content, _http_error_message
 from backend.app.services.ai_selector import _extract_picks
 from backend.app.services.analysis_service import AnalysisService
+from backend.app.services.t1_candidate_tracking_service import CandidateTrackingService
+from backend.app.t1_candidate_store import CandidateStore
 from backend.app.settings import Settings
 
 
@@ -110,8 +121,8 @@ T1_MINUTE_FETCH_CHUNK_SIZE = int(os.getenv("T1_MINUTE_FETCH_CHUNK_SIZE", "80"))
 T1_MINUTE_FETCH_ATTEMPTS = int(os.getenv("T1_MINUTE_FETCH_ATTEMPTS", "2"))
 T1_MINUTE_FETCH_CHUNK_SLEEP_SECONDS = float(os.getenv("T1_MINUTE_FETCH_CHUNK_SLEEP_SECONDS", "0.15"))
 T1_MINUTE_FETCH_RETRY_SLEEP_SECONDS = float(os.getenv("T1_MINUTE_FETCH_RETRY_SLEEP_SECONDS", "0.8"))
-T1_MINUTE_MAX_CODES = max(1, int(os.getenv("T1_MINUTE_MAX_CODES", "120")))
-T1_TAIL_MINUTE_MAX_CODES = max(1, int(os.getenv("T1_TAIL_MINUTE_MAX_CODES", "30")))
+T1_MINUTE_MAX_CODES = min(120, max(1, int(os.getenv("T1_MINUTE_MAX_CODES", "120"))))
+T1_TAIL_MINUTE_MAX_CODES = min(30, max(1, int(os.getenv("T1_TAIL_MINUTE_MAX_CODES", "30"))))
 T1_ENABLE_THS_CONSTITUENTS = str(os.getenv("T1_ENABLE_THS_CONSTITUENTS", "0")).lower() in {"1", "true", "yes"}
 
 AI_SELECTION_OUTPUT_PROTOCOL = "structured_selection_slip"
@@ -271,9 +282,12 @@ DEFAULT_MARKET_PREFETCH_CONFIG = {
 
 class T1OvernightSelectionService:
     def __init__(self, settings: Settings, analysis_service: AnalysisService, database: Database):
-        self.settings = settings
+        # T+1 validates real 15m evidence independently of the radar's period.
+        self.settings = replace(settings, kline_period="15m")
         self.analysis_service = analysis_service
         self.database = database
+        self.candidate_store = CandidateStore(database)
+        self.candidate_tracking = CandidateTrackingService(database, token=settings.tushare_token)
         self._lock = threading.Lock()
         self._threads: Dict[int, threading.Thread] = {}
         self._validation_auto_freeze_thread: Optional[threading.Thread] = None
@@ -509,9 +523,9 @@ class T1OvernightSelectionService:
         risk_mode = "balanced"
         source = source if source in {"auto", "sina", "akshare", "mock"} else "auto"
         scan_time = _normalize_scan_time(scan_time)
-        pool_size = _clamp_int(pool_size, 80, 600, DEFAULT_POOL_SIZE)
-        batch_size = _clamp_int(batch_size, 20, 100, DEFAULT_BATCH_SIZE)
-        batch_pick = _clamp_int(batch_pick, 2, 12, DEFAULT_BATCH_PICK)
+        pool_size = _clamp_int(pool_size, 80, 500, DEFAULT_POOL_SIZE)
+        batch_size = _clamp_int(batch_size, 20, 80, DEFAULT_BATCH_SIZE)
+        batch_pick = _clamp_int(batch_pick, 2, 8, DEFAULT_BATCH_PICK)
         final_limit = _clamp_int(final_limit, 1, 5, DEFAULT_FINAL_LIMIT)
         run_profile = _run_profile_for_pool(pool_size)
         recommendation_date = date.today().isoformat()
@@ -663,7 +677,7 @@ class T1OvernightSelectionService:
     ) -> Dict[str, Any]:
         source = source if source in {"auto", "sina", "akshare", "mock"} else "auto"
         scan_time = _normalize_scan_time(scan_time)
-        pool_size = _clamp_int(pool_size, T1_OFFICIAL_MIN_POOL_SIZE, 600, DEFAULT_POOL_SIZE)
+        pool_size = _clamp_int(pool_size, T1_OFFICIAL_MIN_POOL_SIZE, 500, DEFAULT_POOL_SIZE)
         started = time.perf_counter()
         batch = self._build_pool(
             "balanced",
@@ -2600,11 +2614,30 @@ class T1OvernightSelectionService:
         stage_callback: Optional[Any] = None,
         recommendation_date: str = "",
         stage_controls: Optional[Dict[str, Any]] = None,
+        selection_run_id: int = 0,
     ) -> Dict[str, Any]:
         recommendation_date = str(recommendation_date or date.today().isoformat())
         stage_controls = stage_controls or self.stage_status()
-        provider, market, raw_stocks, provider_warning = self._load_market_data_for_t1(source, scan_time=scan_time)
-        market = _enrich_market_turnover_context(self.database, market, provider.source)
+        existing_archive = self.candidate_store.all(selection_run_id) if selection_run_id else []
+        saved_run = (self.database.load_t1_overnight_selection_run(selection_run_id) or {}) if selection_run_id else {}
+        saved_request = saved_run.get("request") or {}
+        if existing_archive and saved_request.get("poolCandidateCodes"):
+            saved_items = {x["code"]: x.get("item") or x.get("pick") for x in self.database.load_t1_overnight_selection_items(selection_run_id)}
+            pool_codes = saved_request["poolCandidateCodes"]
+            if all(saved_items.get(code) for code in pool_codes):
+                return dict(pool=[saved_items[c] for c in pool_codes],
+                    selectionPool=[saved_items[c] for c in saved_request.get("selectionCandidateCodes", [])],
+                    market=copy.deepcopy(saved_run.get("market") or {}),
+                    actualSource=saved_run.get("actualSource"), evidenceRunId=saved_run.get("evidenceRunId"),
+                    totalCount=saved_run.get("totalCount"), hardFilteredCount=saved_run.get("hardFilteredCount"))
+        if existing_archive:
+            market = copy.deepcopy(saved_request.get("candidateSnapshotMarket") or {})
+            provider = SimpleNamespace(source=saved_request.get("candidateSnapshotSource") or source)
+            raw_stocks = [_stock_from_dict(x["rawStock"]) for x in existing_archive]
+            provider_warning = "已恢复该 Run 的冻结候选与价格，不重新抓取市场候选。"
+        else:
+            provider, market, raw_stocks, provider_warning = self._load_market_data_for_t1(source, scan_time=scan_time)
+            market = _enrich_market_turnover_context(self.database, market, provider.source)
         market_context = _classify_market_context(market)
         trade_date_status = _t1_trade_date_status(
             recommendation_date,
@@ -2628,32 +2661,49 @@ class T1OvernightSelectionService:
             )
             if not allowed:
                 continue
-            if stock.limit_status == "down":
+            if stock.limit_status in {"down", "limit_down", "one_word_limit_down"}:
                 continue
             hard_filtered.append(stock)
-        preliminary: List[tuple[RawStock, Dict[str, Any]]] = []
-        for stock in hard_filtered:
-            candidate = attach_plan(score_stock(stock, risk_mode=risk_mode), scan_time=scan_time)
-            preliminary.append(
-                (
-                    stock,
-                    _annotate_t1_candidate(
-                        candidate,
-                        scan_time=scan_time,
-                        market_context=market_context,
-                        sector_evidence=None,
-                    ),
-                )
-            )
-
-        preliminary_candidates = _layered_t1_pool([candidate for _, candidate in preliminary], pool_size)
-        preliminary_by_code = {candidate.get("code"): candidate for candidate in preliminary_candidates}
-        preliminary = [(stock, preliminary_by_code[stock.code]) for stock, _ in preliminary if stock.code in preliminary_by_code]
+        identities = self.database.load_t1_stock_sector_identity_cache([stock.code for stock in hard_filtered])
+        cheap = [preliminary_candidate(stock, {"industry": (identities.get(stock.code) or {}).get("industrySector")})
+                 for stock in hard_filtered]
+        preliminary_candidates = build_preliminary_pool(cheap, pool_size)
+        stock_by_code = {stock.code: stock for stock in hard_filtered}
+        if existing_archive:
+            preliminary_candidates = existing_archive
+            stock_by_code = {x["code"]: _stock_from_dict(x["rawStock"]) for x in existing_archive}
+            if saved_request.get("candidateSnapshotMarket"):
+                market = copy.deepcopy(saved_request["candidateSnapshotMarket"])
+                market_context = _classify_market_context(market)
+                market_context.update(tradeDateStatus=trade_date_status, stageControls=stage_controls)
+        else:
+            for item in preliminary_candidates:
+                raw = stock_by_code[item["code"]].to_dict()
+                raw.update(kline_series=[], kline_source="", kline_period="")
+                item["rawStock"] = raw
+        preliminary = [(stock_by_code[item["code"]], item) for item in preliminary_candidates]
         evidence_stocks = [stock for stock, _ in preliminary]
-        minute_layer_codes = _unique_codes([stock.code for stock in evidence_stocks[:T1_MINUTE_MAX_CODES]])
-        tail_minute_layer_codes = minute_layer_codes[:T1_TAIL_MINUTE_MAX_CODES]
-        if str(self.settings.kline_period or "").lower() == T1_TAIL_MINUTE_PERIOD:
-            minute_layer_codes = tail_minute_layer_codes
+        seed = f"{recommendation_date}:{T1_ALLOCATION_VERSION}:{market.get('snapshotVersion') or ''}"
+        seed = saved_request.get("allocationSeed") or seed
+        round_one = ([x for x in existing_archive if x["allocationRound"] == 1] or
+                     allocate_round(preliminary_candidates, 1, seed, budget=T1_MINUTE_MAX_CODES))
+        minute_layer_codes = [item["code"] for item in round_one]
+        tail_minute_layer_codes: List[str] = []
+        allocation_by_code = {item["code"]: item for item in round_one}
+        if selection_run_id:
+            self.candidate_store.freeze(selection_run_id, preliminary_candidates, str(market.get("snapshotVersion") or ""))
+            if not existing_archive:
+                saved_request.update(allocationVersion=T1_ALLOCATION_VERSION, allocationSeed=seed,
+                    candidateSnapshotMarket=market, candidateSnapshotSource=provider.source,
+                    candidateSnapshotTotalCount=len(raw_stocks), candidateSnapshotHardFilteredCount=len(hard_filtered),
+                    roundQuotas=[{"core":45,"single":15,"boundary":10,"coverage":7,"explore":3},
+                    {"core":10,"single":5,"boundary":10,"coverage":8,"explore":7}],
+                    concentrationLimits={"industry":.15,"candidateType":.30,"highRisk":.10},
+                    minuteBudgets={"15m":T1_MINUTE_MAX_CODES,"1m":T1_TAIL_MINUTE_MAX_CODES})
+                self.database.update_t1_overnight_selection_run(selection_run_id, {"request": saved_request})
+                self.candidate_store.update(selection_run_id, round_one, "15m_round1_planned")
+            self.candidate_store.update(selection_run_id,
+                [dict(code=x["code"], minute15mRequested=provider.source != "mock", minute15mStatus="requested") for x in round_one], "15m_round1_requested")
         evidence = self._prepare_t1_evidence_run(
             requested_source=source,
             actual_source=provider.source,
@@ -2671,10 +2721,54 @@ class T1OvernightSelectionService:
         sector_evidence_by_code = evidence.get("sectorEvidenceByCode") or {}
         minute_by_code = evidence.get("minuteByCode") or {}
         tail_minute_by_code = evidence.get("tailMinuteByCode") or {}
+        first_feedback = {}
+        for item in round_one:
+            stock = stock_by_code[item["code"]]
+            row = minute_by_code.get(item["code"]) or {}
+            series = clip_minute_series(row.get("series") or [], recommendation_date, scan_time, "15m")
+            stock.kline_series, stock.kline_source, stock.kline_period = series, str(row.get("source") or ""), "15m"
+            base = attach_plan(score_stock(stock, risk_mode=risk_mode), scan_time=scan_time) if len(series) >= 8 else item
+            evaluated = _apply_data_quality(_annotate_t1_candidate(base, scan_time=scan_time,
+                market_context=market_context, sector_evidence=sector_evidence_by_code.get(item["code"])), provider.source, market)
+            first_feedback[item["code"]] = dict(series=series,
+                qualityEligible=bool((evaluated.get("dataQuality") or {}).get("eligibleForRealTop")),
+                verifiedScore=evaluated.get("t1Score") or 0,
+                scoreDisagreement=(evaluated.get("t1Score") or 0) - item["preliminaryScore"])
+        if selection_run_id:
+            self.candidate_store.update(selection_run_id, [dict(code=x["code"], minute15mStatus="available" if
+                (minute_by_code.get(x["code"]) or {}).get("series") else "failed") for x in round_one], "15m_round1_result")
+        round_two = ([x for x in existing_archive if x["allocationRound"] == 2] or
+                     allocate_round(preliminary_candidates, 2, seed, previous=round_one,
+                                    evidence=first_feedback, budget=T1_MINUTE_MAX_CODES))
+        if selection_run_id:
+            self.candidate_store.update(selection_run_id, round_two, "15m_round2_planned")
+        round_two_codes = [item["code"] for item in round_two]
+        if round_two_codes:
+            if selection_run_id:
+                self.candidate_store.update(selection_run_id,
+                    [dict(code=x, minute15mRequested=provider.source != "mock", minute15mStatus="requested") for x in round_two_codes], "15m_round2_requested")
+            second_rows = {} if provider.source == "mock" else _fetch_t1_minute_rows_with_retries(
+                self.database, self.analysis_service.kline_provider, round_two_codes,
+                self.settings.kline_period, recommendation_date, exclude_run_id=evidence_run_id)
+            normalized_rows = []
+            for code in round_two_codes:
+                row = dict(second_rows.get(code) or {"code": code, "period": self.settings.kline_period,
+                    "source": "", "qualityStatus": "unavailable", "error": "第二轮真实分钟线未取到", "series": []})
+                row["code"] = code
+                row.setdefault("pointCount", len(row.get("series") or []))
+                normalized_rows.append(row)
+            self.database.upsert_t1_overnight_minute_snapshots(evidence_run_id, self.settings.kline_period, normalized_rows)
+            minute_by_code.update({row["code"]: row for row in normalized_rows})
+        minute_layer_codes += round_two_codes
+        allocation_by_code.update({item["code"]: item for item in round_two})
         attached_kline_count = 0
         for stock, _ in preliminary:
+            stock.kline_series = []
+            stock.kline_source = ""
+            stock.kline_period = ""
             minute = minute_by_code.get(_normalize_code(stock.code)) or {}
-            series = minute.get("series") or []
+            series = clip_minute_series(minute.get("series") or [], recommendation_date, scan_time, self.settings.kline_period)
+            minute["series"] = series
             if not series:
                 continue
             stock.kline_series = series
@@ -2684,15 +2778,33 @@ class T1OvernightSelectionService:
 
         rescored = []
         for stock, original in preliminary:
-            base = attach_plan(score_stock(stock, risk_mode=risk_mode), scan_time=scan_time) if stock.kline_series else original
+            base = attach_plan(score_stock(stock, risk_mode=risk_mode), scan_time=scan_time) if len(stock.kline_series) >= 8 else original
             annotated = _annotate_t1_candidate(
                 base,
                 scan_time=scan_time,
                 market_context=market_context,
                 sector_evidence=sector_evidence_by_code.get(_normalize_code(stock.code)),
             )
+            if len(stock.kline_series) < 8:
+                annotated["candidateTypes"] = original["candidateTypes"]
+                annotated["candidateType"] = original["candidateTypes"][0]
+                annotated["t1Dimensions"]["intradayStructure"] = None
+                annotated["t1Dimensions"]["intradayStructureStatus"] = "unavailable"
             enriched = _apply_data_quality(annotated, provider.source, market)
             code = _normalize_code(stock.code)
+            allocation = allocation_by_code.get(code)
+            if allocation:
+                for key in ("primaryGroup", "groupTags", "allocationRound", "allocationPriority",
+                            "allocationReason", "relaxationReason", "preliminaryScore",
+                            "preliminaryScoreRank", "recallRank", "industry"):
+                    enriched[key] = allocation.get(key)
+                enriched["minute15mRequested"] = provider.source != "mock"
+                enriched["minute15mAvailable"] = bool((minute_by_code.get(code) or {}).get("series"))
+                enriched["minute15mStatus"] = ("available" if (enriched.get("dataQuality") or {}).get("eligibleForRealTop")
+                    else "quality_rejected" if enriched["minute15mAvailable"] else "failed")
+            else:
+                enriched.update(minute15mRequested=False, minute15mAvailable=False,
+                                minute15mStatus="not_planned", allocationRound=0, primaryGroup="")
             minute = tail_minute_by_code.get(code) or {}
             if not minute and str(self.settings.kline_period or "").lower() == T1_TAIL_MINUTE_PERIOD:
                 minute = minute_by_code.get(code) or {}
@@ -2706,8 +2818,28 @@ class T1OvernightSelectionService:
             )
             rescored.append(enriched)
         ranked = _layered_t1_pool(rescored, pool_size)
+        for item in ranked:
+            item["verifiedRank"] = None
+        verified = [item for item in ranked if item.get("minute15mAvailable")]
+        for index, item in enumerate(sorted(verified, key=lambda x: (-float(x.get("t1Score") or 0), x.get("code") or "")), 1):
+            item["verifiedRank"] = index
         selection_ranked = [item for item in ranked if (item.get("dataQuality") or {}).get("eligibleForRealTop")]
+        if selection_run_id:
+            self.candidate_store.update(selection_run_id, [dict(code=item["code"],
+                minute15mStatus=item["minute15mStatus"], minute15mRequested=item["minute15mRequested"],
+                minute15mAvailable=item["minute15mAvailable"], qualityEligible=item in selection_ranked,
+                verifiedRank=item["verifiedRank"], verifiedScore=item.get("t1Score") if item["verifiedRank"] else None,
+                minute15mSource=(minute_by_code.get(item["code"]) or {}).get("source", ""),
+                minute15mPointCount=len((minute_by_code.get(item["code"]) or {}).get("series") or []),
+                minute15mError=(minute_by_code.get(item["code"]) or {}).get("error", ""),
+                minute15mCutoff=f"{recommendation_date}T{scan_time}", dataQuality=item.get("dataQuality"),
+                exclusionReason="未分配15m验证名额" if not item.get("allocationRound") else "",
+                verifiedCandidateTypes=item.get("candidateTypes")) for item in ranked], "15m_result")
         data_quality_stats = _data_quality_stats(ranked)
+        evidence_request = dict(evidence_run.get("request") or {})
+        evidence_request.update(minuteCodes=minute_layer_codes, minuteCandidateCount=len(minute_layer_codes), allocationVersion=T1_ALLOCATION_VERSION)
+        self.database.update_t1_overnight_evidence_run(evidence_run_id,
+            {"minuteCount": attached_kline_count, "request": evidence_request})
 
         market["providerWarning"] = provider_warning
         market["scanTime"] = scan_time
@@ -2723,6 +2855,15 @@ class T1OvernightSelectionService:
             attached=attached_kline_count,
             period=self.settings.kline_period,
         )
+        market["minuteKlineStatus"].update(requested=len(minute_layer_codes), ok=attached_kline_count,
+            attached=attached_kline_count, failed=len(minute_layer_codes)-attached_kline_count)
+        market["validationAllocation"] = {"version": T1_ALLOCATION_VERSION, "seed": seed,
+            "rounds": [{"round": n, "planned": len(rows), "requested": len(rows) if provider.source != "mock" else 0,
+                "available": sum(bool((minute_by_code.get(x["code"]) or {}).get("series")) for x in rows),
+                "eligible": sum(x.get("allocationRound") == n for x in selection_ranked)}
+                for n, rows in ((1, round_one), (2, round_two))],
+            "distinctPlanned": len(set(minute_layer_codes)), "budget": T1_MINUTE_MAX_CODES,
+            "tail1m": {"planned": 0, "status": "waiting_for_ai_batch"}}
         market["marketContext"] = market_context
         market["tradeDateStatus"] = trade_date_status
         market["aiParticipation"] = _ai_participation_mode(
@@ -2760,8 +2901,8 @@ class T1OvernightSelectionService:
         return {
             "pool": [_pool_item(item, index) for index, item in enumerate(ranked, start=1)],
             "selectionPool": [_pool_item(item, index) for index, item in enumerate(selection_ranked, start=1)],
-            "totalCount": len(raw_stocks),
-            "hardFilteredCount": len(hard_filtered),
+            "totalCount": saved_request.get("candidateSnapshotTotalCount", len(raw_stocks)),
+            "hardFilteredCount": saved_request.get("candidateSnapshotHardFilteredCount", len(hard_filtered)),
             "actualSource": provider.source,
             "evidenceRunId": evidence_run_id,
             "market": market,
@@ -2967,8 +3108,8 @@ class T1OvernightSelectionService:
         market["stageControls"] = stage_controls
         codes = _unique_codes([stock.code for stock in stocks])
         code_set = set(codes)
-        minute_codes = [code for code in _unique_codes(minute_codes or codes) if code in code_set]
-        tail_minute_codes = [code for code in _unique_codes(tail_minute_codes or minute_codes) if code in set(minute_codes)]
+        minute_codes = [code for code in _unique_codes(codes if minute_codes is None else minute_codes) if code in code_set]
+        tail_minute_codes = [code for code in _unique_codes(minute_codes if tail_minute_codes is None else tail_minute_codes) if code in set(minute_codes)]
         minute_candidate_count = len(minute_codes)
         tail_minute_candidate_count = len(tail_minute_codes)
         existing = self.database.latest_reusable_t1_overnight_evidence_run(
@@ -3501,7 +3642,7 @@ class T1OvernightSelectionService:
             scan_time = str(run.get("scanTime") or DEFAULT_SCAN_TIME)
             recommendation_date = str(run.get("recommendationDate") or date.today().isoformat())
             request = run.get("request") or {}
-            requested_pool_size = _clamp_int(request.get("poolSize"), 80, 600, DEFAULT_POOL_SIZE)
+            requested_pool_size = _clamp_int(request.get("poolSize"), 80, 500, DEFAULT_POOL_SIZE)
             stage_config = _normalize_stage_config(request.get("stageConfig") or self.stage_config())
             stage_controls = request.get("stageControls") or self.stage_status(stage_config)
 
@@ -3514,6 +3655,7 @@ class T1OvernightSelectionService:
                 stage_callback=lambda: self.database.update_t1_overnight_selection_run(run_id, {"currentStage": "building_pool"}),
                 recommendation_date=recommendation_date,
                 stage_controls=stage_controls,
+                selection_run_id=run_id,
             )
             pool = batch["pool"]
             selection_pool = batch.get("selectionPool") or []
@@ -3545,7 +3687,10 @@ class T1OvernightSelectionService:
                 "picks": [dict(item) for item in market["baselineGroups"].get("tailSupportShadow", [])],
             }
             batch_count = math.ceil(len(selection_pool) / batch_size) if selection_pool else 0
-            self.database.upsert_t1_overnight_selection_items(run_id, pool, stage="pool")
+            saved_decisions = {x["code"] for x in self.database.load_t1_overnight_selection_items(run_id) if x.get("stage") != "pool"}
+            self.database.upsert_t1_overnight_selection_items(run_id, [x for x in pool if x["code"] not in saved_decisions], stage="pool")
+            request = dict((self.database.load_t1_overnight_selection_run(run_id) or {}).get("request") or request)
+            request.update(poolCandidateCodes=[x["code"] for x in pool], selectionCandidateCodes=[x["code"] for x in selection_pool])
             self.database.update_t1_overnight_selection_run(
                 run_id,
                 {
@@ -3556,6 +3701,7 @@ class T1OvernightSelectionService:
                     "poolSize": len(pool),
                     "batchCount": batch_count,
                     "market": market,
+                    "request": request,
                     "currentStage": "building_pool",
                 },
             )
@@ -3602,6 +3748,7 @@ class T1OvernightSelectionService:
                 )
                 return
             if not self._ai_available():
+                self._attach_dynamic_tail(run_id, selection_pool, [], market, batch)
                 fallback = _rules_fallback(selection_pool, effective_final_limit)
                 fallback = _apply_final_guardrails(fallback, market, effective_final_limit)
                 market["baselineGroups"]["final"] = [dict(item) for item in fallback]
@@ -3623,17 +3770,27 @@ class T1OvernightSelectionService:
                 )
                 return
 
-            batch_summary = []
-            semifinal: List[Dict[str, Any]] = []
+            batch_summary = list(run.get("batchSummary") or [])
+            completed_batches = {int(x["batchIndex"]) for x in batch_summary}
+            semifinal: List[Dict[str, Any]] = [dict(pick) for summary in batch_summary for pick in summary.get("picks", [])]
+            if not semifinal:
+                semifinal = [dict(x.get("pick") or x.get("item") or x) for x in self.database.load_t1_overnight_selection_items(run_id)
+                    if x.get("stage") == "semifinal" and int(x.get("batchIndex") or 0) in completed_batches]
             chunks = _chunks(selection_pool, batch_size)
             for batch_index, chunk in enumerate(chunks, start=1):
+                if batch_index in completed_batches:
+                    continue
                 current_batch_pick = _batch_pick_for_size(len(chunk), batch_size, batch_pick)
                 self.database.update_t1_overnight_selection_run(
                     run_id,
                     {"currentStage": f"batch:{batch_index}/{len(chunks)}"},
                 )
+                self.candidate_store.update(run_id, [dict(code=item["code"], aiBatchIndex=batch_index) for item in chunk], "ai_batch_requested")
                 picks, error = self._select_with_ai(chunk, market, current_batch_pick, stage="batch", batch_index=batch_index)
                 selected = _apply_picks(chunk, picks, limit=current_batch_pick, batch_index=batch_index)
+                selected_codes = {item["code"] for item in selected}
+                self.candidate_store.update(run_id, [dict(code=item["code"], aiBatchIndex=batch_index,
+                    semifinalSelected=item["code"] in selected_codes, aiBatchSelected=item["code"] in selected_codes) for item in chunk], "ai_batch")
                 if not selected and error:
                     LOGGER.warning("t1 overnight batch empty index=%s error=%s", batch_index, error)
                 semifinal.extend(selected)
@@ -3645,6 +3802,7 @@ class T1OvernightSelectionService:
                         "pickCount": len(selected),
                         "error": error,
                         "aiZeroPick": bool(not selected and not error and ((market.get("lastAiZeroPick") or {}).get("stage") == "batch")),
+                        "picks": selected,
                     }
                 )
                 self.database.upsert_t1_overnight_selection_items(run_id, selected, stage="semifinal")
@@ -3658,6 +3816,7 @@ class T1OvernightSelectionService:
                 )
 
             semifinal = _unique_by_code(semifinal)
+            self._attach_dynamic_tail(run_id, selection_pool, semifinal, market, batch)
             self.database.update_t1_overnight_selection_run(run_id, {"currentStage": "final", "semifinalCount": len(semifinal)})
             final_picks, final_error = self._select_with_ai(semifinal, market, effective_final_limit, stage="final", batch_index=0)
             final_ai_zero_pick = bool(not final_picks and not final_error and ((market.get("lastAiZeroPick") or {}).get("stage") == "final"))
@@ -3752,6 +3911,46 @@ class T1OvernightSelectionService:
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=1.0)
+            try:
+                self.candidate_store.sync_decisions(run_id)
+                self.candidate_tracking.ensure_job(run_id)
+            except Exception:
+                LOGGER.exception("candidate archive finalization failed run=%s", run_id)
+
+    def _attach_dynamic_tail(self, run_id, pool, semifinal, market, batch):
+        frozen = [x["code"] for x in self.candidate_store.all(run_id) if x["minute1mStatus"] != "not_planned"]
+        codes = frozen or select_tail_codes(pool, semifinal, T1_TAIL_MINUTE_MAX_CODES)
+        self.candidate_store.update(run_id, [dict(code=c, minute1mStatus="planned") for c in codes], "1m_planned")
+        self.candidate_store.update(run_id, [dict(code=c, minute1mStatus="requested") for c in codes], "1m_requested")
+        run = self.database.load_t1_overnight_selection_run(run_id) or {}
+        try:
+            rows = _fetch_t1_minute_rows_with_retries(self.database, self.analysis_service.kline_provider,
+                codes, "1m", run.get("recommendationDate") or date.today().isoformat(),
+                exclude_run_id=int(batch.get("evidenceRunId") or 0))
+        except Exception as error:
+            LOGGER.warning("dynamic shadow minute fetch failed run=%s error=%s", run_id, error)
+            rows = {}
+        scan = str(run.get("scanTime") or DEFAULT_SCAN_TIME)
+        updates, snapshots = [], []
+        for code in codes:
+            row = dict(rows.get(code) or {})
+            row.update(code=code, period="1m")
+            row["series"] = clip_minute_series(row.get("series") or [], run.get("recommendationDate") or date.today().isoformat(), scan, "1m")
+            row["pointCount"] = len(row["series"])
+            row["qualityStatus"] = "available" if row["series"] else "unavailable"
+            snapshots.append(row)
+            updates.append(dict(code=code, minute1mStatus="available" if row["series"] else "failed",
+                tailSource=row.get("source"), tailPointCount=len(row["series"])))
+        self.database.upsert_t1_overnight_minute_snapshots(int(batch.get("evidenceRunId") or 0), "1m", snapshots)
+        self.candidate_store.update(run_id, updates, "1m_result")
+        for candidate in pool + semifinal:
+            if candidate["code"] in codes:
+                row = next(x for x in snapshots if x["code"] == candidate["code"])
+                candidate.update(_p1_shadow_features(candidate, row["series"], scan, market.get("marketContext") or {}))
+        market["baselineGroups"]["tailSupportShadow"] = _tail_support_shadow_top_picks(pool, DEFAULT_FINAL_LIMIT)
+        market["shadowTop3"]["picks"] = [dict(x) for x in market["baselineGroups"]["tailSupportShadow"]]
+        market["shadowTop3"].update(candidateScope="dynamic_1m_after_batch", candidateCount=len(codes))
+        market.setdefault("validationAllocation", {})["tail1m"] = {"planned": len(codes), "requested": len(codes), "available": sum(bool(x["series"]) for x in snapshots), "status": "done"}
 
     def _ai_available(self) -> bool:
         return bool(self.settings.enable_ai and self.settings.ai_api_key and self.settings.ai_base_url)
@@ -6941,11 +7140,11 @@ def _apply_data_quality(candidate: Dict[str, Any], snapshot_source: str, market:
         core_eligible = False
         reasons.append("全市场快照来自缓存")
 
-    if kline_source == "simulated":
+    if kline_source in {"simulated", "unavailable"}:
         grade = "D"
         quote_quality = _worse_data_quality_grade(quote_quality, "D")
         core_eligible = False
-        reasons.append("关键分时/K线为模拟回退")
+        reasons.append("关键分时/K线为模拟回退或不可用")
     elif series_len < 8:
         grade = "B" if grade == "A" else grade
         quote_quality = _worse_data_quality_grade(quote_quality, "B")
@@ -7160,6 +7359,9 @@ def _fetch_t1_minute_rows_with_retries(
         period=period,
         exclude_run_id=exclude_run_id,
     )
+    if exclude_run_id:
+        own_rows = database.load_t1_overnight_minute_snapshots(exclude_run_id, unique_codes, period=period)
+        reused_rows.update({code: row for code, row in own_rows.items() if row.get("series") and row.get("qualityStatus") == "available"})
     results: Dict[str, Dict[str, Any]] = {}
     source_by_code: Dict[str, str] = {}
     provider_meta: List[Dict[str, Any]] = []
@@ -8371,8 +8573,8 @@ def _layered_t1_pool(candidates: List[Dict[str, Any]], limit: int) -> List[Dict[
     buckets: List[List[Dict[str, Any]]] = []
     for candidate_type in candidate_types:
         typed = [item for item in candidates if candidate_type in (item.get("candidateTypes") or [])]
-        buckets.append(sorted(typed, key=lambda item: _type_rank_key(item, candidate_type), reverse=True))
-    buckets.append(sorted(candidates, key=_t1_pool_key, reverse=True))
+        buckets.append(sorted(typed, key=lambda item: (-_type_rank_key(item, candidate_type), item["code"])))
+    buckets.append(sorted(candidates, key=lambda item: (-_t1_pool_key(item), item["code"])))
     selected: List[Dict[str, Any]] = []
     seen = set()
     cursor = 0
@@ -8422,7 +8624,7 @@ def _pool_item(candidate: Dict[str, Any], pool_rank: int) -> Dict[str, Any]:
     item = dict(candidate)
     item["poolRank"] = pool_rank
     item["rank"] = pool_rank
-    for key in ("series", "macdSeries", "vwapSeries", "ma5", "ma10", "ma20", "ma60"):
+    for key in ("rawStock", "series", "macdSeries", "vwapSeries", "ma5", "ma10", "ma20", "ma60"):
         item.pop(key, None)
     return item
 
@@ -8451,6 +8653,7 @@ def _compact_market(market: Dict[str, Any]) -> Dict[str, Any]:
         "timeHint": market.get("timeHint", ""),
         "candidateTypeCounts": market.get("candidateTypeCounts") or {},
         "dataQualityStats": market.get("dataQualityStats") or {},
+        "validationAllocation": market.get("validationAllocation") or {},
         "marketContext": market.get("marketContext") or {},
         "tradeDateStatus": market.get("tradeDateStatus") or {},
         "stageControls": market.get("stageControls") or _t1_stage_controls_snapshot(),
@@ -11413,9 +11616,9 @@ def _normalize_auto_run_config(config: Any) -> Dict[str, Any]:
     normalized["pollIntervalSeconds"] = _clamp_int(normalized.get("pollIntervalSeconds"), 30, 600, 60)
     normalized["source"] = str(normalized.get("source") or "auto") if str(normalized.get("source") or "") in {"auto", "sina", "akshare", "mock"} else "auto"
     normalized["scanTime"] = _normalize_scan_time(normalized.get("scanTime") or DEFAULT_SCAN_TIME)
-    normalized["poolSize"] = _clamp_int(normalized.get("poolSize"), T1_OFFICIAL_MIN_POOL_SIZE, 600, DEFAULT_POOL_SIZE)
-    normalized["batchSize"] = _clamp_int(normalized.get("batchSize"), 20, 100, DEFAULT_BATCH_SIZE)
-    normalized["batchPick"] = _clamp_int(normalized.get("batchPick"), 2, 12, DEFAULT_BATCH_PICK)
+    normalized["poolSize"] = _clamp_int(normalized.get("poolSize"), T1_OFFICIAL_MIN_POOL_SIZE, 500, DEFAULT_POOL_SIZE)
+    normalized["batchSize"] = _clamp_int(normalized.get("batchSize"), 20, 80, DEFAULT_BATCH_SIZE)
+    normalized["batchPick"] = _clamp_int(normalized.get("batchPick"), 2, 8, DEFAULT_BATCH_PICK)
     normalized["finalLimit"] = _clamp_int(normalized.get("finalLimit"), 1, 5, DEFAULT_FINAL_LIMIT)
     normalized["force"] = bool(normalized.get("force"))
     normalized["retainDays"] = _clamp_int(normalized.get("retainDays"), 3, 60, 10)

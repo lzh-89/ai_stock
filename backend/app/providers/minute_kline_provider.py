@@ -327,6 +327,7 @@ def _eastmoney_rows_to_series(rows: List[Any]) -> List[Dict[str, float]]:
         try:
             item = {
                 "time": parts[0],
+                "timeLabel": "end",
                 "open": _finite_float(parts[1]),
                 "close": _finite_float(parts[2]),
                 "high": _finite_float(parts[3]),

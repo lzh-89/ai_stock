@@ -38,6 +38,13 @@ class RawStock:
     kline_source: str = ""
     kline_period: str = ""
     amount: float = 0.0
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    pre_close: float | None = None
+    trade_date: str = ""
+    quote_time: str = ""
+    price_basis: str = "unadjusted"
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)

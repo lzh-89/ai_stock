@@ -4,6 +4,7 @@ const state = {
   runId: 0,
   payload: null,
   loading: false,
+  loadGeneration: 0,
   actionNotice: ""
 };
 
@@ -87,6 +88,7 @@ function bindEvents() {
 }
 
 async function loadReview({ keepSelection = false } = {}) {
+  const generation = ++state.loadGeneration;
   setLoading(true);
   try {
     const params = new URLSearchParams({ limit: String(state.limit) });
@@ -94,6 +96,7 @@ async function loadReview({ keepSelection = false } = {}) {
     if ((keepSelection || state.runId > 0) && state.runId > 0) params.set("runId", String(state.runId));
     const response = await fetch(`/api/t1-overnight-selection/review?${params.toString()}`);
     const payload = await response.json().catch(() => ({}));
+    if (generation !== state.loadGeneration) return;
     if (!response.ok) throw new Error(payload.error || `API ${response.status}`);
     state.payload = payload;
     state.runId = Number(payload.selectedRunId || payload.selectedRun?.id || state.runId || 0);
@@ -105,9 +108,9 @@ async function loadReview({ keepSelection = false } = {}) {
     render();
     syncUrl();
   } catch (error) {
-    renderError(error);
+    if (generation === state.loadGeneration) renderError(error);
   } finally {
-    setLoading(false);
+    if (generation === state.loadGeneration) setLoading(false);
   }
 }
 
@@ -186,6 +189,7 @@ function render() {
   renderRunList(filteredRuns, runs.length, selected);
   renderDetail(selected);
   renderBaseline(selected);
+  window.dispatchEvent(new CustomEvent("t1-review-run", { detail: { runId: Number(selected?.id || 0) } }));
   let notice = "";
   if (!runs.length) notice = "暂无 T+1 run。先在 T+1 筛选页生成推荐后，这里会显示复盘记录。";
   else if (!filteredRuns.length) notice = "当前筛选条件下没有 run；可以切到“全部”查看其它记录。";
@@ -370,14 +374,27 @@ function renderUsageExplanation(run) {
 function renderPickSummary(run) {
   const picks = run.finalPicks || [];
   if (!picks.length) {
-    els.pickSummary.innerHTML = `<span class="pick-pill">${escapeHtml(zeroPickReason(run) || "没有最终 Top3")}</span>`;
+    els.pickSummary.innerHTML = `<section class="review-official-section is-empty"><div class="review-official-head"><div><strong>正式推荐</strong><small>系统最终交易组合</small></div><span class="review-official-count">空仓</span></div><p>${escapeHtml(zeroPickReason(run) || "本次没有正式推荐。")}</p></section>`;
     return;
   }
-  els.pickSummary.innerHTML = picks.map((pick, index) => `
-    <a class="pick-pill" href="${escapeHtml(stockAnalysisHref(pick))}" title="打开个股分析">
-      #${formatInteger(index + 1)} ${escapeHtml(pick.name || "--")} ${escapeHtml(pick.code || "")}
-    </a>
-  `).join("");
+  const outcomeByCode = new Map((run.outcomes || []).map((item) => [normalizedStockCode(item.code), item]));
+  const rows = picks.map((pick, index) => {
+    const result = outcomeByCode.get(normalizedStockCode(pick.code));
+    const primary = result ? primaryScenario(result) : {};
+    const returnValue = primary.netReturnPct;
+    const status = result?.outcomeLabel || outcomeStatusLabel(run.outcomeStatus);
+    return `<article class="review-official-pick">
+      <span class="review-official-rank">#${formatInteger(pick.aiRank || index + 1)}</span>
+      <a class="review-official-stock" href="${escapeHtml(stockAnalysisHref(pick))}" title="打开个股分析"><strong>${escapeHtml(pick.name || "--")}</strong><small>${escapeHtml(normalizedStockCode(pick.code))}</small></a>
+      <span class="review-official-fields">
+        <span class="review-official-field"><small>AI 终选</small><strong>#${formatInteger(pick.aiRank || index + 1)}</strong></span>
+        <span class="review-official-field"><small>候选池</small><strong>${pick.poolRank == null ? "--" : `#${formatInteger(pick.poolRank)}`}</strong></span>
+        <span class="review-official-field"><small>open_15m</small><strong class="${returnTone(returnValue)}">${returnValue == null ? "待验证" : formatPct(returnValue)}</strong></span>
+      </span>
+      <span class="review-official-status ${escapeHtml(outcomeStatusTone(run.outcomeStatus))}">${escapeHtml(status)}</span>
+    </article>`;
+  }).join("");
+  els.pickSummary.innerHTML = `<section class="review-official-section"><div class="review-official-head"><div><strong>正式推荐</strong><small>系统最终交易组合，进入次日验证与策略复盘</small></div><span class="review-official-count">正式组合 · ${formatInteger(picks.length)} 只</span></div><div class="review-official-list">${rows}</div></section>`;
 }
 
 function renderShadow(run) {
@@ -399,7 +416,7 @@ function renderShadow(run) {
     shadowReviewGroup("规则尾盘影子", rulePicks, rows),
     shadowReviewGroup("AI 尾盘影子", aiPicks, aiRows)
   ].filter(Boolean).join("");
-  const finalReturn = outcome.final?.portfolioReturnPct;
+  const finalReturn = outcome.final?.portfolioReturnPct ?? run.baselineComparison?.portfolio?.portfolioReturnPct ?? run.tradeableSummary?.avgNetReturnPct;
   const shadowReturn = outcome.shadow?.portfolioReturnPct;
   const aiReturn = outcome.deepSeekTail?.portfolioReturnPct;
   els.shadowPanel.innerHTML = `
@@ -420,7 +437,7 @@ function renderShadow(run) {
 }
 
 function shadowReturnCard(label, value, note, tone) {
-  return `<div class="review-shadow-return ${tone}"><small>${escapeHtml(label)}</small><strong>${formatPct(value)}</strong><span>${escapeHtml(note)}</span></div>`;
+  return `<div class="review-shadow-return ${tone}"><small>${escapeHtml(label)}</small><strong class="${returnTone(value)}">${value == null ? "待验证" : formatPct(value)}</strong><span>${escapeHtml(note)}</span></div>`;
 }
 
 function shadowReviewGroup(title, picks, outcomeRows) {
@@ -604,6 +621,7 @@ function statusPill(label, tone = "neutral") {
 
 function normalizeReviewFilter(value) {
   const text = String(value || "");
+  if (text === "all") return "";
   if (["usable", "official_usable", "research", "zero_pick"].includes(text)) return "reviewable";
   if (text === "learning") return "learnable";
   if (["pending_next_trade_day", "verifiable", "not_ready"].includes(text)) return "waiting";
@@ -750,6 +768,16 @@ function stockAnalysisHref(itemOrCode) {
   if (!normalized) return "./index.html#stock";
   const stockCode = /^\d{1,6}$/.test(normalized) ? normalized.padStart(6, "0") : normalized;
   return `./index.html?stock=${encodeURIComponent(stockCode)}&analyze=1#stock`;
+}
+
+function normalizedStockCode(value) {
+  const code = String(value || "").trim();
+  return /^\d{1,6}$/.test(code) ? code.padStart(6, "0") : code;
+}
+
+function returnTone(value) {
+  if (value == null || Number(value) === 0) return "neutral";
+  return Number(value) > 0 ? "positive" : "negative";
 }
 
 function renderNotice(message) {
