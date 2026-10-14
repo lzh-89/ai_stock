@@ -21,6 +21,7 @@ from backend.app.services.intraday_entry_audit_service import IntradayEntryAudit
 from backend.app.services.stock_analysis_feedback_service import StockAnalysisFeedbackService
 from backend.app.services.stock_analysis_service import StockAnalysisService
 from backend.app.services.t1_overnight_selection_service import RiskPolicyConflictError, T1OvernightSelectionService
+from backend.app.services.t1_entry_execution_evidence_service import T1EntryExecutionEvidenceService
 from backend.app.services.t1_opening_evidence_service import T1OpeningEvidenceService
 from backend.app.services.t1_shadow_analytics_service import T1ShadowAnalyticsService
 from backend.app.services.watchlist_service import WatchlistService
@@ -44,6 +45,7 @@ STOCK_FEEDBACK_V2 = StockAnalysisFeedbackService(SETTINGS, DATABASE, version="v2
 STOCK_ANALYSIS_V2 = StockAnalysisService(SETTINGS, DATABASE, feedback_version="v2")
 AI_FULL_MARKET_SELECTION = AIFullMarketSelectionService(SETTINGS, ANALYSIS, DATABASE)
 T1_OVERNIGHT_SELECTION = T1OvernightSelectionService(SETTINGS, ANALYSIS, DATABASE)
+T1_ENTRY_EXECUTION_EVIDENCE = T1EntryExecutionEvidenceService(ANALYSIS, DATABASE)
 T1_OPENING_EVIDENCE = T1OpeningEvidenceService(ANALYSIS, DATABASE)
 T1_SHADOW_ANALYTICS = T1ShadowAnalyticsService(DATABASE)
 T1_OVERNIGHT_SELECTION.start_watchdog()
@@ -73,6 +75,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/daily-kline-cache/scheduler":
             self._json(DAILY_KLINE_CACHE.status())
+            return
+        if parsed.path == "/api/t1-overnight-selection/entry-execution-evidence/status":
+            self._json(T1_ENTRY_EXECUTION_EVIDENCE.status())
             return
         if parsed.path == "/api/cross-module-validation/summary":
             query = parse_qs(parsed.query)
@@ -801,6 +806,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                     scope=str(payload.get("scope") or "final"),
                     force=bool(payload.get("force")),
                     period=str(payload.get("period") or "1m"),
+                    required_through=str(payload.get("requiredThrough") or payload.get("required_through") or ""),
                 )
             except ValueError as error:
                 self._json({"error": str(error)}, status=HTTPStatus.BAD_REQUEST)
@@ -845,6 +851,16 @@ class AppHandler(SimpleHTTPRequestHandler):
                 data = T1_OPENING_EVIDENCE.run_due(trigger_source="manual_api")
             except Exception as error:  # noqa: BLE001 - keep manual scheduler diagnostics readable.
                 LOGGER.warning("request t1 opening evidence run failed elapsed_ms=%.0f error=%s", (time.perf_counter() - started) * 1000, error)
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
+            else:
+                self._json(data)
+            return
+        if parsed.path == "/api/t1-overnight-selection/entry-execution-evidence/run":
+            started = time.perf_counter()
+            try:
+                data = T1_ENTRY_EXECUTION_EVIDENCE.run_due(trigger_source="manual_api")
+            except Exception as error:  # noqa: BLE001 - keep manual scheduler diagnostics readable.
+                LOGGER.warning("request t1 entry execution evidence run failed elapsed_ms=%.0f error=%s", (time.perf_counter() - started) * 1000, error)
                 self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
             else:
                 self._json(data)
@@ -1312,6 +1328,7 @@ def main() -> None:
     T1_OVERNIGHT_SELECTION.start_auto_run_scheduler()
     T1_OVERNIGHT_SELECTION.start_market_prefetch_scheduler()
     T1_OVERNIGHT_SELECTION.start_validation_auto_freeze_scheduler()
+    T1_ENTRY_EXECUTION_EVIDENCE.start_scheduler()
     T1_OPENING_EVIDENCE.start_scheduler()
     T1_SHADOW_ANALYTICS.start_scheduler()
     T1_OVERNIGHT_SELECTION.candidate_tracking.start_scheduler()

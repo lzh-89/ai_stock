@@ -33,7 +33,13 @@ class MinuteKlineProvider:
         self.last_sources_by_code: Dict[str, str] = {}
         self.last_warning = ""
 
-    def fetch_many(self, codes: List[str], period: str = "15m", require_dated: bool = False) -> Dict[str, List[Dict[str, float]]]:
+    def fetch_many(
+        self,
+        codes: List[str],
+        period: str = "15m",
+        require_dated: bool = False,
+        target_trade_date: str = "",
+    ) -> Dict[str, List[Dict[str, float]]]:
         unique_codes = _unique_codes(codes)
         results: Dict[str, List[Dict[str, float]]] = {}
         self.last_sources_by_code = {}
@@ -66,7 +72,7 @@ class MinuteKlineProvider:
                 normalized = str(code or "").strip().zfill(6)
                 if not normalized or not series or normalized in results:
                     continue
-                if require_dated and not _series_has_trade_date(series):
+                if require_dated and not _series_has_trade_date(series, target_trade_date):
                     continue
                 results[normalized] = series
                 self.last_sources_by_code[normalized] = provider.source
@@ -305,11 +311,13 @@ def _unique_codes(codes: Iterable[str]) -> List[str]:
     return result
 
 
-def _series_has_trade_date(series: List[Dict[str, Any]]) -> bool:
+def _series_has_trade_date(series: List[Dict[str, Any]], target_trade_date: str = "") -> bool:
+    target = str(target_trade_date or "")[:10]
     for item in series:
         text = str((item or {}).get("time") or (item or {}).get("datetime") or (item or {}).get("date") or "")
         if len(text) >= 10 and text[4] == "-" and text[7] == "-":
-            return True
+            if not target or text[:10] == target:
+                return True
     return False
 
 

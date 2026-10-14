@@ -106,6 +106,92 @@ class T1OvernightSemanticsTest(unittest.TestCase):
         self.assertIn("缓存数据", text)
         self.assertIn("市场基准", text)
 
+    def test_review_usage_explanation_names_missing_post_publish_entry_evidence(self):
+        reasons = svc._review_outcome_exclusion_reasons(
+            [
+                {
+                    "outcome": {
+                        "learningEligible": False,
+                        "exclusionReasons": [
+                            "没有推荐日信号发布后的分钟成交，只能用冻结价近似，不能作为最高等级成交证据。"
+                        ],
+                        "tradeable": {"primaryScenario": {"dataStatus": "ok"}},
+                    }
+                }
+            ]
+        )
+        self.assertTrue(any("正式推荐发布后的分钟成交证据" in reason for reason in reasons))
+
+    def test_post_publish_minute_produces_strict_entry_execution(self):
+        result = svc._simulated_entry_execution(
+            run={
+                "recommendationDate": "2026-10-14",
+                "scanTime": "14:40",
+                "market": {"decisionTiming": {"signalPublishedAt": "2026-10-14T14:41:00"}},
+            },
+            buy_reference=10.0,
+            recommendation_minute_series=[
+                {"time": "2026-10-14 14:42", "open": 10.1, "close": 10.2, "volume": 5000}
+            ],
+        )
+        self.assertEqual(result["status"], "executed_from_minute")
+        self.assertTrue(result["executable"])
+
+    def test_legacy_recommendation_snapshot_cannot_become_strict_entry_evidence(self):
+        outcome = svc._build_outcome(
+            run={
+                "id": 94,
+                "recommendationDate": "2026-10-12",
+                "scanTime": "14:40",
+                "market": {"decisionTiming": {"signalPublishedAt": "2026-10-12T14:40:12"}},
+            },
+            pick={"code": "000001", "name": "测试股", "price": 10.0, "dataQuality": {"grade": "A"}},
+            series=[
+                {"date": "2026-10-12", "open": 9.8, "high": 10.1, "low": 9.7, "close": 10.0},
+                {"date": "2026-10-13", "open": 10.1, "high": 10.3, "low": 9.9, "close": 10.2},
+            ],
+            minute_series=[
+                {"time": "2026-10-13 09:45", "open": 10.1, "high": 10.2, "low": 10.0, "close": 10.15}
+            ],
+            data_source="daily_test",
+            minute_source="minute_test",
+            verified_at="2026-10-13T15:10:00",
+            recommendation_minute_series=[
+                {"time": "2026-10-12 14:40", "open": 9.98, "close": 10.0, "volume": 5000}
+            ],
+            entry_execution_minute_series=[],
+        )
+        self.assertEqual(outcome["entryExecution"]["status"], "reference_price_without_minute")
+        self.assertFalse(outcome["learningEligible"])
+
+    def test_dedicated_post_publish_snapshot_can_become_strict_entry_evidence(self):
+        post_publish = [
+            {"time": "2026-10-12 14:42", "open": 10.02, "close": 10.03, "volume": 5000}
+        ]
+        outcome = svc._build_outcome(
+            run={
+                "id": 95,
+                "recommendationDate": "2026-10-12",
+                "scanTime": "14:40",
+                "market": {"decisionTiming": {"signalPublishedAt": "2026-10-12T14:41:00"}},
+            },
+            pick={"code": "000001", "name": "测试股", "price": 10.0, "dataQuality": {"grade": "A"}},
+            series=[
+                {"date": "2026-10-12", "open": 9.8, "high": 10.1, "low": 9.7, "close": 10.0},
+                {"date": "2026-10-13", "open": 10.1, "high": 10.3, "low": 9.9, "close": 10.2},
+            ],
+            minute_series=[
+                {"time": "2026-10-13 09:45", "open": 10.1, "high": 10.2, "low": 10.0, "close": 10.15}
+            ],
+            data_source="daily_test",
+            minute_source="minute_test",
+            verified_at="2026-10-13T15:10:00",
+            recommendation_minute_series=post_publish,
+            entry_execution_minute_series=post_publish,
+        )
+        self.assertEqual(outcome["entryExecution"]["status"], "executed_from_minute")
+        self.assertTrue(outcome["learningEligible"])
+
     def test_learnable_ai_semifinal_rules_final_keeps_ai_scope_separate(self):
         sample = {
             "sampleClass": "learning",
@@ -782,6 +868,37 @@ class T1OvernightSemanticsTest(unittest.TestCase):
         self.assertEqual(rows["600000"][0]["time"], "2026-08-05 09:45:00")
         self.assertEqual(provider.source_for_code("600000"), "dated_minute")
 
+    def test_minute_provider_target_date_continues_to_historical_source(self):
+        class CurrentDayProvider:
+            source = "current_day"
+            last_meta = {}
+            last_warning = ""
+
+            def fetch_many(self, codes, period="1m"):
+                return {
+                    str(code).zfill(6): [{"time": "2026-08-06 15:00:00", "close": 1.1}]
+                    for code in codes
+                }
+
+        class HistoricalProvider:
+            source = "historical"
+            last_meta = {}
+            last_warning = ""
+
+            def fetch_many(self, codes, period="1m"):
+                return {
+                    str(code).zfill(6): [{"time": "2026-08-05 15:00:00", "close": 1.2}]
+                    for code in codes
+                }
+
+        provider = MinuteKlineProvider()
+        provider.providers = [CurrentDayProvider(), HistoricalProvider()]
+        rows = provider.fetch_many(
+            ["600000"], period="1m", require_dated=True, target_trade_date="2026-08-05"
+        )
+        self.assertEqual(rows["600000"][0]["time"], "2026-08-05 15:00:00")
+        self.assertEqual(provider.source_for_code("600000"), "historical")
+
     def test_t1_verification_filters_undated_minute_rows(self):
         rows = svc._dated_minute_series_by_code(
             {
@@ -1017,6 +1134,60 @@ class T1OvernightSemanticsTest(unittest.TestCase):
         self.assertEqual(need, ["301232"])
         self.assertEqual(skipped, [])
 
+    def test_validation_backfill_requires_close_for_final_freeze(self):
+        morning_snapshot = {
+            "qualityStatus": "partial",
+            "series": [
+                {"time": "2026-08-05 09:45:00", "close": 10.4},
+                {"time": "2026-08-05 11:04:00", "close": 10.2},
+            ],
+        }
+        need, skipped = svc._validation_backfill_target_codes(
+            ["301232"],
+            {"301232": morning_snapshot},
+            [],
+            "2026-08-05",
+            required_through="15:00",
+        )
+        self.assertEqual(need, ["301232"])
+        self.assertEqual(skipped, [])
+        morning_snapshot["series"].append({"time": "2026-08-05 15:00:00", "close": 10.5})
+        need, skipped = svc._validation_backfill_target_codes(
+            ["301232"],
+            {"301232": morning_snapshot},
+            [],
+            "2026-08-05",
+            required_through="15:00",
+        )
+        self.assertEqual(need, [])
+        self.assertEqual(skipped, ["301232"])
+
+    def test_validation_minute_quality_only_marks_full_day_available(self):
+        morning = [{"time": "2026-08-05 11:04:00", "close": 10.2}]
+        complete = morning + [{"time": "2026-08-05 15:00:00", "close": 10.5}]
+        self.assertEqual(svc._validation_minute_quality(morning, "2026-08-05"), "partial")
+        self.assertEqual(svc._validation_minute_quality(complete, "2026-08-05"), "available")
+
+    def test_validation_backfill_regrades_legacy_morning_snapshot(self):
+        series = [
+            {"time": "2026-08-05 09:30:00", "close": 10.0},
+            {"time": "2026-08-05 10:05:00", "close": 10.2},
+        ]
+        rows = svc._regraded_validation_snapshot_rows(
+            {
+                "301232": {
+                    "period": "1m",
+                    "source": "tencent_minute",
+                    "qualityStatus": "available",
+                    "series": series,
+                }
+            },
+            "2026-08-05",
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["qualityStatus"], "partial")
+        self.assertEqual(rows[0]["series"], series)
+
     def test_validation_backfill_message_separates_pick_and_benchmark_failures(self):
         items = [
             {"code": "000539", "role": "pick", "status": "failed", "error": "1m/15m 均未返回"},
@@ -1103,6 +1274,13 @@ class T1OvernightSemanticsTest(unittest.TestCase):
             state,
         )
         self.assertEqual(slots, ["10:05"])
+
+    def test_validation_auto_freeze_adds_close_retries_to_legacy_config(self):
+        config = svc._normalize_validation_auto_freeze_config(
+            {"scheduleTimes": ["09:46", "10:05", "15:10"]}
+        )
+        self.assertEqual(config["finalizeTimes"], ["15:10", "15:20", "15:40"])
+        self.assertEqual(config["scheduleTimes"], ["09:46", "10:05", "15:10", "15:20", "15:40"])
 
     def test_validation_auto_freeze_next_weekday_handles_weekend(self):
         self.assertEqual(svc._next_weekday_date("2026-08-07"), "2026-08-10")

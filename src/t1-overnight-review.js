@@ -588,6 +588,7 @@ function renderDetail(run) {
   const openingPrecheck = openingEvidence.precheck || {};
   const openingSnapshot = openingEvidence.snapshot || {};
   const openingLegacy = openingEvidence.status === "not_applicable_old_version";
+  const entryEvidence = run.entryExecutionEvidence || run.market?.entryExecutionEvidence || {};
   const tradeable = run.tradeableSummary || {};
   const summary = run.outcomeSummary || {};
   els.detailEyebrow.textContent = `${run.recommendationDate || "--"} ${run.scanTime || ""} · ${escapeHtml(reviewStatusLabel(run))}`;
@@ -599,6 +600,11 @@ function renderDetail(run) {
     metricCard("主 KPI 均值", formatPct(tradeable.avgNetReturnPct), "固定 open_15m，缺失不 fallback"),
     metricCard("成功数量", `${formatInteger(summary.successCount || 0)} / ${formatInteger(summary.count || 0)}`, "强成功 / 成功溢价 / 弱成功"),
     metricCard("用于优化股票", formatInteger(run.learningEligibleCount || 0), learningScopeLabel(run)),
+    metricCard(
+      "发布后买入证据",
+      entryEvidence.complete ? `${formatInteger(entryEvidence.eligibleCount || 0)} / ${formatInteger(entryEvidence.expectedCount || 0)} 已冻结` : entryExecutionReviewLabel(entryEvidence.status),
+      entryExecutionReviewDetail(entryEvidence)
+    ),
     metricCard("验证进度", outcomeStatusLabel(run.outcomeStatus), outcomeStatusHint(run.outcomeStatus, run)),
     metricCard("市场状态", marketContext.label || "--", (run.market?.recommendationPolicy || {}).reason || run.error || "--"),
     metricCard(
@@ -618,6 +624,28 @@ function renderDetail(run) {
   renderPickSummary(run);
   renderShadow(run);
   renderOutcomes(run);
+}
+
+function entryExecutionReviewLabel(status) {
+  return {
+    available: "可用于成交回放",
+    scheduled: "等待采集",
+    running: "正在采集",
+    retry_wait: "等待重试",
+    partial: "部分不可用",
+    provider_failed: "行情源失败",
+    missed_deadline: "错过采集窗口",
+    legacy_not_recorded: "旧 Run 未记录",
+    not_registered: "任务待登记",
+  }[String(status || "not_registered")] || String(status || "--");
+}
+
+function entryExecutionReviewDetail(evidence = {}) {
+  const ready = (evidence.snapshots || []).filter((item) => item.decisionEligible);
+  if (ready.length) return ready.map((item) => `${item.code || "--"} ${item.entryTime || "--"} ${formatNumber(item.price)}`).join("；");
+  if (evidence.job?.error) return evidence.job.error;
+  if (evidence.status === "legacy_not_recorded") return "当时未独立冻结正式推荐发布后的分钟成交，不能倒推为可优化样本。";
+  return "只认信号发布后的真实分钟成交；提前冻结选股价格不能替代。";
 }
 
 function openingEvidenceStatusLabel(status) {

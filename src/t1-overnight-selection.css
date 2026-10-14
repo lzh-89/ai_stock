@@ -2052,6 +2052,17 @@ a.secondary-button {
   }
 }
 
+@media (max-width: 1360px) {
+  .page-top {
+    grid-template-columns: 44px minmax(0, 1fr);
+  }
+
+  .controls {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+}
+
 @media (max-width: 980px) {
   .t1-app-shell {
     grid-template-columns: 1fr;
@@ -2112,15 +2123,6 @@ a.secondary-button {
 
   .t1-rail-subnav a {
     white-space: nowrap;
-  }
-
-  .page-top {
-    grid-template-columns: 44px minmax(0, 1fr);
-  }
-
-  .controls {
-    grid-column: 1 / -1;
-    justify-content: flex-start;
   }
 
   .t1-subnav {

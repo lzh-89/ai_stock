@@ -54,6 +54,7 @@ from backend.app.services.ai_narrator import _chat_completions_url, _extract_cha
 from backend.app.services.ai_selector import _extract_picks
 from backend.app.services.analysis_service import AnalysisService
 from backend.app.services.t1_candidate_tracking_service import CandidateTrackingService
+from backend.app.services.t1_entry_execution_evidence_service import ENTRY_EXECUTION_EVIDENCE_VERSION
 from backend.app.t1_candidate_store import CandidateStore
 from backend.app.settings import Settings
 
@@ -306,7 +307,8 @@ DEFAULT_STAGE_CONFIG = {
 }
 DEFAULT_VALIDATION_AUTO_FREEZE_CONFIG = {
     "enabled": True,
-    "scheduleTimes": ["09:46", "10:05", "15:10"],
+    "scheduleTimes": ["09:46", "10:05", "15:10", "15:20", "15:40"],
+    "finalizeTimes": ["15:10", "15:20", "15:40"],
     "pollIntervalSeconds": 60,
     "scope": "all",
     "period": "1m",
@@ -715,6 +717,7 @@ class T1OvernightSelectionService:
         run["tradeableSummary"] = _tradeable_summary(outcomes)
         run["baselineComparison"] = (run.get("market") or {}).get("baselineComparison") or {}
         run["runRole"] = _run_role(run)
+        run["entryExecutionEvidence"] = _entry_execution_evidence_summary(self.database, run)
         evidence_run_id = int(run.get("evidenceRunId") or (run.get("market") or {}).get("evidenceRunId") or 0)
         run["evidenceRun"] = self.database.load_t1_overnight_evidence_run(evidence_run_id) if evidence_run_id > 0 else None
         run["criticStatus"] = self.critic_status()
@@ -1067,11 +1070,19 @@ class T1OvernightSelectionService:
 
         scope = str(config.get("scope") or "all")
         period = str(config.get("period") or "1m")
+        finalize_times = set(config.get("finalizeTimes") or DEFAULT_VALIDATION_AUTO_FREEZE_CONFIG["finalizeTimes"])
+        required_through = "15:00" if slot in finalize_times else ""
         results = []
         for run in runs:
             run_id = int(run.get("id") or 0)
             try:
-                result = self.backfill_validation_minutes(run_id, scope=scope, force=False, period=period)
+                result = self.backfill_validation_minutes(
+                    run_id,
+                    scope=scope,
+                    force=False,
+                    period=period,
+                    required_through=required_through,
+                )
             except Exception as error:  # noqa: BLE001 - keep other runs moving.
                 LOGGER.warning("t1 validation auto-freeze run failed run=%s slot=%s error=%s", run_id, slot, error)
                 results.append(
@@ -1111,6 +1122,7 @@ class T1OvernightSelectionService:
             "triggerSource": trigger_source,
             "checkedAt": checked_at,
             "runCount": len(runs),
+            "requiredThrough": required_through,
             "message": f"{target_trade_date} {slot} 自动冻结完成：处理 {len(runs)} 个 run，失败 {len(failed_results)} 个，部分完成 {len(partial_results)} 个。",
             "results": results,
         }
@@ -1328,6 +1340,7 @@ class T1OvernightSelectionService:
                 if _adaptive_exit_enabled_for_run(run)
                 else {"status": "not_applicable_old_version", "reason": "旧版本未记录动态退出早盘证据。"}
             ),
+            "entryExecutionEvidence": _entry_execution_evidence_summary(self.database, run),
         }
         return {
             "id": run_id,
@@ -1364,6 +1377,7 @@ class T1OvernightSelectionService:
             "learningEligibleCount": learning_eligible_count,
             "baselineComparison": baseline_comparison,
             "market": compact_market,
+            "entryExecutionEvidence": compact_market["entryExecutionEvidence"],
             "error": run.get("error") or "",
             "finishedAt": run.get("finishedAt") or "",
         }
@@ -1465,7 +1479,17 @@ class T1OvernightSelectionService:
         self.analysis_service._save_daily_kline_to_database(series_by_code, daily_source)
         minute_by_code: Dict[str, List[Dict[str, Any]]] = {}
         recommendation_minute_by_code: Dict[str, List[Dict[str, Any]]] = {}
+        entry_execution_minute_by_code: Dict[str, List[Dict[str, Any]]] = {}
         verification_codes = _unique_codes(codes + benchmark_codes)
+        entry_snapshots = self.database.load_t1_entry_execution_snapshots(run_id, verification_codes)
+        for code, snapshot in entry_snapshots.items():
+            if not snapshot.get("decisionEligible"):
+                continue
+            series = _minute_series_for_trade_date(snapshot.get("series") or [], recommendation_date)
+            if series:
+                normalized = str(code or "").zfill(6)
+                recommendation_minute_by_code[normalized] = series
+                entry_execution_minute_by_code[normalized] = series
         evidence_run_id = int(run.get("evidenceRunId") or (run.get("market") or {}).get("evidenceRunId") or 0)
         if evidence_run_id > 0 and recommendation_date:
             for recommendation_period in ("1m", self.settings.kline_period):
@@ -1556,6 +1580,7 @@ class T1OvernightSelectionService:
                     period_fetch_codes,
                     period=fetch_period,
                     require_dated=require_dated_minutes,
+                    target_trade_date=target_trade_date if require_dated_minutes else "",
                 )
             except TypeError:
                 fetched_minute_by_code = self.analysis_service.kline_provider.fetch_many(period_fetch_codes, period=fetch_period)
@@ -1685,6 +1710,7 @@ class T1OvernightSelectionService:
                 verified_at=verified_at,
                 execution_profile=execution_profile,
                 recommendation_minute_series=recommendation_minute_by_code.get(code, []),
+                entry_execution_minute_series=entry_execution_minute_by_code.get(code, []),
             )
             if not fresh_verification_by_code.get(code) and existing_payload_by_code.get(code):
                 outcome = existing_payload_by_code[code]
@@ -1703,6 +1729,7 @@ class T1OvernightSelectionService:
                     verified_at=verified_at,
                     execution_profile=execution_profile,
                     recommendation_minute_series=recommendation_minute_by_code.get(str(pick.get("code") or "").zfill(6), []),
+                    entry_execution_minute_series=entry_execution_minute_by_code.get(str(pick.get("code") or "").zfill(6), []),
                 )
                 for pick in group_picks
             ]
@@ -1797,6 +1824,7 @@ class T1OvernightSelectionService:
         scope: str = "final",
         force: bool = False,
         period: str = "1m",
+        required_through: str = "",
     ) -> Dict[str, Any]:
         run = self.database.load_t1_overnight_selection_run(run_id)
         if not run:
@@ -1851,6 +1879,23 @@ class T1OvernightSelectionService:
             verification_codes,
             target_trade_date=target_trade_date,
         )
+        regraded_rows = _regraded_validation_snapshot_rows(existing_snapshots, target_trade_date)
+        if regraded_rows:
+            regraded_by_period: Dict[str, List[Dict[str, Any]]] = {}
+            for row in regraded_rows:
+                regraded_by_period.setdefault(str(row.get("period") or "1m"), []).append(row)
+            for row_period, period_rows in regraded_by_period.items():
+                self.database.upsert_t1_overnight_validation_minute_snapshots(
+                    run_id,
+                    target_trade_date,
+                    row_period,
+                    period_rows,
+                )
+            existing_snapshots = self.database.load_t1_overnight_validation_minute_snapshots(
+                run_id,
+                verification_codes,
+                target_trade_date=target_trade_date,
+            )
         reusable_snapshots = self.database.load_latest_t1_overnight_validation_minute_snapshots_any_run(
             target_trade_date,
             verification_codes,
@@ -1895,6 +1940,7 @@ class T1OvernightSelectionService:
             outcomes=outcomes,
             target_trade_date=target_trade_date,
             force=force,
+            required_through=required_through,
         )
         rows: List[Dict[str, Any]] = []
         failed_items: List[Dict[str, Any]] = []
@@ -1908,7 +1954,12 @@ class T1OvernightSelectionService:
                 if not remaining_fetch_codes:
                     break
                 try:
-                    fetched = self.analysis_service.kline_provider.fetch_many(remaining_fetch_codes, period=fetch_period, require_dated=True)
+                    fetched = self.analysis_service.kline_provider.fetch_many(
+                        remaining_fetch_codes,
+                        period=fetch_period,
+                        require_dated=True,
+                        target_trade_date=target_trade_date,
+                    )
                 except TypeError:
                     fetched = self.analysis_service.kline_provider.fetch_many(remaining_fetch_codes, period=fetch_period)
                     fetched = _dated_minute_series_by_code(fetched)
@@ -2026,6 +2077,7 @@ class T1OvernightSelectionService:
             "runId": run_id,
             "status": verification.get("status") or "done",
             "targetTradeDate": target_trade_date,
+            "requiredThrough": required_through,
             "scope": "final",
             "requested": len(need_codes),
             "stored": stored,
@@ -8465,9 +8517,32 @@ def _validation_minute_quality(series: List[Dict[str, Any]], target_trade_date: 
     if not dated:
         return "unavailable"
     times = {_minute_time(item) for item in dated}
-    if any(time >= "09:45" for time in times if time):
+    if any(time >= "15:00" for time in times if time):
         return "available"
     return "partial"
+
+
+def _regraded_validation_snapshot_rows(
+    snapshots: Dict[str, Dict[str, Any]], target_trade_date: str
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for code, snapshot in snapshots.items():
+        series = _minute_series_from_validation_snapshot(snapshot, target_trade_date)
+        quality_status = _validation_minute_quality(series, target_trade_date)
+        if quality_status == str(snapshot.get("qualityStatus") or ""):
+            continue
+        rows.append(
+            {
+                "code": str(code or "").zfill(6),
+                "targetTradeDate": target_trade_date,
+                "period": str(snapshot.get("period") or "1m"),
+                "source": str(snapshot.get("source") or ""),
+                "qualityStatus": quality_status,
+                "error": str(snapshot.get("error") or ""),
+                "series": series,
+            }
+        )
+    return rows
 
 
 def _verification_picks_for_scope(run: Dict[str, Any], database: Database, scope: str = "final") -> List[Dict[str, Any]]:
@@ -8510,6 +8585,7 @@ def _validation_backfill_target_codes(
     outcomes: List[Dict[str, Any]],
     target_trade_date: str,
     force: bool = False,
+    required_through: str = "",
 ) -> tuple[List[str], List[str]]:
     if force:
         return _unique_codes(codes), []
@@ -8523,7 +8599,11 @@ def _validation_backfill_target_codes(
     for code in _unique_codes(codes):
         snapshot = snapshots.get(code) or {}
         outcome = outcome_by_code.get(code) or {}
-        if _validation_snapshot_supports_primary(snapshot, target_trade_date):
+        if required_through:
+            complete = _validation_snapshot_supports_through(snapshot, target_trade_date, required_through)
+        else:
+            complete = _validation_snapshot_supports_primary(snapshot, target_trade_date)
+        if complete:
             skipped.append(code)
             continue
         need.append(code)
@@ -8538,6 +8618,18 @@ def _validation_snapshot_supports_primary(snapshot: Dict[str, Any], target_trade
         return False
     times = [_minute_time(item) for item in series]
     return any(time >= "09:45" for time in times if time)
+
+
+def _validation_snapshot_supports_through(
+    snapshot: Dict[str, Any], target_trade_date: str, required_through: str
+) -> bool:
+    if not snapshot or str(snapshot.get("qualityStatus") or "") not in {"available", "partial"}:
+        return False
+    series = _minute_series_from_validation_snapshot(snapshot, target_trade_date)
+    if not series:
+        return False
+    times = [_minute_time(item) for item in series]
+    return any(time >= required_through for time in times if time)
 
 
 def _outcome_has_strict_primary(outcome: Dict[str, Any]) -> bool:
@@ -12408,6 +12500,7 @@ def _build_outcome(
     verified_at: str,
     execution_profile: Optional[Dict[str, Any]] = None,
     recommendation_minute_series: Optional[List[Dict[str, Any]]] = None,
+    entry_execution_minute_series: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     execution_profile = _normalize_execution_config(execution_profile or DEFAULT_EXECUTION_PROFILE)
     code = str(pick.get("code") or "").zfill(6)
@@ -12430,7 +12523,7 @@ def _build_outcome(
     entry_execution = _simulated_entry_execution(
         run=run,
         buy_reference=buy_reference,
-        recommendation_minute_series=recommendation_minute_series or [],
+        recommendation_minute_series=entry_execution_minute_series or [],
         execution_profile=execution_profile,
     )
     simulated_entry_price = _safe_number(entry_execution.get("price")) if entry_execution.get("executable") else None
@@ -13309,11 +13402,20 @@ def _normalize_validation_auto_freeze_config(config: Any) -> Dict[str, Any]:
     schedule_times = raw.get("scheduleTimes", normalized.get("scheduleTimes"))
     if not isinstance(schedule_times, list):
         schedule_times = DEFAULT_VALIDATION_AUTO_FREEZE_CONFIG["scheduleTimes"]
-    normalized["scheduleTimes"] = _unique_strings([
+    schedule_times = _unique_strings([
         _normalize_scan_time(item)
         for item in schedule_times
         if str(item or "").strip()
     ]) or list(DEFAULT_VALIDATION_AUTO_FREEZE_CONFIG["scheduleTimes"])
+    finalize_times = raw.get("finalizeTimes", normalized.get("finalizeTimes"))
+    if not isinstance(finalize_times, list):
+        finalize_times = DEFAULT_VALIDATION_AUTO_FREEZE_CONFIG["finalizeTimes"]
+    normalized["finalizeTimes"] = _unique_strings([
+        _normalize_scan_time(item)
+        for item in finalize_times
+        if str(item or "").strip()
+    ]) or list(DEFAULT_VALIDATION_AUTO_FREEZE_CONFIG["finalizeTimes"])
+    normalized["scheduleTimes"] = _unique_strings(schedule_times + normalized["finalizeTimes"])
     normalized["enabled"] = bool(normalized.get("enabled"))
     normalized["pollIntervalSeconds"] = _clamp_int(normalized.get("pollIntervalSeconds"), 30, 600, 60)
     normalized["scope"] = str(normalized.get("scope") or "all") if str(normalized.get("scope") or "").lower() in {"final", "all"} else "all"
@@ -14102,6 +14204,47 @@ def _default_review_run_id(runs: List[Dict[str, Any]]) -> int:
     return int((runs[0] or {}).get("id") or 0) if runs else 0
 
 
+def _entry_execution_evidence_summary(database: Database, run: Dict[str, Any]) -> Dict[str, Any]:
+    run_id = int(run.get("id") or 0)
+    snapshots = database.load_t1_entry_execution_snapshots(run_id) if run_id > 0 else {}
+    rows = list(snapshots.values())
+    jobs = [
+        item
+        for item in database.list_t1_entry_execution_jobs(limit=500)
+        if int(item.get("runId") or 0) == run_id
+    ] if run_id > 0 else []
+    expected = int(run.get("finalCount") or len(run.get("finalPicks") or []))
+    eligible = len([row for row in rows if row.get("decisionEligible")])
+    status = str((jobs[0] if jobs else {}).get("status") or "not_registered")
+    if expected and eligible == expected:
+        status = "available"
+    elif rows:
+        status = "partial"
+    legacy = not rows and not jobs and str(run.get("recommendationDate") or "") < date.today().isoformat()
+    return {
+        "version": ENTRY_EXECUTION_EVIDENCE_VERSION,
+        "status": "legacy_not_recorded" if legacy else status,
+        "expectedCount": expected,
+        "eligibleCount": eligible,
+        "complete": bool(expected and eligible == expected),
+        "job": jobs[0] if jobs else {},
+        "snapshots": [
+            {
+                "snapshotId": row.get("snapshotId"),
+                "code": row.get("code"),
+                "status": row.get("status"),
+                "decisionEligible": bool(row.get("decisionEligible")),
+                "signalPublishedAt": row.get("signalPublishedAt") or "",
+                "entryTime": row.get("entryTime") or "",
+                "price": row.get("price"),
+                "source": row.get("source") or "",
+                "reason": row.get("reason") or "",
+            }
+            for row in rows
+        ],
+    }
+
+
 def _review_sample_meta(
     run: Dict[str, Any],
     outcome_status: str,
@@ -14484,6 +14627,8 @@ def _review_outcome_exclusion_reasons(outcomes: List[Dict[str, Any]]) -> List[st
         translated.append("验证还不是最终状态。")
     if "推荐日买入价未完成校验" in text or "推荐日价格校验证据不足" in text:
         translated.append("买入价来自推荐时冻结价，收益可以看；但推荐日价格校验证据不足，暂不用于优化。")
+    if "没有推荐日信号发布后的分钟成交" in text or "模拟买入成交证据不足" in text:
+        translated.append("没有取得正式推荐发布后的分钟成交证据，只能用冻结价近似买入，因此不能作为可优化样本。")
     if "价格口径" in text or "价格异常" in text:
         translated.append("价格口径有异常，不能用于优化。")
     if "历史旧口径" in text:

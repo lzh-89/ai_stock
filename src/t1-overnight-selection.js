@@ -912,6 +912,7 @@ function renderProgressMeta(run) {
   const source = market.sourceStatus || {};
   const ai = market.ai || {};
   const evidence = market.t1Evidence || {};
+  const entryEvidence = run?.entryExecutionEvidence || market.entryExecutionEvidence || {};
   const aiParticipation = market.aiParticipation || {};
   const criticStatus = market.criticStatus || run.criticStatus || state.criticStatus || {};
   const critic = market.critic || {};
@@ -1043,6 +1044,7 @@ function renderMarketContext(run) {
   const sectorLayerCounts = quality.sectorLayerCounts || {};
   const minuteKline = market.minuteKlineStatus || {};
   const evidence = market.t1Evidence || {};
+  const entryEvidence = run?.entryExecutionEvidence || market.entryExecutionEvidence || {};
   const evidenceCoverage = evidence.evidenceCoverage || sectorLayerCounts;
   const allocation = market.validationAllocation || {};
   const aiParticipation = market.aiParticipation || {};
@@ -1106,6 +1108,11 @@ function renderMarketContext(run) {
 	      <small>${escapeHtml(evidence.note || "T+1 使用独立证据，不混用早盘雷达。")}</small>
       ${evidence.missing?.length ? `<small class="warning-text">${escapeHtml(evidence.missing.slice(0, 2).join("；"))}</small>` : ""}
     </div>
+    <div class="market-status-card ${entryExecutionEvidenceTone(entryEvidence)}">
+      <span>发布后买入证据</span>
+      <strong>${escapeHtml(entryExecutionEvidenceLabel(entryEvidence))}</strong>
+      <small>${escapeHtml(entryExecutionEvidenceDetail(entryEvidence))}</small>
+    </div>
     <div class="market-status-card ${sectorStateSummaryTone(sectorStateSummary)}">
       <span>板块状态影子</span>
       <strong>${escapeHtml(sectorStateSummaryHeadline(sectorStateSummary))}</strong>
@@ -1159,6 +1166,41 @@ function renderMarketContext(run) {
     </div>
     ${aiAuditHtml(market)}
   `;
+}
+
+function entryExecutionEvidenceLabel(evidence = {}) {
+  const status = String(evidence.status || "not_registered");
+  if (evidence.complete || status === "available") return `${formatInteger(evidence.eligibleCount || 0)} / ${formatInteger(evidence.expectedCount || 0)} 已冻结`;
+  return {
+    scheduled: "等待发布后分钟线",
+    running: "正在采集",
+    retry_wait: "等待重试",
+    partial: "部分证据不可用",
+    provider_failed: "行情源失败",
+    missed_deadline: "已错过采集窗口",
+    legacy_not_recorded: "旧 Run 未记录",
+    not_registered: "任务待登记",
+  }[status] || status;
+}
+
+function entryExecutionEvidenceDetail(evidence = {}) {
+  const snapshots = Array.isArray(evidence.snapshots) ? evidence.snapshots : [];
+  const ready = snapshots.filter((item) => item.decisionEligible);
+  if (ready.length) {
+    return ready.map((item) => `${item.code || "--"} ${item.entryTime || "--"} ${formatNumber(item.price)}`).join("；");
+  }
+  const job = evidence.job || {};
+  if (job.error) return job.error;
+  if (job.dueAt) return `预计 ${String(job.dueAt).slice(11, 19)} 起采集正式推荐发布后的第一根完整 1 分钟行情。`;
+  return evidence.status === "legacy_not_recorded"
+    ? "历史 Run 没有独立保存发布后成交证据，不能用当前规则倒推。"
+    : "正式推荐生成后自动登记，不复用选股阶段的提前冻结价格。";
+}
+
+function entryExecutionEvidenceTone(evidence = {}) {
+  if (evidence.complete || evidence.status === "available") return "good";
+  if (["partial", "provider_failed", "missed_deadline"].includes(evidence.status)) return "bad";
+  return "warn";
 }
 
 function aiAuditHtml(market = {}) {

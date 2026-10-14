@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import sqlite3
@@ -927,6 +928,63 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_t1_opening_links_run
                   ON t1_overnight_opening_evidence_links(run_id, scope, snapshot_id);
+
+                CREATE TABLE IF NOT EXISTS t1_overnight_entry_execution_jobs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id INTEGER NOT NULL,
+                  recommendation_date TEXT NOT NULL,
+                  evidence_version TEXT NOT NULL,
+                  signal_published_at TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'scheduled',
+                  due_at TEXT NOT NULL,
+                  deadline_at TEXT NOT NULL,
+                  lease_owner TEXT NOT NULL DEFAULT '',
+                  lease_expires_at TEXT NOT NULL DEFAULT '',
+                  attempt_count INTEGER NOT NULL DEFAULT 0,
+                  started_at TEXT NOT NULL DEFAULT '',
+                  finished_at TEXT NOT NULL DEFAULT '',
+                  error TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(run_id, evidence_version)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_entry_execution_jobs_due
+                  ON t1_overnight_entry_execution_jobs(recommendation_date, status, due_at, deadline_at);
+
+                CREATE TABLE IF NOT EXISTS t1_overnight_entry_execution_snapshots (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id INTEGER NOT NULL,
+                  code TEXT NOT NULL,
+                  recommendation_date TEXT NOT NULL,
+                  evidence_version TEXT NOT NULL,
+                  signal_published_at TEXT NOT NULL,
+                  provider_timestamp TEXT NOT NULL DEFAULT '',
+                  received_at TEXT NOT NULL DEFAULT '',
+                  status TEXT NOT NULL DEFAULT '',
+                  decision_eligible INTEGER NOT NULL DEFAULT 0,
+                  late_backfill INTEGER NOT NULL DEFAULT 0,
+                  source TEXT NOT NULL DEFAULT '',
+                  payload_json TEXT NOT NULL DEFAULT '{}',
+                  payload_hash TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  UNIQUE(run_id, code, evidence_version)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_entry_execution_snapshots_run
+                  ON t1_overnight_entry_execution_snapshots(run_id, decision_eligible, code);
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_entry_execution_snapshots_no_update
+                BEFORE UPDATE ON t1_overnight_entry_execution_snapshots
+                BEGIN
+                  SELECT RAISE(ABORT, 'entry execution evidence snapshots are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_entry_execution_snapshots_no_delete
+                BEFORE DELETE ON t1_overnight_entry_execution_snapshots
+                BEGIN
+                  SELECT RAISE(ABORT, 'entry execution evidence snapshots are append-only');
+                END;
 
                 CREATE TABLE IF NOT EXISTS t1_overnight_shadow_strategy_daily_facts (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3307,6 +3365,168 @@ class Database:
             ).fetchone()
         return self._t1_opening_evidence_snapshot_from_row(row) if row else {}
 
+    def register_t1_entry_execution_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO t1_overnight_entry_execution_jobs(
+                  run_id, recommendation_date, evidence_version, signal_published_at,
+                  status, due_at, deadline_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)
+                ON CONFLICT(run_id, evidence_version) DO NOTHING
+                """,
+                (
+                    int(job.get("runId") or 0),
+                    str(job.get("recommendationDate") or ""),
+                    str(job.get("evidenceVersion") or ""),
+                    str(job.get("signalPublishedAt") or ""),
+                    str(job.get("dueAt") or ""),
+                    str(job.get("deadlineAt") or ""),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM t1_overnight_entry_execution_jobs
+                WHERE run_id = ? AND evidence_version = ?
+                """,
+                (int(job.get("runId") or 0), str(job.get("evidenceVersion") or "")),
+            ).fetchone()
+        return self._t1_entry_execution_job_from_row(row) if row else {}
+
+    def list_t1_entry_execution_jobs(self, recommendation_date: str = "", limit: int = 200) -> List[Dict[str, Any]]:
+        params: List[Any] = []
+        where = ""
+        if recommendation_date:
+            where = "WHERE recommendation_date = ?"
+            params.append(str(recommendation_date))
+        params.append(max(1, min(int(limit or 200), 5000)))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM t1_overnight_entry_execution_jobs
+                {where}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._t1_entry_execution_job_from_row(row) for row in rows]
+
+    def acquire_t1_entry_execution_job(
+        self, job_id: int, lease_owner: str, now_at: str, lease_expires_at: str
+    ) -> Optional[Dict[str, Any]]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE t1_overnight_entry_execution_jobs
+                SET status='running', lease_owner=?, lease_expires_at=?,
+                    attempt_count=attempt_count+1,
+                    started_at=CASE WHEN started_at='' THEN ? ELSE started_at END,
+                    updated_at=?
+                WHERE id=?
+                  AND status IN ('scheduled', 'running')
+                  AND (status='scheduled' OR lease_expires_at='' OR lease_expires_at < ?)
+                """,
+                (lease_owner, lease_expires_at, now_at, now_at, int(job_id), now_at),
+            )
+            if cursor.rowcount <= 0:
+                return None
+            row = connection.execute(
+                "SELECT * FROM t1_overnight_entry_execution_jobs WHERE id=?", (int(job_id),)
+            ).fetchone()
+        return self._t1_entry_execution_job_from_row(row) if row else None
+
+    def retry_t1_entry_execution_job(self, job_id: int, due_at: str, error: str = "") -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE t1_overnight_entry_execution_jobs
+                SET status='scheduled', due_at=?, lease_owner='', lease_expires_at='',
+                    error=?, updated_at=?
+                WHERE id=?
+                """,
+                (str(due_at or ""), str(error or ""), now, int(job_id)),
+            )
+
+    def finish_t1_entry_execution_job(self, job_id: int, status: str, error: str = "") -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE t1_overnight_entry_execution_jobs
+                SET status=?, lease_owner='', lease_expires_at='', finished_at=?, error=?, updated_at=?
+                WHERE id=?
+                """,
+                (str(status or "done"), now, str(error or ""), now, int(job_id)),
+            )
+
+    def append_t1_entry_execution_snapshots(self, snapshots: List[Dict[str, Any]]) -> int:
+        if not snapshots:
+            return 0
+        rows = []
+        for snapshot in snapshots:
+            payload = dict(snapshot.get("payload") or {})
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            rows.append(
+                (
+                    int(snapshot.get("runId") or 0),
+                    str(snapshot.get("code") or "").zfill(6),
+                    str(snapshot.get("recommendationDate") or ""),
+                    str(snapshot.get("evidenceVersion") or ""),
+                    str(snapshot.get("signalPublishedAt") or ""),
+                    str(snapshot.get("providerTimestamp") or ""),
+                    str(snapshot.get("receivedAt") or ""),
+                    str(snapshot.get("status") or ""),
+                    int(bool(snapshot.get("decisionEligible"))),
+                    int(bool(snapshot.get("lateBackfill"))),
+                    str(snapshot.get("source") or ""),
+                    encoded,
+                    str(snapshot.get("payloadHash") or hashlib.sha256(encoded.encode("utf-8")).hexdigest()),
+                    str(snapshot.get("createdAt") or datetime.now().isoformat(timespec="seconds")),
+                )
+            )
+        with self.connect() as connection:
+            before = connection.total_changes
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO t1_overnight_entry_execution_snapshots(
+                  run_id, code, recommendation_date, evidence_version, signal_published_at,
+                  provider_timestamp, received_at, status, decision_eligible, late_backfill,
+                  source, payload_json, payload_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            return connection.total_changes - before
+
+    def load_t1_entry_execution_snapshots(self, run_id: int, codes: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+        params: List[Any] = [int(run_id)]
+        code_clause = ""
+        normalized = [str(code or "").zfill(6) for code in (codes or []) if str(code or "").strip()]
+        if normalized:
+            code_clause = f"AND code IN ({','.join('?' for _ in normalized)})"
+            params.extend(normalized)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM t1_overnight_entry_execution_snapshots
+                WHERE run_id=? {code_clause}
+                ORDER BY id DESC
+                """,
+                params,
+            ).fetchall()
+        result: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            code = str(row["code"] or "").zfill(6)
+            if code not in result:
+                result[code] = self._t1_entry_execution_snapshot_from_row(row)
+        return result
+
     def create_t1_overnight_selection_run(self, run: Dict[str, Any], pool_items: List[Dict[str, Any]]) -> int:
         now = datetime.now().isoformat(timespec="seconds")
         heartbeat_at = str(run.get("heartbeatAt") or now)
@@ -5112,6 +5332,46 @@ class Database:
             "status": row["status"],
             "decisionEligible": bool(row["decision_eligible"]),
             "lateBackfill": bool(row["late_backfill"]),
+            "payloadHash": row["payload_hash"],
+            "createdAt": row["created_at"],
+        }
+
+    def _t1_entry_execution_job_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "runId": int(row["run_id"]),
+            "recommendationDate": row["recommendation_date"],
+            "evidenceVersion": row["evidence_version"],
+            "signalPublishedAt": row["signal_published_at"],
+            "status": row["status"],
+            "dueAt": row["due_at"],
+            "deadlineAt": row["deadline_at"],
+            "leaseOwner": row["lease_owner"],
+            "leaseExpiresAt": row["lease_expires_at"],
+            "attemptCount": int(row["attempt_count"] or 0),
+            "startedAt": row["started_at"],
+            "finishedAt": row["finished_at"],
+            "error": row["error"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def _t1_entry_execution_snapshot_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+        payload = _json_or_default(row["payload_json"], {})
+        return {
+            **payload,
+            "snapshotId": int(row["id"]),
+            "runId": int(row["run_id"]),
+            "code": row["code"],
+            "recommendationDate": row["recommendation_date"],
+            "evidenceVersion": row["evidence_version"],
+            "signalPublishedAt": row["signal_published_at"],
+            "providerTimestamp": row["provider_timestamp"],
+            "receivedAt": row["received_at"],
+            "status": row["status"],
+            "decisionEligible": bool(row["decision_eligible"]),
+            "lateBackfill": bool(row["late_backfill"]),
+            "source": row["source"],
             "payloadHash": row["payload_hash"],
             "createdAt": row["created_at"],
         }
