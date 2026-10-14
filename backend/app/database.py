@@ -863,6 +863,251 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_t1_overnight_validation_minute_snapshots_lookup
                   ON t1_overnight_validation_minute_snapshots(run_id, target_trade_date, quality_status);
 
+                CREATE TABLE IF NOT EXISTS t1_overnight_opening_evidence_jobs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id INTEGER NOT NULL,
+                  target_trade_date TEXT NOT NULL,
+                  evidence_type TEXT NOT NULL,
+                  evidence_version TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'scheduled',
+                  due_at TEXT NOT NULL,
+                  deadline_at TEXT NOT NULL,
+                  lease_owner TEXT NOT NULL DEFAULT '',
+                  lease_expires_at TEXT NOT NULL DEFAULT '',
+                  attempt_count INTEGER NOT NULL DEFAULT 0,
+                  started_at TEXT NOT NULL DEFAULT '',
+                  finished_at TEXT NOT NULL DEFAULT '',
+                  error TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(run_id, target_trade_date, evidence_type, evidence_version)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_opening_jobs_due
+                  ON t1_overnight_opening_evidence_jobs(target_trade_date, status, due_at, deadline_at);
+
+                CREATE TABLE IF NOT EXISTS t1_overnight_opening_evidence_snapshots (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  target_trade_date TEXT NOT NULL,
+                  evidence_type TEXT NOT NULL,
+                  evidence_version TEXT NOT NULL,
+                  provider_timestamp TEXT NOT NULL DEFAULT '',
+                  received_at TEXT NOT NULL DEFAULT '',
+                  snapshot_published_at TEXT NOT NULL DEFAULT '',
+                  status TEXT NOT NULL DEFAULT '',
+                  decision_eligible INTEGER NOT NULL DEFAULT 0,
+                  late_backfill INTEGER NOT NULL DEFAULT 0,
+                  payload_json TEXT NOT NULL DEFAULT '{}',
+                  payload_hash TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_opening_snapshots_date_type
+                  ON t1_overnight_opening_evidence_snapshots(target_trade_date, evidence_type, evidence_version, id);
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_opening_snapshots_no_update
+                BEFORE UPDATE ON t1_overnight_opening_evidence_snapshots
+                BEGIN
+                  SELECT RAISE(ABORT, 'opening evidence snapshots are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_opening_snapshots_no_delete
+                BEFORE DELETE ON t1_overnight_opening_evidence_snapshots
+                BEGIN
+                  SELECT RAISE(ABORT, 'opening evidence snapshots are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS t1_overnight_opening_evidence_links (
+                  run_id INTEGER NOT NULL,
+                  snapshot_id INTEGER NOT NULL,
+                  scope TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  PRIMARY KEY(run_id, snapshot_id, scope)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_opening_links_run
+                  ON t1_overnight_opening_evidence_links(run_id, scope, snapshot_id);
+
+                CREATE TABLE IF NOT EXISTS t1_overnight_shadow_strategy_daily_facts (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  recommendation_date TEXT NOT NULL,
+                  target_trade_date TEXT NOT NULL DEFAULT '',
+                  canonical_run_id INTEGER NOT NULL,
+                  shadow_family TEXT NOT NULL,
+                  shadow_role TEXT NOT NULL,
+                  scope TEXT NOT NULL DEFAULT '',
+                  strategy_policy_version TEXT NOT NULL DEFAULT '',
+                  outcome_scenario TEXT NOT NULL DEFAULT 'open_15m',
+                  execution_profile_version TEXT NOT NULL DEFAULT '',
+                  comparison_key TEXT NOT NULL DEFAULT '',
+                  control_role TEXT NOT NULL DEFAULT '',
+                  portfolio_slot_count INTEGER NOT NULL DEFAULT 3,
+                  holding_count INTEGER NOT NULL DEFAULT 0,
+                  cash_slot_count INTEGER NOT NULL DEFAULT 3,
+                  stock_outcome_count INTEGER NOT NULL DEFAULT 0,
+                  missing_count INTEGER NOT NULL DEFAULT 0,
+                  budget_limited_count INTEGER NOT NULL DEFAULT 0,
+                  unexecutable_count INTEGER NOT NULL DEFAULT 0,
+                  coverage_pct REAL,
+                  treatment_net_return_pct REAL,
+                  control_net_return_pct REAL,
+                  paired_daily_delta_pct REAL,
+                  benchmark_code TEXT NOT NULL DEFAULT '',
+                  benchmark_return_pct REAL,
+                  excess_return_pct REAL,
+                  avoided_loss_pct REAL,
+                  missed_profit_pct REAL,
+                  status TEXT NOT NULL DEFAULT '',
+                  generation_status TEXT NOT NULL DEFAULT '',
+                  source_type TEXT NOT NULL DEFAULT '',
+                  source_revision TEXT NOT NULL DEFAULT '',
+                  calculation_version TEXT NOT NULL DEFAULT '',
+                  detail_json TEXT NOT NULL DEFAULT '{}',
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(canonical_run_id, shadow_role, strategy_policy_version, outcome_scenario, comparison_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_shadow_daily_role_version_date
+                  ON t1_overnight_shadow_strategy_daily_facts(shadow_role, strategy_policy_version, recommendation_date);
+                CREATE INDEX IF NOT EXISTS idx_t1_shadow_daily_scope_date
+                  ON t1_overnight_shadow_strategy_daily_facts(scope, recommendation_date);
+                CREATE INDEX IF NOT EXISTS idx_t1_shadow_daily_run
+                  ON t1_overnight_shadow_strategy_daily_facts(canonical_run_id);
+
+                CREATE TABLE IF NOT EXISTS t1_overnight_shadow_aggregate_jobs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  canonical_run_id INTEGER NOT NULL,
+                  source_revision TEXT NOT NULL,
+                  calculation_version TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  attempt_count INTEGER NOT NULL DEFAULT 0,
+                  lease_owner TEXT NOT NULL DEFAULT '',
+                  lease_expires_at TEXT NOT NULL DEFAULT '',
+                  next_retry_at TEXT NOT NULL DEFAULT '',
+                  last_error TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(canonical_run_id, source_revision, calculation_version)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_shadow_aggregate_jobs_due
+                  ON t1_overnight_shadow_aggregate_jobs(status, next_retry_at, lease_expires_at, id);
+
+                CREATE TABLE IF NOT EXISTS t1_overnight_shadow_evaluation_reports (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  shadow_family TEXT NOT NULL,
+                  shadow_role TEXT NOT NULL,
+                  scope TEXT NOT NULL DEFAULT '',
+                  strategy_policy_version TEXT NOT NULL DEFAULT '',
+                  outcome_scenario TEXT NOT NULL DEFAULT 'open_15m',
+                  execution_profile_version TEXT NOT NULL DEFAULT '',
+                  window_type TEXT NOT NULL DEFAULT '',
+                  window_start_date TEXT NOT NULL DEFAULT '',
+                  window_end_date TEXT NOT NULL DEFAULT '',
+                  effective_day_count INTEGER NOT NULL DEFAULT 0,
+                  hit_day_count INTEGER NOT NULL DEFAULT 0,
+                  outcome_count INTEGER NOT NULL DEFAULT 0,
+                  coverage_pct REAL,
+                  metrics_json TEXT NOT NULL DEFAULT '{}',
+                  admission_json TEXT NOT NULL DEFAULT '{}',
+                  review_status TEXT NOT NULL DEFAULT 'collecting',
+                  source_watermark TEXT NOT NULL DEFAULT '',
+                  report_revision INTEGER NOT NULL DEFAULT 1,
+                  created_at TEXT NOT NULL,
+                  UNIQUE(shadow_family, shadow_role, strategy_policy_version, outcome_scenario, window_type, report_revision)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_shadow_reports_lookup
+                  ON t1_overnight_shadow_evaluation_reports(
+                    shadow_family, shadow_role, strategy_policy_version,
+                    outcome_scenario, window_type, report_revision
+                  );
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_shadow_reports_no_update
+                BEFORE UPDATE ON t1_overnight_shadow_evaluation_reports
+                BEGIN
+                  SELECT RAISE(ABORT, 'shadow evaluation reports are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_shadow_reports_no_delete
+                BEFORE DELETE ON t1_overnight_shadow_evaluation_reports
+                BEGIN
+                  SELECT RAISE(ABORT, 'shadow evaluation reports are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS t1_overnight_event_risk_snapshots (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id INTEGER NOT NULL DEFAULT 0,
+                  recommendation_date TEXT NOT NULL,
+                  signal_published_at TEXT NOT NULL DEFAULT '',
+                  evidence_cutoff_at TEXT NOT NULL DEFAULT '',
+                  source TEXT NOT NULL DEFAULT '',
+                  status TEXT NOT NULL DEFAULT 'unavailable',
+                  requested_count INTEGER NOT NULL DEFAULT 0,
+                  covered_count INTEGER NOT NULL DEFAULT 0,
+                  coverage_pct REAL,
+                  exact_timestamp_count INTEGER NOT NULL DEFAULT 0,
+                  event_count INTEGER NOT NULL DEFAULT 0,
+                  timestamp_audit_passed INTEGER NOT NULL DEFAULT 0,
+                  requested_codes_json TEXT NOT NULL DEFAULT '[]',
+                  covered_codes_json TEXT NOT NULL DEFAULT '[]',
+                  events_json TEXT NOT NULL DEFAULT '[]',
+                  errors_json TEXT NOT NULL DEFAULT '[]',
+                  payload_hash TEXT NOT NULL DEFAULT '',
+                  reused_from_snapshot_id INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_event_risk_snapshots_lookup
+                  ON t1_overnight_event_risk_snapshots(
+                    recommendation_date, source, status, created_at, id
+                  );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_event_risk_snapshots_run
+                  ON t1_overnight_event_risk_snapshots(run_id, id);
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_event_risk_snapshots_no_update
+                BEFORE UPDATE ON t1_overnight_event_risk_snapshots
+                BEGIN
+                  SELECT RAISE(ABORT, 'event risk snapshots are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_event_risk_snapshots_no_delete
+                BEFORE DELETE ON t1_overnight_event_risk_snapshots
+                BEGIN
+                  SELECT RAISE(ABORT, 'event risk snapshots are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS t1_overnight_risk_policy_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  revision INTEGER NOT NULL,
+                  event_type TEXT NOT NULL,
+                  previous_state TEXT NOT NULL DEFAULT '',
+                  next_state TEXT NOT NULL DEFAULT '',
+                  reason TEXT NOT NULL DEFAULT '',
+                  source_run_ids_json TEXT NOT NULL DEFAULT '[]',
+                  actor TEXT NOT NULL DEFAULT 'system',
+                  detail_json TEXT NOT NULL DEFAULT '{}',
+                  created_at TEXT NOT NULL,
+                  UNIQUE(revision, event_type)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_risk_policy_events_created
+                  ON t1_overnight_risk_policy_events(created_at DESC, id DESC);
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_risk_policy_events_no_update
+                BEFORE UPDATE ON t1_overnight_risk_policy_events
+                BEGIN
+                  SELECT RAISE(ABORT, 'risk policy events are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_risk_policy_events_no_delete
+                BEFORE DELETE ON t1_overnight_risk_policy_events
+                BEGIN
+                  SELECT RAISE(ABORT, 'risk policy events are append-only');
+                END;
+
                 CREATE TABLE IF NOT EXISTS t1_overnight_strategy_feedback (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   feedback_date TEXT NOT NULL,
@@ -1009,6 +1254,7 @@ class Database:
                 """
             )
             self._ensure_column(connection, "t1_overnight_selection_runs", "evidence_run_id", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "t1_overnight_event_risk_snapshots", "reused_from_snapshot_id", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "t1_overnight_sector_snapshots", "sector_state", "TEXT NOT NULL DEFAULT 'data_insufficient'")
             self._ensure_column(connection, "t1_overnight_sector_snapshots", "sector_risk_score", "REAL")
             self._ensure_column(connection, "t1_overnight_sector_snapshots", "sector_confidence", "REAL")
@@ -2909,6 +3155,158 @@ class Database:
                 result[code] = item
         return result
 
+    def register_t1_opening_evidence_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO t1_overnight_opening_evidence_jobs(
+                  run_id, target_trade_date, evidence_type, evidence_version, status,
+                  due_at, deadline_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)
+                ON CONFLICT(run_id, target_trade_date, evidence_type, evidence_version) DO NOTHING
+                """,
+                (
+                    int(job.get("runId") or 0),
+                    str(job.get("targetTradeDate") or ""),
+                    str(job.get("evidenceType") or ""),
+                    str(job.get("evidenceVersion") or ""),
+                    str(job.get("dueAt") or ""),
+                    str(job.get("deadlineAt") or ""),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM t1_overnight_opening_evidence_jobs
+                WHERE run_id = ? AND target_trade_date = ? AND evidence_type = ? AND evidence_version = ?
+                """,
+                (
+                    int(job.get("runId") or 0),
+                    str(job.get("targetTradeDate") or ""),
+                    str(job.get("evidenceType") or ""),
+                    str(job.get("evidenceVersion") or ""),
+                ),
+            ).fetchone()
+        return self._t1_opening_evidence_job_from_row(row) if row else {}
+
+    def list_t1_opening_evidence_jobs(self, target_trade_date: str = "", limit: int = 200) -> List[Dict[str, Any]]:
+        params: List[Any] = []
+        where = ""
+        if target_trade_date:
+            where = "WHERE target_trade_date = ?"
+            params.append(str(target_trade_date))
+        params.append(max(1, int(limit or 200)))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM t1_overnight_opening_evidence_jobs
+                {where}
+                ORDER BY target_trade_date DESC, due_at ASC, id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._t1_opening_evidence_job_from_row(row) for row in rows]
+
+    def acquire_t1_opening_evidence_job(
+        self, job_id: int, worker_id: str, now_at: str, lease_expires_at: str
+    ) -> Optional[Dict[str, Any]]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE t1_overnight_opening_evidence_jobs
+                SET status = 'running', lease_owner = ?, lease_expires_at = ?,
+                    attempt_count = attempt_count + 1,
+                    started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('scheduled', 'running')
+                  AND due_at <= ?
+                  AND deadline_at >= ?
+                  AND (status = 'scheduled' OR lease_expires_at = '' OR lease_expires_at < ?)
+                """,
+                (worker_id, lease_expires_at, now_at, now_at, int(job_id), now_at, now_at, now_at),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM t1_overnight_opening_evidence_jobs WHERE id = ?",
+                (int(job_id),),
+            ).fetchone()
+        return self._t1_opening_evidence_job_from_row(row) if row else None
+
+    def finish_t1_opening_evidence_job(self, job_id: int, status: str, error: str = "") -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE t1_overnight_opening_evidence_jobs
+                SET status = ?, error = ?, finished_at = ?, lease_owner = '',
+                    lease_expires_at = '', updated_at = ?
+                WHERE id = ?
+                """,
+                (str(status), str(error or ""), now, now, int(job_id)),
+            )
+
+    def append_t1_opening_evidence_snapshot(self, snapshot: Dict[str, Any], run_ids: List[int]) -> int:
+        created_at = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO t1_overnight_opening_evidence_snapshots(
+                  target_trade_date, evidence_type, evidence_version, provider_timestamp,
+                  received_at, snapshot_published_at, status, decision_eligible,
+                  late_backfill, payload_json, payload_hash, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(snapshot.get("targetTradeDate") or ""),
+                    str(snapshot.get("evidenceType") or ""),
+                    str(snapshot.get("evidenceVersion") or ""),
+                    str(snapshot.get("providerTimestamp") or ""),
+                    str(snapshot.get("receivedAt") or ""),
+                    str(snapshot.get("snapshotPublishedAt") or ""),
+                    str(snapshot.get("status") or ""),
+                    1 if snapshot.get("decisionEligible") else 0,
+                    1 if snapshot.get("lateBackfill") else 0,
+                    json.dumps(snapshot.get("payload") or {}, ensure_ascii=False),
+                    str(snapshot.get("payloadHash") or ""),
+                    created_at,
+                ),
+            )
+            snapshot_id = int(cursor.lastrowid)
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO t1_overnight_opening_evidence_links(run_id, snapshot_id, scope, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (int(run_id), snapshot_id, str(snapshot.get("scope") or snapshot.get("evidenceType") or ""), created_at)
+                    for run_id in run_ids
+                    if int(run_id or 0) > 0
+                ],
+            )
+        return snapshot_id
+
+    def load_t1_opening_evidence(self, run_id: int, evidence_type: str = "opening_risk_snapshot") -> Dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT snapshot.*
+                FROM t1_overnight_opening_evidence_snapshots snapshot
+                JOIN t1_overnight_opening_evidence_links link ON link.snapshot_id = snapshot.id
+                WHERE link.run_id = ? AND snapshot.evidence_type = ?
+                ORDER BY snapshot.decision_eligible DESC, snapshot.id DESC
+                LIMIT 1
+                """,
+                (int(run_id), str(evidence_type)),
+            ).fetchone()
+        return self._t1_opening_evidence_snapshot_from_row(row) if row else {}
+
     def create_t1_overnight_selection_run(self, run: Dict[str, Any], pool_items: List[Dict[str, Any]]) -> int:
         now = datetime.now().isoformat(timespec="seconds")
         heartbeat_at = str(run.get("heartbeatAt") or now)
@@ -3411,6 +3809,650 @@ class Database:
             if code not in result:
                 result[code] = self._t1_overnight_validation_minute_snapshot_from_row(row)
         return result
+
+    def upsert_t1_shadow_strategy_daily_fact(self, fact: Dict[str, Any]) -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        values = (
+            str(fact.get("recommendationDate") or ""),
+            str(fact.get("targetTradeDate") or ""),
+            int(fact.get("canonicalRunId") or 0),
+            str(fact.get("shadowFamily") or ""),
+            str(fact.get("shadowRole") or ""),
+            str(fact.get("scope") or ""),
+            str(fact.get("strategyPolicyVersion") or ""),
+            str(fact.get("outcomeScenario") or "open_15m"),
+            str(fact.get("executionProfileVersion") or ""),
+            str(fact.get("comparisonKey") or ""),
+            str(fact.get("controlRole") or ""),
+            int(fact.get("portfolioSlotCount") or 3),
+            int(fact.get("holdingCount") or 0),
+            int(fact.get("cashSlotCount") if fact.get("cashSlotCount") is not None else 3),
+            int(fact.get("stockOutcomeCount") or 0),
+            int(fact.get("missingCount") or 0),
+            int(fact.get("budgetLimitedCount") or 0),
+            int(fact.get("unexecutableCount") or 0),
+            _optional_float(fact.get("coveragePct")),
+            _optional_float(fact.get("treatmentNetReturnPct")),
+            _optional_float(fact.get("controlNetReturnPct")),
+            _optional_float(fact.get("pairedDailyDeltaPct")),
+            str(fact.get("benchmarkCode") or ""),
+            _optional_float(fact.get("benchmarkReturnPct")),
+            _optional_float(fact.get("excessReturnPct")),
+            _optional_float(fact.get("avoidedLossPct")),
+            _optional_float(fact.get("missedProfitPct")),
+            str(fact.get("status") or ""),
+            str(fact.get("generationStatus") or "done"),
+            str(fact.get("sourceType") or ""),
+            str(fact.get("sourceRevision") or ""),
+            str(fact.get("calculationVersion") or ""),
+            json.dumps(fact.get("detail") or {}, ensure_ascii=False),
+            now,
+            now,
+        )
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO t1_overnight_shadow_strategy_daily_facts(
+                  recommendation_date, target_trade_date, canonical_run_id,
+                  shadow_family, shadow_role, scope, strategy_policy_version,
+                  outcome_scenario, execution_profile_version, comparison_key, control_role,
+                  portfolio_slot_count, holding_count, cash_slot_count, stock_outcome_count,
+                  missing_count, budget_limited_count, unexecutable_count, coverage_pct,
+                  treatment_net_return_pct, control_net_return_pct, paired_daily_delta_pct,
+                  benchmark_code, benchmark_return_pct, excess_return_pct,
+                  avoided_loss_pct, missed_profit_pct, status, generation_status,
+                  source_type, source_revision, calculation_version, detail_json,
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(canonical_run_id, shadow_role, strategy_policy_version, outcome_scenario, comparison_key)
+                DO UPDATE SET
+                  recommendation_date=excluded.recommendation_date,
+                  target_trade_date=excluded.target_trade_date,
+                  shadow_family=excluded.shadow_family,
+                  scope=excluded.scope,
+                  execution_profile_version=excluded.execution_profile_version,
+                  control_role=excluded.control_role,
+                  portfolio_slot_count=excluded.portfolio_slot_count,
+                  holding_count=excluded.holding_count,
+                  cash_slot_count=excluded.cash_slot_count,
+                  stock_outcome_count=excluded.stock_outcome_count,
+                  missing_count=excluded.missing_count,
+                  budget_limited_count=excluded.budget_limited_count,
+                  unexecutable_count=excluded.unexecutable_count,
+                  coverage_pct=excluded.coverage_pct,
+                  treatment_net_return_pct=excluded.treatment_net_return_pct,
+                  control_net_return_pct=excluded.control_net_return_pct,
+                  paired_daily_delta_pct=excluded.paired_daily_delta_pct,
+                  benchmark_code=excluded.benchmark_code,
+                  benchmark_return_pct=excluded.benchmark_return_pct,
+                  excess_return_pct=excluded.excess_return_pct,
+                  avoided_loss_pct=excluded.avoided_loss_pct,
+                  missed_profit_pct=excluded.missed_profit_pct,
+                  status=excluded.status,
+                  generation_status=excluded.generation_status,
+                  source_type=excluded.source_type,
+                  source_revision=excluded.source_revision,
+                  calculation_version=excluded.calculation_version,
+                  detail_json=excluded.detail_json,
+                  updated_at=excluded.updated_at
+                """,
+                values,
+            )
+            row = connection.execute(
+                """
+                SELECT id FROM t1_overnight_shadow_strategy_daily_facts
+                WHERE canonical_run_id=? AND shadow_role=? AND strategy_policy_version=?
+                  AND outcome_scenario=? AND comparison_key=?
+                """,
+                (
+                    int(fact.get("canonicalRunId") or 0),
+                    str(fact.get("shadowRole") or ""),
+                    str(fact.get("strategyPolicyVersion") or ""),
+                    str(fact.get("outcomeScenario") or "open_15m"),
+                    str(fact.get("comparisonKey") or ""),
+                ),
+            ).fetchone()
+        return int(row["id"] or 0) if row else 0
+
+    def list_t1_shadow_strategy_daily_facts(
+        self,
+        shadow_family: str = "",
+        shadow_role: str = "",
+        scope: str = "",
+        strategy_policy_version: str = "",
+        outcome_scenario: str = "open_15m",
+        execution_profile_version: str = "",
+        date_from: str = "",
+        date_to: str = "",
+    ) -> List[Dict[str, Any]]:
+        clauses = ["1=1"]
+        params: List[Any] = []
+        for column, value in (
+            ("shadow_family", shadow_family),
+            ("shadow_role", shadow_role),
+            ("scope", scope),
+            ("strategy_policy_version", strategy_policy_version),
+            ("outcome_scenario", outcome_scenario),
+            ("execution_profile_version", execution_profile_version),
+        ):
+            if value:
+                clauses.append(f"{column} = ?")
+                params.append(str(value))
+        if date_from:
+            clauses.append("recommendation_date >= ?")
+            params.append(str(date_from))
+        if date_to:
+            clauses.append("recommendation_date <= ?")
+            params.append(str(date_to))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM t1_overnight_shadow_strategy_daily_facts WHERE {' AND '.join(clauses)} ORDER BY recommendation_date, canonical_run_id",
+                params,
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "recommendationDate": row["recommendation_date"],
+                "targetTradeDate": row["target_trade_date"],
+                "canonicalRunId": int(row["canonical_run_id"]),
+                "shadowFamily": row["shadow_family"],
+                "shadowRole": row["shadow_role"],
+                "scope": row["scope"],
+                "strategyPolicyVersion": row["strategy_policy_version"],
+                "outcomeScenario": row["outcome_scenario"],
+                "executionProfileVersion": row["execution_profile_version"],
+                "comparisonKey": row["comparison_key"],
+                "controlRole": row["control_role"],
+                "portfolioSlotCount": int(row["portfolio_slot_count"] or 3),
+                "holdingCount": int(row["holding_count"] or 0),
+                "cashSlotCount": int(row["cash_slot_count"] or 0),
+                "stockOutcomeCount": int(row["stock_outcome_count"] or 0),
+                "missingCount": int(row["missing_count"] or 0),
+                "budgetLimitedCount": int(row["budget_limited_count"] or 0),
+                "unexecutableCount": int(row["unexecutable_count"] or 0),
+                "coveragePct": _optional_float(row["coverage_pct"]),
+                "treatmentNetReturnPct": _optional_float(row["treatment_net_return_pct"]),
+                "controlNetReturnPct": _optional_float(row["control_net_return_pct"]),
+                "pairedDailyDeltaPct": _optional_float(row["paired_daily_delta_pct"]),
+                "benchmarkCode": row["benchmark_code"],
+                "benchmarkReturnPct": _optional_float(row["benchmark_return_pct"]),
+                "excessReturnPct": _optional_float(row["excess_return_pct"]),
+                "avoidedLossPct": _optional_float(row["avoided_loss_pct"]),
+                "missedProfitPct": _optional_float(row["missed_profit_pct"]),
+                "status": row["status"],
+                "generationStatus": row["generation_status"],
+                "sourceType": row["source_type"],
+                "sourceRevision": row["source_revision"],
+                "calculationVersion": row["calculation_version"],
+                "detail": _json_or_default(row["detail_json"], {}),
+                "createdAt": row["created_at"],
+                "updatedAt": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def register_t1_shadow_aggregate_job(
+        self,
+        canonical_run_id: int,
+        source_revision: str,
+        calculation_version: str,
+    ) -> Dict[str, Any]:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO t1_overnight_shadow_aggregate_jobs(
+                  canonical_run_id, source_revision, calculation_version,
+                  status, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?)
+                """,
+                (int(canonical_run_id), str(source_revision), str(calculation_version), now, now),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM t1_overnight_shadow_aggregate_jobs
+                WHERE canonical_run_id=? AND source_revision=? AND calculation_version=?
+                """,
+                (int(canonical_run_id), str(source_revision), str(calculation_version)),
+            ).fetchone()
+        return self._t1_shadow_aggregate_job_from_row(row) if row else {}
+
+    def list_t1_shadow_aggregate_jobs(self, limit: int = 200) -> List[Dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM t1_overnight_shadow_aggregate_jobs
+                ORDER BY id DESC LIMIT ?
+                """,
+                (max(1, int(limit or 200)),),
+            ).fetchall()
+        return [self._t1_shadow_aggregate_job_from_row(row) for row in rows]
+
+    def acquire_t1_shadow_aggregate_job(
+        self,
+        job_id: int,
+        worker_id: str,
+        now_at: str,
+        lease_expires_at: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE t1_overnight_shadow_aggregate_jobs
+                SET status='running', lease_owner=?, lease_expires_at=?,
+                    attempt_count=attempt_count+1, updated_at=?
+                WHERE id=?
+                  AND status IN ('pending', 'retry_wait', 'running')
+                  AND (next_retry_at='' OR next_retry_at<=?)
+                  AND (status!='running' OR lease_expires_at='' OR lease_expires_at<=?)
+                """,
+                (str(worker_id), str(lease_expires_at), str(now_at), int(job_id), str(now_at), str(now_at)),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM t1_overnight_shadow_aggregate_jobs WHERE id=?",
+                (int(job_id),),
+            ).fetchone()
+        return self._t1_shadow_aggregate_job_from_row(row) if row else None
+
+    def complete_t1_shadow_aggregate_job(self, job_id: int, worker_id: str, now_at: str) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE t1_overnight_shadow_aggregate_jobs
+                SET status='done', lease_owner='', lease_expires_at='', next_retry_at='',
+                    last_error='', updated_at=?
+                WHERE id=? AND status='running' AND lease_owner=?
+                """,
+                (str(now_at), int(job_id), str(worker_id)),
+            )
+        return cursor.rowcount == 1
+
+    def fail_t1_shadow_aggregate_job(
+        self,
+        job_id: int,
+        worker_id: str,
+        now_at: str,
+        next_retry_at: str,
+        error: str,
+        terminal: bool = False,
+    ) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE t1_overnight_shadow_aggregate_jobs
+                SET status=?, lease_owner='', lease_expires_at='', next_retry_at=?,
+                    last_error=?, updated_at=?
+                WHERE id=? AND status='running' AND lease_owner=?
+                """,
+                (
+                    "failed" if terminal else "retry_wait",
+                    "" if terminal else str(next_retry_at),
+                    str(error)[:2000],
+                    str(now_at),
+                    int(job_id),
+                    str(worker_id),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def delete_t1_shadow_daily_facts_outside_runs(self, canonical_run_ids: List[int]) -> int:
+        normalized = sorted({int(value) for value in canonical_run_ids if int(value) > 0})
+        if not normalized:
+            return 0
+        placeholders = ",".join("?" for _ in normalized)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM t1_overnight_shadow_strategy_daily_facts WHERE canonical_run_id NOT IN ({placeholders})",
+                normalized,
+            )
+        return int(cursor.rowcount or 0)
+
+    def delete_t1_shadow_daily_facts_for_run(self, canonical_run_id: int) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM t1_overnight_shadow_strategy_daily_facts WHERE canonical_run_id=?",
+                (int(canonical_run_id),),
+            )
+        return int(cursor.rowcount or 0)
+
+    def append_t1_shadow_evaluation_report(self, report: Dict[str, Any]) -> Dict[str, Any]:
+        identity = (
+            str(report.get("shadowFamily") or ""),
+            str(report.get("shadowRole") or ""),
+            str(report.get("strategyPolicyVersion") or ""),
+            str(report.get("outcomeScenario") or "open_15m"),
+            str(report.get("windowType") or ""),
+        )
+        execution_version = str(report.get("executionProfileVersion") or "")
+        source_watermark = str(report.get("sourceWatermark") or "")
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM t1_overnight_shadow_evaluation_reports
+                WHERE shadow_family=? AND shadow_role=? AND strategy_policy_version=?
+                  AND outcome_scenario=? AND window_type=?
+                  AND execution_profile_version=? AND source_watermark=?
+                  AND window_start_date=? AND window_end_date=?
+                ORDER BY report_revision DESC LIMIT 1
+                """,
+                (
+                    *identity,
+                    execution_version,
+                    source_watermark,
+                    str(report.get("windowStartDate") or ""),
+                    str(report.get("windowEndDate") or ""),
+                ),
+            ).fetchone()
+            if existing:
+                result = self._t1_shadow_evaluation_report_from_row(existing)
+                result["created"] = False
+                return result
+            revision_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(report_revision), 0) AS revision
+                FROM t1_overnight_shadow_evaluation_reports
+                WHERE shadow_family=? AND shadow_role=? AND strategy_policy_version=?
+                  AND outcome_scenario=? AND window_type=?
+                """,
+                identity,
+            ).fetchone()
+            revision = int(revision_row["revision"] or 0) + 1
+            cursor = connection.execute(
+                """
+                INSERT INTO t1_overnight_shadow_evaluation_reports(
+                  shadow_family, shadow_role, scope, strategy_policy_version,
+                  outcome_scenario, execution_profile_version, window_type,
+                  window_start_date, window_end_date, effective_day_count,
+                  hit_day_count, outcome_count, coverage_pct, metrics_json,
+                  admission_json, review_status, source_watermark,
+                  report_revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identity[0], identity[1], str(report.get("scope") or ""), identity[2],
+                    identity[3], execution_version, identity[4],
+                    str(report.get("windowStartDate") or ""), str(report.get("windowEndDate") or ""),
+                    int(report.get("effectiveDayCount") or 0), int(report.get("hitDayCount") or 0),
+                    int(report.get("outcomeCount") or 0), _optional_float(report.get("coveragePct")),
+                    json.dumps(report.get("metrics") or {}, ensure_ascii=False),
+                    json.dumps(report.get("admission") or {}, ensure_ascii=False),
+                    str(report.get("reviewStatus") or "collecting"), source_watermark,
+                    revision, now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM t1_overnight_shadow_evaluation_reports WHERE id=?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        result = self._t1_shadow_evaluation_report_from_row(row)
+        result["created"] = True
+        return result
+
+    def list_t1_shadow_evaluation_reports(
+        self,
+        shadow_family: str = "",
+        shadow_role: str = "",
+        scope: str = "",
+        strategy_policy_version: str = "",
+        outcome_scenario: str = "open_15m",
+        execution_profile_version: str = "",
+        window_type: str = "",
+    ) -> List[Dict[str, Any]]:
+        clauses = ["1=1"]
+        params: List[Any] = []
+        for column, value in (
+            ("shadow_family", shadow_family),
+            ("shadow_role", shadow_role),
+            ("scope", scope),
+            ("strategy_policy_version", strategy_policy_version),
+            ("outcome_scenario", outcome_scenario),
+            ("execution_profile_version", execution_profile_version),
+            ("window_type", window_type),
+        ):
+            if value:
+                clauses.append(f"{column}=?")
+                params.append(str(value))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM t1_overnight_shadow_evaluation_reports
+                WHERE {' AND '.join(clauses)}
+                ORDER BY shadow_family, shadow_role, strategy_policy_version,
+                         window_type, report_revision DESC
+                """,
+                params,
+            ).fetchall()
+        return [self._t1_shadow_evaluation_report_from_row(row) for row in rows]
+
+    def _t1_shadow_aggregate_job_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "canonicalRunId": int(row["canonical_run_id"]),
+            "sourceRevision": row["source_revision"],
+            "calculationVersion": row["calculation_version"],
+            "status": row["status"],
+            "attemptCount": int(row["attempt_count"] or 0),
+            "leaseOwner": row["lease_owner"],
+            "leaseExpiresAt": row["lease_expires_at"],
+            "nextRetryAt": row["next_retry_at"],
+            "lastError": row["last_error"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def _t1_shadow_evaluation_report_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "shadowFamily": row["shadow_family"],
+            "shadowRole": row["shadow_role"],
+            "scope": row["scope"],
+            "strategyPolicyVersion": row["strategy_policy_version"],
+            "outcomeScenario": row["outcome_scenario"],
+            "executionProfileVersion": row["execution_profile_version"],
+            "windowType": row["window_type"],
+            "windowStartDate": row["window_start_date"],
+            "windowEndDate": row["window_end_date"],
+            "effectiveDayCount": int(row["effective_day_count"] or 0),
+            "hitDayCount": int(row["hit_day_count"] or 0),
+            "outcomeCount": int(row["outcome_count"] or 0),
+            "coveragePct": _optional_float(row["coverage_pct"]),
+            "metrics": _json_or_default(row["metrics_json"], {}),
+            "admission": _json_or_default(row["admission_json"], {}),
+            "reviewStatus": row["review_status"],
+            "sourceWatermark": row["source_watermark"],
+            "reportRevision": int(row["report_revision"] or 1),
+            "createdAt": row["created_at"],
+        }
+
+    def append_t1_event_risk_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        now = str(snapshot.get("createdAt") or datetime.now().isoformat(timespec="seconds"))
+        requested_codes = sorted({str(code or "").zfill(6) for code in snapshot.get("requestedCodes") or [] if str(code or "").strip()})
+        covered_codes = sorted({str(code or "").zfill(6) for code in snapshot.get("coveredCodes") or [] if str(code or "").strip()})
+        events = list(snapshot.get("events") or [])
+        errors = list(snapshot.get("errors") or [])
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO t1_overnight_event_risk_snapshots(
+                  run_id, recommendation_date, signal_published_at,
+                  evidence_cutoff_at, source, status, requested_count,
+                  covered_count, coverage_pct, exact_timestamp_count,
+                  event_count, timestamp_audit_passed, requested_codes_json,
+                  covered_codes_json, events_json, errors_json, payload_hash,
+                  reused_from_snapshot_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(snapshot.get("runId") or 0),
+                    str(snapshot.get("recommendationDate") or ""),
+                    str(snapshot.get("signalPublishedAt") or ""),
+                    str(snapshot.get("evidenceCutoffAt") or ""),
+                    str(snapshot.get("source") or ""),
+                    str(snapshot.get("status") or "unavailable"),
+                    len(requested_codes),
+                    len(covered_codes),
+                    _optional_float(snapshot.get("coveragePct")),
+                    int(snapshot.get("exactTimestampCount") or 0),
+                    len(events),
+                    1 if snapshot.get("timestampAuditPassed") else 0,
+                    json.dumps(requested_codes, ensure_ascii=False),
+                    json.dumps(covered_codes, ensure_ascii=False),
+                    json.dumps(events, ensure_ascii=False),
+                    json.dumps(errors, ensure_ascii=False),
+                    str(snapshot.get("payloadHash") or ""),
+                    int(snapshot.get("reusedFromSnapshotId") or 0),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM t1_overnight_event_risk_snapshots WHERE id=?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return self._t1_event_risk_snapshot_from_row(row)
+
+    def latest_reusable_t1_event_risk_snapshot(
+        self,
+        recommendation_date: str,
+        source: str,
+        requested_codes: List[str],
+        not_before: str,
+    ) -> Optional[Dict[str, Any]]:
+        normalized = sorted({str(code or "").zfill(6) for code in requested_codes if str(code or "").strip()})
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM t1_overnight_event_risk_snapshots
+                WHERE recommendation_date=? AND source=? AND status='available'
+                  AND created_at>=?
+                ORDER BY id DESC
+                LIMIT 20
+                """,
+                (str(recommendation_date or ""), str(source or ""), str(not_before or "")),
+            ).fetchall()
+        for row in rows:
+            item = self._t1_event_risk_snapshot_from_row(row)
+            if item.get("requestedCodes") == normalized:
+                return item
+        return None
+
+    def list_t1_event_risk_snapshots(self, limit: int = 120) -> List[Dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM t1_overnight_event_risk_snapshots
+                ORDER BY recommendation_date DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit or 120)),),
+            ).fetchall()
+        return [self._t1_event_risk_snapshot_from_row(row) for row in rows]
+
+    def _t1_event_risk_snapshot_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "runId": int(row["run_id"] or 0),
+            "recommendationDate": row["recommendation_date"],
+            "signalPublishedAt": row["signal_published_at"],
+            "evidenceCutoffAt": row["evidence_cutoff_at"],
+            "source": row["source"],
+            "status": row["status"],
+            "requestedCount": int(row["requested_count"] or 0),
+            "coveredCount": int(row["covered_count"] or 0),
+            "coveragePct": _optional_float(row["coverage_pct"]),
+            "exactTimestampCount": int(row["exact_timestamp_count"] or 0),
+            "eventCount": int(row["event_count"] or 0),
+            "timestampAuditPassed": bool(row["timestamp_audit_passed"]),
+            "requestedCodes": _json_or_default(row["requested_codes_json"], []),
+            "coveredCodes": _json_or_default(row["covered_codes_json"], []),
+            "events": _json_or_default(row["events_json"], []),
+            "errors": _json_or_default(row["errors_json"], []),
+            "payloadHash": row["payload_hash"],
+            "reusedFromSnapshotId": int(row["reused_from_snapshot_id"] or 0),
+            "createdAt": row["created_at"],
+        }
+
+    def save_t1_risk_policy_transition(
+        self,
+        setting_key: str,
+        expected_revision: int,
+        state: Dict[str, Any],
+        event: Dict[str, Any],
+    ) -> bool:
+        now = str(event.get("createdAt") or datetime.now().isoformat(timespec="seconds"))
+        payload = json.dumps(state, ensure_ascii=False)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value_json FROM app_settings WHERE key=?",
+                (str(setting_key),),
+            ).fetchone()
+            current = _json_or_default(row["value_json"], {}) if row else {}
+            current_revision = int(current.get("revision") or 0)
+            if current_revision != int(expected_revision or 0):
+                connection.rollback()
+                return False
+            if row:
+                connection.execute(
+                    "UPDATE app_settings SET value_json=?, updated_at=? WHERE key=?",
+                    (payload, now, str(setting_key)),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO app_settings(key, value_json, updated_at) VALUES (?, ?, ?)",
+                    (str(setting_key), payload, now),
+                )
+            connection.execute(
+                """
+                INSERT INTO t1_overnight_risk_policy_events(
+                  revision, event_type, previous_state, next_state, reason,
+                  source_run_ids_json, actor, detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(state.get("revision") or 0),
+                    str(event.get("eventType") or "state_transition"),
+                    str(event.get("previousState") or ""),
+                    str(event.get("nextState") or state.get("state") or ""),
+                    str(event.get("reason") or state.get("reason") or ""),
+                    json.dumps(event.get("sourceRunIds") or state.get("sourceRunIds") or [], ensure_ascii=False),
+                    str(event.get("actor") or "system"),
+                    json.dumps(event.get("detail") or {}, ensure_ascii=False),
+                    now,
+                ),
+            )
+        return True
+
+    def list_t1_risk_policy_events(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM t1_overnight_risk_policy_events
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit or 50)),),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "revision": int(row["revision"] or 0),
+                "eventType": row["event_type"],
+                "previousState": row["previous_state"],
+                "nextState": row["next_state"],
+                "reason": row["reason"],
+                "sourceRunIds": _json_or_default(row["source_run_ids_json"], []),
+                "actor": row["actor"],
+                "detail": _json_or_default(row["detail_json"], {}),
+                "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def count_t1_overnight_completed_runs(self) -> int:
         with self.connect() as connection:
@@ -4036,6 +5078,44 @@ class Database:
             "updatedAt": row["updated_at"],
         }
 
+    def _t1_opening_evidence_job_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "runId": int(row["run_id"]),
+            "targetTradeDate": row["target_trade_date"],
+            "evidenceType": row["evidence_type"],
+            "evidenceVersion": row["evidence_version"],
+            "status": row["status"],
+            "dueAt": row["due_at"],
+            "deadlineAt": row["deadline_at"],
+            "leaseOwner": row["lease_owner"],
+            "leaseExpiresAt": row["lease_expires_at"],
+            "attemptCount": int(row["attempt_count"] or 0),
+            "startedAt": row["started_at"],
+            "finishedAt": row["finished_at"],
+            "error": row["error"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def _t1_opening_evidence_snapshot_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+        payload = _json_or_default(row["payload_json"], {})
+        return {
+            **payload,
+            "snapshotId": int(row["id"]),
+            "targetTradeDate": row["target_trade_date"],
+            "evidenceType": row["evidence_type"],
+            "evidenceVersion": row["evidence_version"],
+            "providerTimestamp": row["provider_timestamp"],
+            "receivedAt": row["received_at"],
+            "snapshotPublishedAt": row["snapshot_published_at"],
+            "status": row["status"],
+            "decisionEligible": bool(row["decision_eligible"]),
+            "lateBackfill": bool(row["late_backfill"]),
+            "payloadHash": row["payload_hash"],
+            "createdAt": row["created_at"],
+        }
+
     def _t1_overnight_item_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         stage = row["stage"]
         return {
@@ -4225,6 +5305,8 @@ def _pick_official_t1_run_id(run_ids: List[int], run_meta: Dict[int, Dict[str, A
         selection_mode = str(meta.get("selectionMode") or "")
         force = bool(request.get("force"))
         final_count = int(meta.get("finalCount") or 0)
+        if selection_mode in {"rules_fallback", "ai_technical_failure_zero_pick", "ai_unavailable_zero_pick", "ai_failed"}:
+            return (98, run_id)
         if role == "official":
             return (0, run_id)
         if final_count > 0 and not force and "14:30" <= scan_time <= "14:50" and selection_mode not in {"rules_fallback"}:

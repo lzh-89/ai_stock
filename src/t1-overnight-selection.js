@@ -18,9 +18,11 @@ const state = {
   executionConfig: null,
   stageConfig: null,
   stageStatus: null,
+  strategyGovernance: null,
   criticStatus: null,
   strategyFeedback: null,
-  autoRunStatus: null
+  autoRunStatus: null,
+  advancedGovernanceLoaded: false
 };
 
 const ZERO_PICK_SELECTION_MODES = ["market_risk_zero_pick", "data_quality_zero_pick", "guardrail_zero_pick", "invalid_non_trading_day"];
@@ -80,6 +82,16 @@ const els = {
   stage3TradeableInput: document.querySelector("#stage3TradeableInput"),
   saveStageConfigButton: document.querySelector("#saveStageConfigButton"),
   stageStatusLine: document.querySelector("#stageStatusLine"),
+  strategyStateSummary: document.querySelector("#strategyStateSummary"),
+  strategyTodayImpact: document.querySelector("#strategyTodayImpact"),
+  strategyPendingActions: document.querySelector("#strategyPendingActions"),
+  strategyReviewProgress: document.querySelector("#strategyReviewProgress"),
+  strategyStateHistory: document.querySelector("#strategyStateHistory"),
+  refreshStrategyStateButton: document.querySelector("#refreshStrategyStateButton"),
+  continueObserveButton: document.querySelector("#continueObserveButton"),
+  pauseStrategyButton: document.querySelector("#pauseStrategyButton"),
+  recoverStrategyButton: document.querySelector("#recoverStrategyButton"),
+  advancedGovernance: document.querySelector("#advancedGovernance"),
   saveExecutionConfigButton: document.querySelector("#saveExecutionConfigButton"),
   buySlippageInput: document.querySelector("#buySlippageInput"),
   sellSlippageInput: document.querySelector("#sellSlippageInput"),
@@ -118,10 +130,8 @@ function init() {
   bindEvents();
   updateHeader();
   if (requestedPoolSize && Number(requestedPoolSize) !== state.poolSize) syncUrl();
-  if (hasCriticForm()) loadCriticConfig();
-  if (hasExecutionForm()) loadExecutionConfig();
-  if (hasStageForm()) loadStageConfig();
-  if (hasStrategyFeedbackPanel()) loadStrategyFeedback();
+  if (state.pageMode !== "config" || els.advancedGovernance?.open) loadAdvancedGovernanceData();
+  if (els.strategyStateSummary) loadStrategyGovernance();
   loadAutoRunStatus();
   if (state.pageMode !== "config") loadLatest();
 }
@@ -154,6 +164,13 @@ function bindEvents() {
   on(els.runButton, "click", startRun);
   on(els.saveCriticConfigButton, "click", saveCriticConfig);
   on(els.saveStageConfigButton, "click", saveStageConfig);
+  on(els.refreshStrategyStateButton, "click", loadStrategyGovernance);
+  on(els.continueObserveButton, "click", () => reviewRiskPolicy("continue_observing"));
+  on(els.pauseStrategyButton, "click", () => reviewRiskPolicy("pause"));
+  on(els.recoverStrategyButton, "click", () => reviewRiskPolicy("recover"));
+  on(els.advancedGovernance, "toggle", () => {
+    if (els.advancedGovernance.open) loadAdvancedGovernanceData();
+  });
   on(els.stageSectorShadowCheck, "change", renderStageForm);
   on(els.stageStyleShadowCheck, "change", renderStageForm);
   on(els.saveExecutionConfigButton, "click", saveExecutionConfig);
@@ -226,6 +243,15 @@ function hasStageForm() {
 
 function hasStrategyFeedbackPanel() {
   return Boolean(els.feedbackStats && els.feedbackPatterns && els.feedbackSuggestions);
+}
+
+function loadAdvancedGovernanceData() {
+  if (state.advancedGovernanceLoaded) return;
+  state.advancedGovernanceLoaded = true;
+  if (hasCriticForm()) loadCriticConfig();
+  if (hasExecutionForm()) loadExecutionConfig();
+  if (hasStageForm()) loadStageConfig();
+  if (hasStrategyFeedbackPanel()) loadStrategyFeedback();
 }
 
 async function loadLatest() {
@@ -372,6 +398,63 @@ async function loadStageConfig() {
     renderStageStatusLine();
   } catch (error) {
     renderError(error);
+  }
+}
+
+async function loadStrategyGovernance() {
+  if (!els.strategyStateSummary) return;
+  setDisabled(els.refreshStrategyStateButton, true);
+  try {
+    const response = await fetch("/api/t1-overnight-selection/strategy-state");
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `API ${response.status}`);
+    state.strategyGovernance = payload;
+    renderStrategyGovernance();
+  } catch (error) {
+    state.strategyGovernance = null;
+    setHtml(els.strategyStateSummary, `<div class="governance-empty bad-text">策略状态加载失败：${escapeHtml(error?.message || error)}</div>`);
+    renderError(error);
+  } finally {
+    setDisabled(els.refreshStrategyStateButton, false);
+  }
+}
+
+async function reviewRiskPolicy(action) {
+  const governance = state.strategyGovernance || {};
+  const policyState = governance.state || {};
+  if (!policyState.revision) return;
+  const labels = {
+    pause: "暂停正式风险暴露",
+    continue_observing: "继续观察当前状态",
+    recover: "恢复正式风险监控"
+  };
+  const warnings = {
+    pause: "该操作会写入审计记录；仅当停机保护已经是正式生效模式时，才会从下一个正式 Run 输出 Top0。",
+    continue_observing: "该操作只记录你的决定，不会改变策略状态或把影子策略转正式。",
+    recover: "恢复会开启新的监控周期，旧周期亏损不会立即触发再次停机。"
+  };
+  if (!window.confirm(`${labels[action]}？\n\n${warnings[action]}`)) return;
+  setActionLoading(true);
+  try {
+    const response = await fetch("/api/t1-overnight-selection/kill-switch/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action,
+        revision: policyState.revision,
+        note: labels[action],
+        confirmDataRepair: action === "recover" && policyState.state === "data_hold"
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `API ${response.status}`);
+    state.strategyGovernance = payload;
+    renderStrategyGovernance();
+    renderNotice(`${labels[action]}已记录；历史 Run 不会被改写。`);
+  } catch (error) {
+    renderError(error);
+  } finally {
+    setActionLoading(false);
   }
 }
 
@@ -1148,10 +1231,11 @@ function shadowTop3Html(run) {
   const market = run?.market || {};
   const shadow = market.shadowTop3 || {};
   const aiShadow = market.shadowDeepSeekTailTop3 || {};
+  const policy = market.strategyPolicy || {};
   const comparison = market.shadowComparison || {};
   const picks = Array.isArray(shadow.picks) ? shadow.picks : [];
   const aiPicks = Array.isArray(aiShadow.picks) ? aiShadow.picks : [];
-  if (!picks.length && !aiPicks.length && !aiShadow.error && !aiShadow.reason) return "";
+  if (!picks.length && !aiPicks.length && !aiShadow.error && !aiShadow.reason && !policy.strategyPolicyVersion) return "";
   const finalCodes = new Set(Array.isArray(comparison.finalCodes) ? comparison.finalCodes : []);
   const changedCount = Number(comparison.changedCount || 0);
   const aiChangedCount = Number(comparison.deepSeekTailChangedCount || 0);
@@ -1169,8 +1253,123 @@ function shadowTop3Html(run) {
       ${!aiPicks.length && aiShadow.reason ? `<p class="shadow-top3-note">${escapeHtml(aiShadow.reason)}</p>` : ""}
       ${aiShadow.error && !aiPicks.length ? `<p class="shadow-top3-note">${escapeHtml(aiShadow.error)}</p>` : ""}
       ${comparison.reason ? `<p class="shadow-top3-note">${escapeHtml(comparison.reason)}</p>` : ""}
+      ${strategyPolicyShadowHtml(policy, market)}
     </section>
   `;
+}
+
+function strategyPolicyShadowHtml(policy = {}, market = {}) {
+  if (!policy.strategyPolicyVersion) return "";
+  const eventAudit = market.eventRiskAudit || {};
+  const gateAudit = policy.negativeGateAudit || {};
+  const gateHits = Object.values(gateAudit.gates || {})
+    .filter((gate) => Number(gate.hitCount || 0) > 0)
+    .map((gate) => `${gate.label === "1m 尾盘承接" ? "1 分钟尾盘承接" : (gate.label || gate.gateKey)} ${formatInteger(gate.hitCount)} 只`);
+  const calibration = policy.executionCalibrationAudit || {};
+  const eventText = Number(eventAudit.requestedCount || 0)
+    ? `${formatInteger(eventAudit.coveredCount || 0)} / ${formatInteger(eventAudit.requestedCount)} 覆盖`
+    : "未采集";
+  const roles = [
+    shadowPolicyRole("市场门禁", policy.marketGateShadowPortfolio, policyRoleResultReason("市场门禁", policy, market)),
+    shadowPolicyRole("风险门禁", policy.riskGateTreatmentPortfolio, policyRoleResultReason("风险门禁", policy, market, gateHits)),
+    shadowPolicyRole("组合去同质化", policy.portfolioDiversityTreatmentPortfolio, policyRoleResultReason("组合去同质化", policy, market)),
+    shadowPolicyRole("第三槽", policy.rank3ShadowPortfolio, policyRoleResultReason("第三槽", policy, market)),
+    shadowPolicyRole("净期望排序", policy.netExpectationTreatmentPortfolio, policyRoleResultReason("净期望排序", policy, market)),
+    shadowPolicyRole("动态退出", policy.frozenDecisionRanking, policyRoleResultReason("动态退出", policy, market))
+  ].join("");
+  const calibrationCount = Number(calibration.selectedCount || calibration.selectedCandidateCount || calibration.sampleCount || 0);
+  return `
+    <div class="shadow-policy-panel">
+      <div class="shadow-policy-head">
+        <div><strong>收益优化策略影子</strong><small>本期新策略仅做旁路验证，不改变正式 Top3；收益需下一交易日验证。</small></div>
+        <span class="shadow-badge">${policy.affectsOfficialRecommendation ? "正式影响" : "仅影子"}</span>
+      </div>
+      <div class="shadow-policy-meta">
+        <span><small>策略版本</small><strong>${escapeHtml(policy.strategyPolicyVersion)}</strong></span>
+        <span><small>事件风险</small><strong>${escapeHtml(eventText)}</strong></span>
+        <span><small>执行校准</small><strong>${formatInteger(calibrationCount)} 只</strong></span>
+        <span><small>正式影响</small><strong>${policy.affectsOfficialRecommendation ? "已启用" : "无"}</strong></span>
+      </div>
+      <div class="shadow-policy-grid">${roles}</div>
+    </div>
+  `;
+}
+
+function shadowPolicyRole(title, rawPicks, status) {
+  const picks = Array.isArray(rawPicks) ? rawPicks : [];
+  const chips = picks.length
+    ? picks.map((pick, index) => {
+      const code = String(pick.code || "").padStart(6, "0");
+      return `<span><b>#${formatInteger(pick.originalAiRank || pick.aiRank || index + 1)}</b>${escapeHtml(pick.name || code)}<small>${escapeHtml(code)}</small></span>`;
+    }).join("")
+    : `<em>Top0</em>`;
+  return `<article class="shadow-policy-role"><div><strong>${escapeHtml(title)}</strong><b>${formatInteger(picks.length)} 只</b></div><small class="shadow-policy-meaning"><b>作用</b>${escapeHtml(shadowPolicyMeaning(title))}</small><div class="shadow-policy-result"><small>本次为什么是 ${formatInteger(picks.length)} 只</small><p>${escapeHtml(status || "等待数据")}</p></div><div class="shadow-policy-picks">${chips}</div></article>`;
+}
+
+function policyRoleResultReason(title, policy = {}, market = {}, gateHits = []) {
+  const frozenCount = Array.isArray(policy.frozenDecisionRanking) ? policy.frozenDecisionRanking.length : 0;
+  const auditCandidateCount = Number((policy.negativeGateAudit || {}).candidateCount || 0);
+  const commonCount = Math.max(
+    Array.isArray(policy.existingGuardrailSequence) ? policy.existingGuardrailSequence.length : 0,
+    auditCandidateCount,
+    frozenCount
+  );
+  if (title === "市场门禁") {
+    const limit = Number(policy.maxOfficialPicksCandidate || 0);
+    const resultCount = Array.isArray(policy.marketGateShadowPortfolio) ? policy.marketGateShadowPortfolio.length : 0;
+    const state = marketStateLabel(policy.baseMarketState);
+    if (!limit) return `当日市场为${state}，市场风险预算不允许持仓，因此结果为 0 只。`;
+    return `当日市场为${state}，风险预算最多 ${formatInteger(limit)} 只；${formatInteger(commonCount)} 只候选中按 AI 原排序保留 ${formatInteger(resultCount)} 只。`;
+  }
+  if (title === "风险门禁") {
+    const audit = policy.negativeGateAudit || {};
+    const checked = Math.max(Number(audit.candidateCount || 0), (policy.riskGateBlockedCandidates || []).length, commonCount);
+    const blocked = Number(audit.blockedCandidateCount ?? (policy.riskGateBlockedCandidates || []).length);
+    const passed = Array.isArray(policy.riskGateTreatmentPortfolio) ? policy.riskGateTreatmentPortfolio.length : Math.max(0, checked - blocked);
+    if (blocked) return `共检查 ${formatInteger(checked)} 只，${formatInteger(blocked)} 只命中风险项（${gateHits.join("；") || "详见门禁证据"}），通过 ${formatInteger(passed)} 只。`;
+    return `共检查 ${formatInteger(checked)} 只，没有候选命中已启用的负向风险项，因此通过 ${formatInteger(passed)} 只。`;
+  }
+  if (title === "组合去同质化") {
+    const upstream = Array.isArray(policy.riskGateTreatmentSequence) ? policy.riskGateTreatmentSequence.length : 0;
+    const audit = policy.portfolioDiversityAudit || {};
+    const resultCount = Array.isArray(policy.portfolioDiversityTreatmentPortfolio) ? policy.portfolioDiversityTreatmentPortfolio.length : 0;
+    if (!upstream) return "风险门禁后没有剩余候选，本项没有股票可做行业和驱动分散，因此为 0 只。";
+    if (resultCount < 2) return `风险门禁后有 ${formatInteger(upstream)} 只；第二只因同类集中或身份信息不足未开放，最终保留 ${formatInteger(resultCount)} 只。`;
+    return `风险门禁后有 ${formatInteger(upstream)} 只，通过行业和上涨驱动检查后保留 ${formatInteger(resultCount)} 只${Number(audit.replacementCount || 0) ? `，替换 ${formatInteger(audit.replacementCount)} 只` : ""}。`;
+  }
+  if (title === "第三槽") {
+    const available = Boolean((policy.rank3Audit || {}).available);
+    const rankedCount = Math.max(frozenCount, Array.isArray(policy.rank3ShadowPortfolio) ? policy.rank3ShadowPortfolio.length : 0);
+    return available
+      ? `AI 冻结排序共有 ${formatInteger(rankedCount)} 只；这里展示完整 Top3，用来比较“持有第 3 只”和“第三槽留现金”，因此为 3 只。`
+      : `AI 冻结排序只有 ${formatInteger(rankedCount)} 只，不足 3 只，不能形成第三槽对照，因此为 0 只。`;
+  }
+  if (title === "净期望排序") {
+    const model = policy.netExpectationModel || {};
+    const samples = Number(model.sampleCount || 0);
+    const minimum = Number(model.minimumTotalSamples || 150);
+    if (!model.rankingReady) return `历史完整执行样本仅 ${formatInteger(samples)} 笔，尚未达到至少 ${formatInteger(minimum)} 笔的启用门槛，所以不生成排序，结果为 0 只。`;
+    const count = Array.isArray(policy.netExpectationTreatmentPortfolio) ? policy.netExpectationTreatmentPortfolio.length : 0;
+    return `历史样本已达到启用门槛，按扣除成本后的保守期望收益排序，并经风险与分散检查后保留 ${formatInteger(count)} 只。`;
+  }
+  if (title === "动态退出") {
+    const eligible = Boolean(((market.openingEvidence || {}).snapshot || {}).decisionEligible);
+    return eligible
+      ? `这 ${formatInteger(frozenCount)} 只是今日冻结持仓的退出跟踪名单；次日 09:31 证据已具备，等待分钟回放得出退出结果。`
+      : `这 ${formatInteger(frozenCount)} 只是今日冻结持仓的退出跟踪名单，并非新增推荐；需等下一交易日 09:29/09:31 数据后才能判断如何退出。`;
+  }
+  return "等待本次冻结数据。";
+}
+
+function shadowPolicyMeaning(title) {
+  return {
+    "市场门禁": "根据大盘和市场广度控制整体风险预算，不直接判断单只股票。",
+    "风险门禁": "检查尾盘承接、隔夜、追高和事件风险，命中时作为回避参考。",
+    "组合去同质化": "避免组合集中在同一行业或同一上涨逻辑，降低同跌风险。",
+    "第三槽": "单独观察 AI 排名第 3 只与现金仓位的差异，不强行补足推荐数量。",
+    "净期望排序": "用历史真实执行结果估算扣成本后的期望收益，样本不足时只观察。",
+    "动态退出": "用次日开盘后的分钟数据决定是否提前退出，不改变今日买入名单。"
+  }[title] || "用于观察策略效果，不改变正式推荐。";
 }
 
 function shadowPickGroupHtml(title, note, picks, finalCodes) {
@@ -1522,6 +1721,121 @@ function renderStageStatusLine() {
     <span>当前 official 交易日 ${formatInteger(samples.officialTradeDays)} · open_15m 有效样本 ${formatInteger(samples.tradeableOutcomes)}</span>
     <span>${escapeHtml(stage2.reason || stage3.reason || "等待阶段配置状态")}</span>
   `;
+}
+
+function renderStrategyGovernance() {
+  if (!els.strategyStateSummary) return;
+  const governance = state.strategyGovernance || {};
+  const policy = governance.state || {};
+  const eventProvider = governance.eventRiskProvider || {};
+  const riskState = String(policy.state || "active");
+  const tone = riskState === "active" ? "good" : riskState === "performance_watch" ? "warn" : "bad";
+  const stateLabel = {
+    active: "正常运行",
+    performance_watch: "表现观察",
+    performance_shadow_only: "仅影子",
+    data_hold: "数据暂停"
+  }[riskState] || riskState;
+  const eventTone = eventProvider.eventGateReady ? "good" : eventProvider.status === "not_started" ? "neutral" : "warn";
+  const eventLabel = eventProvider.eventGateReady
+    ? "事件链路 Ready"
+    : `事件链路 ${formatInteger(eventProvider.consecutivePassedOfficialDays)}/${formatInteger(eventProvider.requiredConsecutiveOfficialDays || 10)} 日`;
+  setHtml(els.strategyStateSummary, `
+    <article class="governance-state-card ${tone}">
+      <span>运行状态</span>
+      <strong>${escapeHtml(stateLabel)}</strong>
+      <small>${escapeHtml(policy.reason || "等待收益评估")}</small>
+    </article>
+    <article class="governance-state-card">
+      <span>正式策略</span>
+      <strong>${escapeHtml(governance.strategyPolicyVersion || "--")}</strong>
+      <small>${escapeHtml(governance.modeLabel || "--")} · revision ${formatInteger(policy.revision)}</small>
+    </article>
+    <article class="governance-state-card ${governance.blocksOfficialRecommendation ? "bad" : "good"}">
+      <span>正式推荐</span>
+      <strong>${governance.blocksOfficialRecommendation ? "Top0" : `最多 Top${formatInteger(governance.officialPickLimit)}`}</strong>
+      <small>${governance.blocksOfficialRecommendation ? "风险状态正在阻止正式暴露" : "影子状态不改变正式结果"}</small>
+    </article>
+    <article class="governance-state-card ${eventTone}">
+      <span>事件风险数据</span>
+      <strong>${escapeHtml(eventLabel)}</strong>
+      <small>${escapeHtml(eventProvider.sourceLabel || eventProvider.source || "尚未开始采集")}</small>
+    </article>
+  `);
+
+  const impact = governance.todayImpact || [];
+  setHtml(els.strategyTodayImpact, impact.length ? impact.map((item) => `
+    <article class="governance-list-row">
+      <div><strong>${escapeHtml(item.label || "--")}</strong><small>${escapeHtml(item.stage || "--")}</small></div>
+      <span class="status-pill ${item.affectsOfficialRecommendation ? "bad" : item.mode === "shadow" ? "warn" : "neutral"}">${escapeHtml(policyModeLabel(item.mode))}</span>
+      <p>${escapeHtml(item.note || "--")}</p>
+    </article>
+  `).join("") : `<div class="governance-empty">暂无策略影响记录</div>`);
+
+  const pending = governance.pendingActions || [];
+  setHtml(els.strategyPendingActions, pending.length ? pending.map((item) => `
+    <article class="governance-list-row pending-${escapeHtml(item.severity || "low")}">
+      <div><strong>${escapeHtml(item.title || "待处理事项")}</strong><small>${escapeHtml(item.actionEnabled ? "可以处理" : "继续收集证据")}</small></div>
+      <p>${escapeHtml(item.description || "")}</p>
+      ${item.disabledReason ? `<small class="governance-disabled-reason">${escapeHtml(item.disabledReason)}</small>` : ""}
+    </article>
+  `).join("") : `<div class="governance-empty good-text">当前无需操作</div>`);
+
+  const progress = governance.reviewProgress || [];
+  setHtml(els.strategyReviewProgress, progress.length ? progress.map((item) => {
+    const target = Number(item.nextCheckpoint || 20);
+    const current = Number(item.effectiveDays || 0);
+    const width = Math.max(0, Math.min(100, target ? current / target * 100 : 0));
+    return `
+      <article class="review-progress-card">
+        <div><strong>${escapeHtml(item.label || "--")}</strong><span>${formatInteger(current)} / ${formatInteger(target)} 日</span></div>
+        <div class="review-progress-track"><i style="width:${width.toFixed(1)}%"></i></div>
+        <small>${item.reviewable ? "已到人工评审点" : `距离下一评审点还差 ${formatInteger(item.remainingDays)} 日`}</small>
+      </article>
+    `;
+  }).join("") : `<div class="governance-empty">新版本尚未产生有效影子日</div>`);
+
+  const history = governance.history || [];
+  setHtml(els.strategyStateHistory, history.length ? history.map((item) => `
+    <article class="governance-history-row">
+      <time>${escapeHtml(item.createdAt || "--")}</time>
+      <strong>${escapeHtml(riskPolicyEventLabel(item.eventType))}</strong>
+      <span>${escapeHtml(riskStateLabel(item.previousState))} → ${escapeHtml(riskStateLabel(item.nextState))}</span>
+      <p>${escapeHtml(item.reason || "--")}</p>
+    </article>
+  `).join("") : `<div class="governance-empty">暂无状态变更记录</div>`);
+
+  const actions = governance.actions || {};
+  setDisabled(els.pauseStrategyButton, !actions.pauseAllowed);
+  setDisabled(els.recoverStrategyButton, !actions.recoverAllowed);
+  setDisabled(els.continueObserveButton, !actions.continueObservingAllowed);
+  if (els.recoverStrategyButton) {
+    const missing = (policy.recoveryProgress || {}).missingConditions || [];
+    els.recoverStrategyButton.title = actions.recoverAllowed ? "恢复后开启新的监控周期" : missing.join("；") || "当前不需要恢复";
+  }
+}
+
+function policyModeLabel(value) {
+  return { off: "关闭", shadow: "仅影子", enforced: "正式生效" }[value] || value || "--";
+}
+
+function riskStateLabel(value) {
+  return {
+    active: "正常运行",
+    performance_watch: "表现观察",
+    performance_shadow_only: "仅影子",
+    data_hold: "数据暂停"
+  }[value] || value || "初始化";
+}
+
+function riskPolicyEventLabel(value) {
+  return {
+    initialized: "初始化",
+    automatic_evaluation: "自动评估",
+    manual_pause: "人工暂停",
+    manual_continue_observing: "继续观察",
+    manual_recover: "人工恢复"
+  }[value] || value || "状态变更";
 }
 
 function stageModeStatusLabel(stage = {}) {

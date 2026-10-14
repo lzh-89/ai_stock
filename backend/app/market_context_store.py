@@ -21,7 +21,7 @@ LOGGER = logging.getLogger("ai_stock.market_context")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FULL_MARKET_CONTEXT_CACHE_PATH = PROJECT_ROOT / "data" / "full_market_context_cache.json"
 FULL_MARKET_CONTEXT_SNAPSHOT_DIR = PROJECT_ROOT / "data" / "full_market_context_snapshots"
-FULL_MARKET_CONTEXT_CACHE_VERSION = 1
+FULL_MARKET_CONTEXT_CACHE_VERSION = 2
 FULL_MARKET_CONTEXT_TTL_SECONDS = int(os.getenv("FULL_MARKET_CONTEXT_TTL_SECONDS", str(60 * 60)))
 FULL_MARKET_CONTEXT_MIN_ROWS = int(os.getenv("FULL_MARKET_CONTEXT_MIN_ROWS", "1200"))
 FULL_MARKET_CONTEXT_EXPECTED_ROWS = int(os.getenv("FULL_MARKET_CONTEXT_EXPECTED_ROWS", "5000"))
@@ -102,9 +102,11 @@ class FullMarketContextStore:
                 stocks = self._fetch_by_provider(provider_name)
                 if len(stocks) < FULL_MARKET_CONTEXT_MIN_ROWS:
                     raise RuntimeError(f"全市场快照样本过少：{len(stocks)}")
+                market = self._fetch_market_by_provider(provider_name, stocks)
                 provider_meta = self._provider_meta(provider_name)
                 payload = self._write_cache(
                     stocks=stocks,
+                    market=market,
                     requested_source=requested_source,
                     actual_source=provider_name,
                     warning="；".join(warnings),
@@ -138,6 +140,19 @@ class FullMarketContextStore:
             "akshare": self.akshare_provider,
         }.get(provider_name)
         return dict(getattr(provider, "last_meta", {}) or {})
+
+    def _fetch_market_by_provider(self, provider_name: str, stocks: List[RawStock]) -> Dict[str, Any]:
+        provider = {
+            "sina": self.sina_provider,
+            "tencent": self.tencent_provider,
+            "akshare": self.akshare_provider,
+        }.get(provider_name)
+        if provider is None:
+            raise RuntimeError(f"不支持的全市场行情源：{provider_name}")
+        market = provider.fetch_market(stocks)
+        if not isinstance(market, dict):
+            raise RuntimeError(f"{provider_name} 市场环境返回格式无效")
+        return market
 
     def public_latest(self, source: str = "auto", force: bool = False) -> Dict[str, Any]:
         return market_context_public_response(self.latest_or_refresh(source=source, force=force))
@@ -207,13 +222,14 @@ class FullMarketContextStore:
             return {}
         if not isinstance(payload, dict):
             return {}
-        if int(payload.get("version") or 0) != FULL_MARKET_CONTEXT_CACHE_VERSION:
+        if int(payload.get("version") or 0) not in {1, FULL_MARKET_CONTEXT_CACHE_VERSION}:
             return {}
         return payload
 
     def _write_cache(
         self,
         stocks: List[RawStock],
+        market: Dict[str, Any],
         requested_source: str,
         actual_source: str,
         warning: str = "",
@@ -225,7 +241,6 @@ class FullMarketContextStore:
         coverage_pct = round(min(100.0, len(stocks) / expected_rows * 100), 2) if expected_rows else 0.0
         status = "ready" if coverage_pct >= 90.0 else "partial"
         failed_pages = int(provider_meta.get("pagesFailed") or 0)
-        market = market_from_stocks(stocks)
         payload = {
             "version": FULL_MARKET_CONTEXT_CACHE_VERSION,
             "snapshotVersion": f"{date.today().isoformat()}-{uuid.uuid4().hex[:12]}",

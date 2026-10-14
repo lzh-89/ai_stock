@@ -24,6 +24,12 @@ from backend.app.universe_store import load_universe_items
 
 
 TENCENT_SNAPSHOT_TIMEOUT_SECONDS = float(os.getenv("TENCENT_SNAPSHOT_TIMEOUT_SECONDS", "8"))
+TENCENT_MAIN_INDEX_SYMBOLS = {
+    "sh000001": "上证指数",
+    "sz399001": "深证成指",
+    "sz399006": "创业板指",
+    "sh000852": "中证1000",
+}
 
 
 class TencentProvider:
@@ -59,7 +65,47 @@ class TencentProvider:
     def fetch_market(self, stocks: Optional[List[RawStock]] = None) -> Dict[str, Any]:
         if stocks is None:
             stocks = self.fetch_snapshot()
-        return market_from_stocks(stocks)
+        market = market_from_stocks(stocks)
+        try:
+            indices = self.fetch_indices()
+        except Exception as error:  # noqa: BLE001 - stock breadth remains independently usable.
+            market["indices"] = []
+            market["marketIndexStatus"] = {"available": False, "source": self.source, "warning": str(error)}
+        else:
+            market["indices"] = indices
+            market["marketIndexStatus"] = {
+                "available": len(indices) == len(TENCENT_MAIN_INDEX_SYMBOLS),
+                "source": self.source,
+                "warning": "" if len(indices) == len(TENCENT_MAIN_INDEX_SYMBOLS) else f"腾讯主要指数只返回 {len(indices)}/4 项",
+            }
+        return market
+
+    def fetch_indices(self) -> List[Dict[str, Any]]:
+        rows = self._fetch_symbols(list(TENCENT_MAIN_INDEX_SYMBOLS))
+        result = []
+        for row in rows:
+            fields = row.get("fields") or []
+            if len(fields) <= 32:
+                continue
+            code = str(fields[2] or "").strip().zfill(6)
+            symbol = next((item for item in TENCENT_MAIN_INDEX_SYMBOLS if item.endswith(code)), "")
+            raw_time = str(fields[30] or "") if len(fields) > 30 else ""
+            if not symbol or len(raw_time) < 14:
+                continue
+            trade_date = f"{raw_time[:4]}-{raw_time[4:6]}-{raw_time[6:8]}"
+            quote_time = f"{trade_date}T{raw_time[8:10]}:{raw_time[10:12]}:{raw_time[12:14]}"
+            result.append(
+                {
+                    "name": TENCENT_MAIN_INDEX_SYMBOLS[symbol],
+                    "code": symbol,
+                    "change": num(fields[32]),
+                    "changePct": num(fields[32]),
+                    "tradeDate": trade_date,
+                    "quoteTime": quote_time,
+                    "source": self.source,
+                }
+            )
+        return result
 
     def _fetch_symbols(self, symbols: List[str]) -> List[Dict[str, Any]]:
         url = f"https://qt.gtimg.cn/q={','.join(symbols)}"

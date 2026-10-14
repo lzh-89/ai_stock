@@ -20,7 +20,9 @@ from backend.app.services.morning_sector_radar_service import MorningSectorRadar
 from backend.app.services.intraday_entry_audit_service import IntradayEntryAuditService
 from backend.app.services.stock_analysis_feedback_service import StockAnalysisFeedbackService
 from backend.app.services.stock_analysis_service import StockAnalysisService
-from backend.app.services.t1_overnight_selection_service import T1OvernightSelectionService
+from backend.app.services.t1_overnight_selection_service import RiskPolicyConflictError, T1OvernightSelectionService
+from backend.app.services.t1_opening_evidence_service import T1OpeningEvidenceService
+from backend.app.services.t1_shadow_analytics_service import T1ShadowAnalyticsService
 from backend.app.services.watchlist_service import WatchlistService
 from backend.app.settings import PROJECT_ROOT, load_settings
 from backend.app.universe_store import universe_response
@@ -42,6 +44,8 @@ STOCK_FEEDBACK_V2 = StockAnalysisFeedbackService(SETTINGS, DATABASE, version="v2
 STOCK_ANALYSIS_V2 = StockAnalysisService(SETTINGS, DATABASE, feedback_version="v2")
 AI_FULL_MARKET_SELECTION = AIFullMarketSelectionService(SETTINGS, ANALYSIS, DATABASE)
 T1_OVERNIGHT_SELECTION = T1OvernightSelectionService(SETTINGS, ANALYSIS, DATABASE)
+T1_OPENING_EVIDENCE = T1OpeningEvidenceService(ANALYSIS, DATABASE)
+T1_SHADOW_ANALYTICS = T1ShadowAnalyticsService(DATABASE)
 T1_OVERNIGHT_SELECTION.start_watchdog()
 DAILY_KLINE_CACHE = DailyKlineCacheService(AnalysisService(SETTINGS, DATABASE), DATABASE)
 MORNING_SECTOR_RADAR = MorningSectorRadarService(SETTINGS, DATABASE)
@@ -180,6 +184,12 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/t1-overnight-selection/stage-config":
             self._json({"config": T1_OVERNIGHT_SELECTION.stage_config(), "status": T1_OVERNIGHT_SELECTION.stage_status()})
             return
+        if parsed.path == "/api/t1-overnight-selection/strategy-state":
+            self._json(T1_OVERNIGHT_SELECTION.strategy_governance_status())
+            return
+        if parsed.path == "/api/t1-overnight-selection/event-risk/status":
+            self._json(T1_OVERNIGHT_SELECTION.event_risk_status())
+            return
         if parsed.path == "/api/t1-overnight-selection/auto-run":
             self._json(T1_OVERNIGHT_SELECTION.auto_run_status())
             return
@@ -192,6 +202,12 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/t1-overnight-selection/validation-auto-freeze":
             self._json(T1_OVERNIGHT_SELECTION.validation_auto_freeze_status())
             return
+        if parsed.path == "/api/t1-overnight-selection/opening-evidence":
+            self._json(T1_OPENING_EVIDENCE.status())
+            return
+        if parsed.path == "/api/t1-overnight-selection/shadow-analytics/status":
+            self._json(T1_SHADOW_ANALYTICS.status())
+            return
         if parsed.path == "/api/t1-overnight-selection/strategy-feedback":
             self._json({"feedback": T1_OVERNIGHT_SELECTION.latest_strategy_feedback(), "criticStatus": T1_OVERNIGHT_SELECTION.critic_status()})
             return
@@ -202,6 +218,37 @@ class AppHandler(SimpleHTTPRequestHandler):
             status = query.get("status", [""])[0]
             review_status = query.get("reviewStatus", query.get("review_status", [""]))[0]
             self._json(T1_OVERNIGHT_SELECTION.review(limit=limit, run_id=run_id, status=status, review_status=review_status))
+            return
+        if parsed.path in {
+            "/api/t1-overnight-selection/shadow-analytics/summary",
+            "/api/t1-overnight-selection/shadow-analytics/series",
+            "/api/t1-overnight-selection/shadow-analytics/evaluation-report",
+        }:
+            query = parse_qs(parsed.query)
+            filters = {
+                "shadow_family": query.get("shadowFamily", query.get("shadow_family", [""]))[0],
+                "shadow_role": query.get("shadowRole", query.get("shadow_role", [""]))[0],
+                "scope": query.get("scope", [""])[0],
+                "strategy_policy_version": query.get("strategyPolicyVersion", query.get("strategy_policy_version", [""]))[0],
+                "outcome_scenario": query.get("outcomeScenario", query.get("outcome_scenario", ["open_15m"]))[0],
+                "execution_profile_version": query.get("executionProfileVersion", query.get("execution_profile_version", [""]))[0],
+                "window": query.get("window", ["all"])[0],
+                "date_from": query.get("from", [""])[0],
+                "date_to": query.get("to", [""])[0],
+            }
+            try:
+                if parsed.path.endswith("/series"):
+                    data = T1_SHADOW_ANALYTICS.series(**filters)
+                elif parsed.path.endswith("/evaluation-report"):
+                    data = T1_SHADOW_ANALYTICS.evaluation_report(**filters)
+                else:
+                    data = T1_SHADOW_ANALYTICS.summary(**filters)
+                self._json(data)
+            except ValueError as error:
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_REQUEST)
+            except Exception as error:  # noqa: BLE001 - analytics failure must not affect recommendations.
+                LOGGER.exception("t1 shadow analytics query failed")
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
             return
         if parsed.path.startswith("/api/t1-overnight-selection/runs/"):
             parts = parsed.path.strip("/").split("/")
@@ -710,6 +757,18 @@ class AppHandler(SimpleHTTPRequestHandler):
                 LOGGER.warning("request t1 overnight stage config failed error=%s", error)
                 self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
             return
+        if parsed.path == "/api/t1-overnight-selection/kill-switch/review":
+            payload = self._read_json()
+            try:
+                self._json(T1_OVERNIGHT_SELECTION.review_kill_switch(payload))
+            except RiskPolicyConflictError as error:
+                self._json({"error": str(error)}, status=HTTPStatus.CONFLICT)
+            except ValueError as error:
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_REQUEST)
+            except Exception as error:  # noqa: BLE001 - keep governance failure isolated from recommendations.
+                LOGGER.exception("request t1 kill switch review failed")
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
+            return
         if parsed.path.startswith("/api/t1-overnight-selection/runs/") and parsed.path.endswith("/verify"):
             parts = parsed.path.strip("/").split("/")
             run_id = _parse_int(parts[-2] if len(parts) >= 2 else "", 0)
@@ -778,6 +837,26 @@ class AppHandler(SimpleHTTPRequestHandler):
                 self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
             else:
                 LOGGER.info("request t1 validation auto-freeze run done status=%s elapsed_ms=%.0f", data.get("lastStatus"), (time.perf_counter() - started) * 1000)
+                self._json(data)
+            return
+        if parsed.path == "/api/t1-overnight-selection/opening-evidence/run":
+            started = time.perf_counter()
+            try:
+                data = T1_OPENING_EVIDENCE.run_due(trigger_source="manual_api")
+            except Exception as error:  # noqa: BLE001 - keep manual scheduler diagnostics readable.
+                LOGGER.warning("request t1 opening evidence run failed elapsed_ms=%.0f error=%s", (time.perf_counter() - started) * 1000, error)
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
+            else:
+                self._json(data)
+            return
+        if parsed.path == "/api/t1-overnight-selection/shadow-analytics/run":
+            started = time.perf_counter()
+            try:
+                data = T1_SHADOW_ANALYTICS.run_due(trigger_source="manual_api")
+            except Exception as error:  # noqa: BLE001 - aggregation diagnostics must not affect recommendations.
+                LOGGER.warning("request t1 shadow analytics run failed elapsed_ms=%.0f error=%s", (time.perf_counter() - started) * 1000, error)
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
+            else:
                 self._json(data)
             return
         if parsed.path == "/api/t1-overnight-selection/auto-run/run":
@@ -1233,6 +1312,8 @@ def main() -> None:
     T1_OVERNIGHT_SELECTION.start_auto_run_scheduler()
     T1_OVERNIGHT_SELECTION.start_market_prefetch_scheduler()
     T1_OVERNIGHT_SELECTION.start_validation_auto_freeze_scheduler()
+    T1_OPENING_EVIDENCE.start_scheduler()
+    T1_SHADOW_ANALYTICS.start_scheduler()
     T1_OVERNIGHT_SELECTION.candidate_tracking.start_scheduler()
     DAILY_KLINE_CACHE.start_scheduler()
     server = ThreadingHTTPServer((args.host, args.port), AppHandler)

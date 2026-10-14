@@ -3,8 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>T+1 策略配置</title>
-    <link rel="stylesheet" href="./src/t1-overnight-selection.css?v=20260809-nav-tree" />
+    <title>T+1 策略状态</title>
+    <link rel="stylesheet" href="./src/t1-overnight-selection.css?v=20261013-strategy-governance-v2" />
     <link rel="stylesheet" href="./src/intraday-entry-audit.css?v=20260719-entry-audit" />
   </head>
   <body data-t1-page="config">
@@ -49,7 +49,7 @@
             <div class="t1-rail-subnav">
               <a data-t1-nav="selection" href="./t1-overnight-selection.html">今日推荐</a>
               <a data-t1-nav="review" href="./t1-overnight-review.html">推荐复盘</a>
-              <a data-t1-nav="config" href="./t1-overnight-config.html">策略配置</a>
+              <a data-t1-nav="config" href="./t1-overnight-config.html">策略状态</a>
               <a data-t1-nav="diagnostics" href="./t1-overnight-diagnostics.html">Run 诊断</a>
               <a data-t1-nav="maintenance" href="./t1-overnight-maintenance.html">数据维护</a>
             </div>
@@ -76,9 +76,9 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11v2H7.8l5.6 5.6L12 20 4 12l8-8 1.4 1.4L7.8 11H20Z"/></svg>
         </a>
         <div class="title-block">
-          <span id="pageEyebrow">T+1 独立配置</span>
-          <h1>T+1 策略配置</h1>
-          <p>集中管理日常运行参数、专业复盘口径、AI 自检和阶段实验开关；新 run 会按保存后的配置执行。</p>
+          <span id="pageEyebrow">T+1 风险与版本治理</span>
+          <h1>T+1 策略状态</h1>
+          <p>查看当前正式策略、风险保护、事件数据和待审批事项；任何影子能力都不会自动转为正式推荐。</p>
         </div>
         <div class="controls">
           <label>
@@ -120,7 +120,7 @@
       <nav class="t1-subnav" aria-label="T+1 功能导航">
         <a href="./t1-overnight-selection.html">今日推荐</a>
         <a href="./t1-overnight-review.html">推荐复盘</a>
-        <a class="active" href="./t1-overnight-config.html">策略配置</a>
+        <a class="active" href="./t1-overnight-config.html">策略状态</a>
         <a href="./t1-overnight-diagnostics.html">Run 诊断</a>
         <a href="./t1-overnight-maintenance.html">数据维护</a>
       </nav>
@@ -133,6 +133,49 @@
         </div>
         <div class="action-progress-track"><span></span></div>
       </div>
+
+      <section class="panel governance-panel" data-t1-scope="config">
+        <div class="panel-head governance-head">
+          <div>
+            <span>当前策略</span>
+            <h2>正式风险状态</h2>
+          </div>
+          <div class="panel-actions">
+            <button id="refreshStrategyStateButton" class="icon-button" type="button" title="刷新策略状态" aria-label="刷新策略状态">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.2L13 11h8V3l-3.3 3.3Z"/></svg>
+            </button>
+          </div>
+        </div>
+        <div id="strategyStateSummary" class="governance-summary"><div class="governance-loading">正在加载策略状态...</div></div>
+        <div class="governance-columns">
+          <div class="governance-block">
+            <div class="governance-block-head"><h3>今日实际影响</h3><span>按决策环节</span></div>
+            <div id="strategyTodayImpact" class="governance-list"></div>
+          </div>
+          <div class="governance-block">
+            <div class="governance-block-head"><h3>需要你处理</h3><span>不会自动转正式</span></div>
+            <div id="strategyPendingActions" class="governance-list"></div>
+          </div>
+        </div>
+        <div class="governance-block governance-progress-block">
+          <div class="governance-block-head"><h3>影子评审进度</h3><a href="./t1-overnight-review.html">查看收益复盘</a></div>
+          <div id="strategyReviewProgress" class="review-progress-grid"></div>
+        </div>
+        <details class="governance-history">
+          <summary>查看状态变更记录</summary>
+          <div id="strategyStateHistory" class="governance-list"></div>
+        </details>
+        <div class="governance-actions">
+          <button id="continueObserveButton" class="secondary-button" type="button" disabled>继续观察</button>
+          <button id="pauseStrategyButton" class="danger-button" type="button" disabled>暂停正式暴露</button>
+          <button id="recoverStrategyButton" class="primary-button" type="button" disabled>受控恢复</button>
+        </div>
+      </section>
+
+      <details id="advancedGovernance" class="advanced-governance" data-t1-scope="config">
+        <summary>高级治理与测算设置</summary>
+        <p>以下参数用于研究、复盘和系统维护。普通使用不需要调整；保存后只影响新的 Run，不改写历史。</p>
+      </details>
 
       <section class="stat-grid" data-t1-scope="selection diagnostics">
         <article>
@@ -173,7 +216,7 @@
         <div id="marketContextPanel" class="market-context-panel"></div>
       </section>
 
-      <section class="panel" data-t1-scope="config">
+      <section class="panel advanced-config-section" data-t1-scope="config">
         <div class="panel-head">
           <div>
             <span>T+1 专属</span>
@@ -246,7 +289,7 @@
         <div id="stageStatusLine" class="status-line stage-status-line"></div>
       </section>
 
-      <section class="panel" data-t1-scope="config">
+      <section class="panel advanced-config-section" data-t1-scope="config">
         <div class="panel-head">
           <div>
             <span>阶段 2</span>
@@ -305,7 +348,7 @@
         <div id="criticStatusLine" class="status-line"></div>
       </section>
 
-      <section class="panel" data-t1-scope="config">
+      <section class="panel advanced-config-section" data-t1-scope="config">
         <div class="panel-head">
           <div>
             <span>阶段 1</span>
@@ -428,7 +471,7 @@
         </div>
       </section>
 
-      <section class="panel" data-t1-scope="config maintenance">
+      <section class="panel advanced-config-section" data-t1-scope="config maintenance">
         <div class="panel-head">
           <div>
             <span>阶段 3</span>
@@ -492,6 +535,6 @@
     </div>
 
     <script src="./src/intraday-entry-audit.js?v=20260719-entry-audit"></script>
-    <script src="./src/t1-overnight-selection.js?v=20260809-p0-p1-shadow"></script>
+    <script src="./src/t1-overnight-selection.js?v=20261013-strategy-governance-v3"></script>
   </body>
 </html>

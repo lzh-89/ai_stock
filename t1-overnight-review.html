@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>T+1 复盘</title>
     <link rel="stylesheet" href="./src/t1-overnight-selection.css?v=20260809-nav-tree" />
-    <link rel="stylesheet" href="./src/t1-overnight-review.css?v=20261012-official-picks" />
+    <link rel="stylesheet" href="./src/t1-overnight-review.css?v=20261013-policy-run-shadow-reason" />
   </head>
   <body data-t1-page="review">
     <div class="t1-app-shell">
@@ -106,7 +106,7 @@
       <nav class="t1-subnav" aria-label="T+1 功能导航">
         <a href="./t1-overnight-selection.html">今日推荐</a>
         <a class="active" href="./t1-overnight-review.html">推荐复盘</a>
-        <a href="./t1-overnight-config.html">策略配置</a>
+        <a href="./t1-overnight-config.html">策略状态</a>
         <a href="./t1-overnight-diagnostics.html">Run 诊断</a>
         <a href="./t1-overnight-maintenance.html">数据维护</a>
       </nav>
@@ -114,6 +114,44 @@
       <section id="notice" class="notice"></section>
       <section id="summaryGrid" class="stat-grid"></section>
       <section id="reviewNote" class="review-note"></section>
+      <section class="panel shadow-analytics-panel" aria-labelledby="shadowAnalyticsTitle">
+        <div class="panel-head shadow-analytics-head">
+          <div>
+            <span>跨 Run · 分角色统计</span>
+            <h2 id="shadowAnalyticsTitle">影子策略统计</h2>
+          </div>
+          <div class="shadow-analytics-controls">
+            <label>
+              <span>角色</span>
+              <select id="shadowRoleSelect"></select>
+            </label>
+            <label>
+              <span>窗口</span>
+              <select id="shadowWindowSelect">
+                <option value="all">当前版本全部</option>
+                <option value="20d">近 20 个有效日</option>
+                <option value="discovery60">前 60 日发现期</option>
+                <option value="confirmation60">第 61-120 日确认期</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div id="shadowFamilyTabs" class="shadow-family-tabs" role="tablist" aria-label="影子家族">
+          <button type="button" role="tab" data-shadow-family="legacy_tail_rule">规则尾盘影子</button>
+          <button type="button" role="tab" data-shadow-family="legacy_tail_ai">AI 尾盘影子</button>
+          <button type="button" role="tab" data-shadow-family="policy_experiment">本期策略实验</button>
+        </div>
+        <p id="shadowAnalyticsNotice" class="shadow-analytics-notice">正在加载影子统计...</p>
+        <div id="shadowAnalyticsMetrics" class="metric-grid"></div>
+        <div id="shadowAnalyticsProgress" class="shadow-analytics-progress"></div>
+        <div id="shadowGateDiagnostics" class="shadow-gate-diagnostics hidden"></div>
+        <div class="table-wrap">
+          <table class="data-table shadow-series-table">
+            <thead><tr><th>推荐日</th><th>Run</th><th>持仓 / 现金</th><th>影子收益</th><th>对照收益</th><th>同日差值</th><th>覆盖状态</th></tr></thead>
+            <tbody id="shadowAnalyticsRows"></tbody>
+          </table>
+        </div>
+      </section>
       <section class="panel optimization-stats-panel">
         <div class="panel-head">
           <div>
@@ -286,7 +324,7 @@
       </div>
     </div>
 
-    <script src="./src/t1-overnight-review.js?v=20261012-official-picks"></script>
+    <script src="./src/t1-overnight-review.js?v=20261013-policy-run-shadow-reason"></script>
     <script src="./src/t1-candidate-review.js?v=20261010-candidate-review"></script>
   </body>
 </html>

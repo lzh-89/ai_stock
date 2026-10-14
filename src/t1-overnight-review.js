@@ -5,7 +5,12 @@ const state = {
   payload: null,
   loading: false,
   loadGeneration: 0,
-  actionNotice: ""
+  actionNotice: "",
+  shadowFamily: "legacy_tail_rule",
+  shadowRole: "tail_rule",
+  shadowWindow: "all",
+  shadowPayload: null,
+  shadowLoadGeneration: 0
 };
 
 const els = {
@@ -17,6 +22,14 @@ const els = {
   notice: document.querySelector("#notice"),
   summaryGrid: document.querySelector("#summaryGrid"),
   reviewNote: document.querySelector("#reviewNote"),
+  shadowFamilyTabs: document.querySelector("#shadowFamilyTabs"),
+  shadowRoleSelect: document.querySelector("#shadowRoleSelect"),
+  shadowWindowSelect: document.querySelector("#shadowWindowSelect"),
+  shadowAnalyticsNotice: document.querySelector("#shadowAnalyticsNotice"),
+  shadowAnalyticsMetrics: document.querySelector("#shadowAnalyticsMetrics"),
+  shadowAnalyticsProgress: document.querySelector("#shadowAnalyticsProgress"),
+  shadowGateDiagnostics: document.querySelector("#shadowGateDiagnostics"),
+  shadowAnalyticsRows: document.querySelector("#shadowAnalyticsRows"),
   optimizationStatsMeta: document.querySelector("#optimizationStatsMeta"),
   optimizationStatsGrid: document.querySelector("#optimizationStatsGrid"),
   exitTimingStatsRows: document.querySelector("#exitTimingStatsRows"),
@@ -43,23 +56,28 @@ const els = {
   actionModalOk: document.querySelector("#actionModalOk")
 };
 
-init();
-
 function init() {
   const params = new URLSearchParams(window.location.search);
   state.limit = clampNumber(params.get("limit"), 10, 200, 60);
   state.statusFilter = normalizeReviewFilter(params.get("reviewStatus") || params.get("status") || "reviewable");
   state.runId = clampNumber(params.get("runId"), 0, 999999, 0);
+  state.shadowFamily = normalizeShadowFamily(params.get("shadowFamily"));
+  state.shadowRole = params.get("shadowRole") || defaultShadowRole(state.shadowFamily);
+  state.shadowWindow = normalizeShadowWindow(params.get("shadowWindow"));
   els.limitInput.value = String(state.limit);
   els.statusSelect.value = state.statusFilter;
+  if (els.shadowWindowSelect) els.shadowWindowSelect.value = state.shadowWindow;
+  populateShadowRoles();
   bindEvents();
   loadReview();
+  loadShadowAnalytics();
 }
 
 function bindEvents() {
   els.refreshButton.addEventListener("click", () => {
     state.actionNotice = "";
     loadReview();
+    loadShadowAnalytics();
   });
   els.verifyRunButton.addEventListener("click", verifySelectedRun);
   els.backfillMinuteButton?.addEventListener("click", backfillSelectedRunMinutes);
@@ -85,6 +103,257 @@ function bindEvents() {
     state.runId = Number(button.dataset.runId || 0);
     loadReview({ keepSelection: true });
   });
+  els.shadowFamilyTabs?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-shadow-family]");
+    if (!button) return;
+    state.shadowFamily = normalizeShadowFamily(button.dataset.shadowFamily);
+    state.shadowRole = defaultShadowRole(state.shadowFamily);
+    populateShadowRoles();
+    loadShadowAnalytics();
+  });
+  els.shadowRoleSelect?.addEventListener("change", () => {
+    state.shadowRole = els.shadowRoleSelect.value || defaultShadowRole(state.shadowFamily);
+    loadShadowAnalytics();
+  });
+  els.shadowWindowSelect?.addEventListener("change", () => {
+    state.shadowWindow = normalizeShadowWindow(els.shadowWindowSelect.value);
+    loadShadowAnalytics();
+  });
+}
+
+const SHADOW_ROLES = {
+  legacy_tail_rule: [{ value: "tail_rule", label: "规则尾盘" }],
+  legacy_tail_ai: [{ value: "tail_ai", label: "AI 尾盘" }],
+  policy_experiment: [
+    { value: "policy_market_gate", label: "市场门禁" },
+    { value: "policy_risk_gate", label: "风险门禁" },
+    { value: "policy_diversity", label: "组合去同质化" },
+    { value: "policy_rank3", label: "第三槽" },
+    { value: "policy_net_expectation", label: "净期望排序" },
+    { value: "policy_adaptive_exit", label: "动态退出" }
+  ]
+};
+
+init();
+
+function populateShadowRoles() {
+  if (!els.shadowRoleSelect) return;
+  const roles = SHADOW_ROLES[state.shadowFamily] || [];
+  if (!roles.some((item) => item.value === state.shadowRole)) state.shadowRole = roles[0]?.value || "";
+  els.shadowRoleSelect.innerHTML = roles.map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`).join("");
+  els.shadowRoleSelect.value = state.shadowRole;
+}
+
+async function loadShadowAnalytics() {
+  const generation = ++state.shadowLoadGeneration;
+  if (els.shadowAnalyticsNotice) els.shadowAnalyticsNotice.textContent = "正在重建并加载影子统计...";
+  try {
+    const params = new URLSearchParams({
+      shadowFamily: state.shadowFamily,
+      shadowRole: state.shadowRole,
+      window: state.shadowWindow,
+      outcomeScenario: "open_15m"
+    });
+    const response = await fetch(`/api/t1-overnight-selection/shadow-analytics/summary?${params.toString()}`);
+    const payload = await response.json().catch(() => ({}));
+    if (generation !== state.shadowLoadGeneration) return;
+    if (!response.ok) throw new Error(payload.error || `API ${response.status}`);
+    state.shadowPayload = payload;
+    renderShadowAnalytics();
+    syncUrl();
+  } catch (error) {
+    if (generation !== state.shadowLoadGeneration) return;
+    state.shadowPayload = null;
+    if (els.shadowAnalyticsNotice) els.shadowAnalyticsNotice.textContent = `影子统计加载失败：${error?.message || error}`;
+    if (els.shadowAnalyticsMetrics) els.shadowAnalyticsMetrics.innerHTML = "";
+    if (els.shadowGateDiagnostics) {
+      els.shadowGateDiagnostics.innerHTML = "";
+      els.shadowGateDiagnostics.classList.add("hidden");
+    }
+    if (els.shadowAnalyticsRows) els.shadowAnalyticsRows.innerHTML = `<tr><td colspan="7" class="empty">暂时无法加载影子统计。</td></tr>`;
+  }
+}
+
+function renderShadowAnalytics() {
+  const payload = state.shadowPayload || {};
+  const report = (payload.roles || [])[0] || {};
+  const facts = [...(payload.facts || [])]
+    .filter((fact) => !report.strategyPolicyVersion || fact.strategyPolicyVersion === report.strategyPolicyVersion)
+    .reverse();
+  els.shadowFamilyTabs?.querySelectorAll("[data-shadow-family]").forEach((button) => {
+    const active = button.dataset.shadowFamily === state.shadowFamily;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  const source = payload.sourceType === "historical_backfill" ? "历史数据已重建" : "从新策略版本开始前向累计";
+  const coverage = report.coveragePct == null ? "暂无覆盖数据" : `覆盖率 ${formatRate(report.coveragePct)}`;
+  if (els.shadowAnalyticsNotice) {
+    els.shadowAnalyticsNotice.textContent = `${payload.description || "各影子角色独立统计。"} ${source}；${coverage}。最后计算 ${payload.generatedAt || "--"}。`;
+  }
+  if (els.shadowAnalyticsMetrics) {
+    els.shadowAnalyticsMetrics.innerHTML = [
+      metricCard("有效交易日", formatInteger(report.effectiveDays || 0), `目标日 ${formatInteger(report.targetTradeDays || 0)} · 命中 ${formatInteger(report.hitDays || 0)}`),
+      metricCard("累计净收益", formatPct(report.cumulativeReturnPct), "三槽组合复利，空槽按现金"),
+      metricCard("日均净收益", formatPct(report.avgDailyNetReturnPct), `中位数 ${formatPct(report.medianDailyNetReturnPct)}`),
+      metricCard("持仓日正收益率", formatRate(report.positiveHoldingDayRate), `盈亏比 ${formatNumber(report.profitLossRatio, 2)}`),
+      metricCard("最大回撤", formatPct(report.maxDrawdownPct), `最差 10% ${formatPct(report.worst10Pct)}`),
+      metricCard("同日配对改善", formatPct(report.avgPairedDeltaPct), report.comparisonLabel || "诊断角色不解释为因果增益"),
+      metricCard("避免亏损", formatPct(report.avoidedLossPct), `错过盈利 ${formatPct(report.missedProfitPct)}`),
+      metricCard("评审状态", report.reviewStatusLabel || "收集中", `版本 ${report.strategyPolicyVersion || "--"}`)
+    ].join("");
+  }
+  const progress = report.progress || {};
+  if (els.shadowAnalyticsProgress) {
+    const target = Number(progress.nextTargetDays || 20);
+    const current = Number(progress.effectiveDays || 0);
+    const width = Math.max(0, Math.min(100, target ? current / target * 100 : 0));
+    els.shadowAnalyticsProgress.innerHTML = `
+      <div><strong>${escapeHtml(report.reviewStatusLabel || "收集中")}</strong><span>${formatInteger(current)} / ${formatInteger(target)} 个有效交易日，还差 ${formatInteger(progress.remainingDays || 0)} 日</span></div>
+      <span class="shadow-progress-track"><i style="width:${width.toFixed(1)}%"></i></span>
+    `;
+  }
+  renderShadowGateDiagnostics(report);
+  if (els.shadowAnalyticsRows) {
+    els.shadowAnalyticsRows.innerHTML = facts.length
+      ? facts.slice(0, 120).map((fact) => `
+        <tr>
+          <td>${escapeHtml(fact.recommendationDate || "--")}</td>
+          <td><a href="?runId=${formatIntegerRaw(fact.canonicalRunId)}">#${formatInteger(fact.canonicalRunId)}</a></td>
+          <td>${formatInteger(fact.holdingCount || 0)} / ${formatInteger(fact.cashSlotCount || 0)}</td>
+          <td class="${returnTone(fact.treatmentNetReturnPct)}">${formatPct(fact.treatmentNetReturnPct)}</td>
+          <td>${formatPct(fact.controlNetReturnPct)}</td>
+          <td class="${returnTone(fact.pairedDailyDeltaPct)}">${formatPct(fact.pairedDailyDeltaPct)}</td>
+          <td><span class="status-pill ${fact.status === "ok" ? "good" : "warn"}">${fact.status === "ok" ? "完整" : "数据不足"}</span><small>${fact.coveragePct == null ? "" : formatRate(fact.coveragePct)}</small></td>
+        </tr>
+      `).join("")
+      : `<tr><td colspan="7" class="empty">当前角色还没有可用数据，将从符合条件的 Run 自动累计。</td></tr>`;
+  }
+}
+
+function renderShadowGateDiagnostics(report) {
+  if (!els.shadowGateDiagnostics) return;
+  const diagnostics = Array.isArray(report.gateDiagnostics) ? report.gateDiagnostics : [];
+  const isPolicy = state.shadowFamily === "policy_experiment";
+  const isRiskGate = isPolicy && state.shadowRole === "policy_risk_gate" && diagnostics.length > 0;
+  const isDiversity = isPolicy && state.shadowRole === "policy_diversity";
+  const isRank3 = isPolicy && state.shadowRole === "policy_rank3";
+  const isNetExpectation = isPolicy && state.shadowRole === "policy_net_expectation";
+  const isAdaptiveExit = isPolicy && state.shadowRole === "policy_adaptive_exit";
+  const visible = isRiskGate || isDiversity || isRank3 || isNetExpectation || isAdaptiveExit;
+  els.shadowGateDiagnostics.classList.toggle("hidden", !visible);
+  if (!visible) {
+    els.shadowGateDiagnostics.innerHTML = "";
+    return;
+  }
+  if (isDiversity) {
+    const detail = report.diversityDiagnostics || {};
+    const conflicts = detail.conflictCounts || {};
+    els.shadowGateDiagnostics.innerHTML = `
+      <div class="shadow-gate-diagnostics-head">
+        <strong>组合独立性诊断</strong>
+        <span>仅比较 P2 影子组合，不改变正式推荐</span>
+      </div>
+      <div class="shadow-gate-diagnostic-list role-metrics">
+        ${shadowDiagnosticMetric("组合替换", formatInteger(detail.replacementCount || 0), `冲突挡下 ${formatInteger(detail.blockedCandidateCount || 0)} 只`)}
+        ${shadowDiagnosticMetric("第二槽增量", formatPct(detail.avgSecondSlotIncrementPct), `中位数 ${formatPct(detail.medianSecondSlotIncrementPct)}`)}
+        ${shadowDiagnosticMetric("第二槽胜率", formatRate(detail.positiveSecondSlotRate), `${formatInteger(detail.secondSlotEffectiveDays || 0)} 个有效日`)}
+        ${shadowDiagnosticMetric("同日失败率", formatRate(detail.sameDayFailureRate), `${formatInteger(detail.sameDayFailureSampleDays || 0)} 个可比日`)}
+        ${shadowDiagnosticMetric("组合内相关性", formatCorrelation(detail.portfolioReturnCorrelation), `样本 ${formatInteger(detail.correlationSampleDays || 0)} 日${detail.portfolioReturnCorrelation == null ? "，不足 5 日不计算" : ""}`)}
+        ${shadowDiagnosticMetric("冲突构成", formatInteger((conflicts.sameIndustry || 0) + (conflicts.sameDriverGroup || 0)), `同行业 ${formatInteger(conflicts.sameIndustry || 0)} · 同驱动 ${formatInteger(conflicts.sameDriverGroup || 0)}`)}
+        ${shadowDiagnosticMetric("身份缺失", formatInteger((conflicts.industryIdentityUnavailable || 0) + (conflicts.driverIdentityUnavailable || 0)), `行业 ${formatInteger(conflicts.industryIdentityUnavailable || 0)} · 驱动 ${formatInteger(conflicts.driverIdentityUnavailable || 0)}`)}
+      </div>
+    `;
+    return;
+  }
+  if (isRank3) {
+    const detail = report.rank3Diagnostics || {};
+    els.shadowGateDiagnostics.innerHTML = `
+      <div class="shadow-gate-diagnostics-head">
+        <strong>第三槽增量诊断</strong>
+        <span>Rank1+Rank2+现金 对照 Rank1+Rank2+Rank3</span>
+      </div>
+      <div class="shadow-gate-diagnostic-list role-metrics">
+        ${shadowDiagnosticMetric("有效交易日", formatInteger(detail.effectiveDays || 0), "只认冻结排序的原始 Rank 3")}
+        ${shadowDiagnosticMetric("平均增量", formatPct(detail.avgIncrementPct), `中位数 ${formatPct(detail.medianIncrementPct)}`)}
+        ${shadowDiagnosticMetric("增量胜率", formatRate(detail.positiveIncrementRate), `最差增量 ${formatPct(detail.worstIncrementPct)}`)}
+        ${shadowDiagnosticMetric("Rank 3 单股", formatPct(detail.avgSlotReturnPct), `ETF 超额 ${formatPct(detail.avgEtfExcessPct)}`)}
+        ${shadowDiagnosticMetric("三只同跌", formatRate(detail.sameDayFailureRate), `${formatInteger(detail.sameDayFailureSampleDays || 0)} 个可比日`)}
+        ${shadowDiagnosticMetric("与前两槽相关性", formatCorrelation(detail.baseReturnCorrelation), `样本 ${formatInteger(detail.correlationSampleDays || 0)} 日${detail.baseReturnCorrelation == null ? "，不足 5 日不计算" : ""}`)}
+      </div>
+    `;
+    return;
+  }
+  if (isNetExpectation) {
+    const detail = report.netExpectationDiagnostics || {};
+    const remaining = Math.max(0, Number(detail.minimumTotalSamples || 150) - Number(detail.trainingSampleCount || 0));
+    els.shadowGateDiagnostics.innerHTML = `
+      <div class="shadow-gate-diagnostics-head">
+        <strong>保守净期望模型</strong>
+        <span>${detail.rankingReady ? "已达到影子排序门槛，仍不影响正式推荐" : "样本积累中，仅观察，不生成可交易排序"}</span>
+      </div>
+      <div class="shadow-gate-diagnostic-list role-metrics">
+        ${shadowDiagnosticMetric("执行训练样本", formatInteger(detail.trainingSampleCount || 0), `${formatInteger(detail.trainingTradeDays || 0)} 个交易日 · 还差 ${formatInteger(remaining)} 笔`)}
+        ${shadowDiagnosticMetric("稳定分箱", `${formatInteger(detail.readyBinCount || 0)} / ${formatInteger(detail.binCount || 0)}`, `每箱至少 ${formatInteger(detail.minimumBinSamples || 30)} 笔`)}
+        ${shadowDiagnosticMetric("校准入样", formatInteger(detail.calibrationSelectedCount || 0), `其中概率样本 ${formatInteger(detail.calibrationProbabilityCount || 0)} 笔`)}
+        ${shadowDiagnosticMetric("120 池加权收益", formatPct(detail.avgEligiblePoolWeightedReturnPct), "按冻结入样概率估计")}
+        ${shadowDiagnosticMetric("当前策略", formatPct(detail.avgCurrentRuleReturnPct), `随机基线 ${formatPct(detail.avgRandomBaselineReturnPct)}`)}
+        ${shadowDiagnosticMetric("ETF 基准", formatPct(detail.avgEtfReturnPct), `预算未覆盖 ${formatInteger(detail.budgetLimitedDays || 0)} 日`)}
+      </div>
+    `;
+    return;
+  }
+  if (isAdaptiveExit) {
+    const detail = report.adaptiveExitDiagnostics || {};
+    const statuses = detail.executionStatusCounts || {};
+    const branches = detail.branchCounts || {};
+    els.shadowGateDiagnostics.innerHTML = `
+      <div class="shadow-gate-diagnostics-head">
+        <strong>逐分钟动态退出诊断</strong>
+        <span>只改变卖出路径，固定 open_15m 继续作为主 KPI</span>
+      </div>
+      <div class="shadow-gate-diagnostic-list role-metrics">
+        ${shadowDiagnosticMetric("完整成交率", formatRate(detail.completeExecutionRate), `${formatInteger(detail.completeExecutionCount || 0)} / ${formatInteger(detail.holdingOutcomeCount || 0)} 笔`)}
+        ${shadowDiagnosticMetric("未完整执行", formatInteger(detail.incompleteExecutionCount || 0), `部分 ${formatInteger(statuses.partial_execution || 0)} · 不可成交 ${formatInteger(statuses.market_unexecutable || 0)}`)}
+        ${shadowDiagnosticMetric("低开风险退出", formatInteger(branches.opening_risk_exit || 0), "依赖合格的 09:31 冻结证据")}
+        ${shadowDiagnosticMetric("破位退出", formatInteger(branches.breakdown_exit || 0), "09:35 完成决策，最早下一分钟成交")}
+        ${shadowDiagnosticMetric("强开分腿", formatInteger(branches.strong_open_split_exit || 0), "50% 早退 · 50% 09:45 后")}
+        ${shadowDiagnosticMetric("盯市收益", formatPct(detail.avgMarkToMarketReturnPct), "未成交余量不从样本中删除")}
+      </div>
+    `;
+    return;
+  }
+  const modeLabels = { off: "关闭", shadow: "影子", enforced: "正式" };
+  els.shadowGateDiagnostics.innerHTML = `
+    <div class="shadow-gate-diagnostics-head">
+      <strong>负向门禁诊断</strong>
+      <span>累计挡下 ${formatInteger(report.gateBlockedCandidateCount || 0)} 个候选，仅影响影子处理组</span>
+    </div>
+    <div class="shadow-gate-diagnostic-list">
+      ${diagnostics.map((item) => `
+        <div class="shadow-gate-diagnostic-item">
+          <span>${escapeHtml(item.label || item.gateKey || "--")}</span>
+          <strong>${formatInteger(item.hitCount || 0)} / ${formatInteger(item.evaluatedCount || 0)}</strong>
+          <small>${escapeHtml(modeLabels[item.configuredMode] || item.configuredMode || "--")} · 证据覆盖 ${formatRate(item.evidenceCoveragePct)}</small>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function shadowDiagnosticMetric(label, value, note) {
+  return `
+    <div class="shadow-gate-diagnostic-item">
+      <span>${escapeHtml(label || "--")}</span>
+      <strong>${escapeHtml(value ?? "--")}</strong>
+      <small>${escapeHtml(note || "--")}</small>
+    </div>
+  `;
+}
+
+function formatCorrelation(value) {
+  if (value == null || value === "") return "--";
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(2) : "--";
 }
 
 async function loadReview({ keepSelection = false } = {}) {
@@ -207,7 +476,7 @@ function renderSummary(runs, selected) {
     metricCard("等待数据", formatInteger(stats.displayWaitingRuns || 0), "还没到验证时间或需刷新"),
     metricCard("仅排查", formatInteger(stats.displayDiagnosticRuns ?? stats.displayUnusableRuns ?? 0), "周末/异常/旧规则记录"),
     metricCard("open_15m均值", formatPct(stats.avgNetReturnPct), "只看可用于优化样本"),
-    metricCard("open_15m成功率", formatPct(stats.successRate, true), `强成功 ${formatPct(stats.strongSuccessRate, true)}`),
+    metricCard("open_15m成功率", formatRate(stats.successRate), `强成功 ${formatRate(stats.strongSuccessRate)}`),
     metricCard("选中 run", selected ? `#${formatInteger(selected.id)}` : "--", selected ? `${selected.recommendationDate || "--"} ${selected.scanTime || ""}` : "未选择"),
     metricCard("选中状态", selected ? reviewStatusLabel(selected) : "--", selected?.reviewStatusReason || "左侧选择 run 后显示")
   ].join("");
@@ -236,7 +505,7 @@ function renderOptimizationStats(stats) {
     metricCard("统计范围", stats.scopeLabel || "可用于优化", "不受下方筛选和列表加载数量影响"),
     metricCard("主KPI", stats.primaryScenarioLabel || "开盘后15分钟", "固定主口径，缺失不 fallback"),
     metricCard("平均净收益", formatPct(primary.avgNetReturnPct), "可用于优化样本的 open_15m 均值"),
-    metricCard("成功率", formatPct(primary.successRate, true), "open_15m 净收益大于 0 的比例")
+    metricCard("成功率", formatRate(primary.successRate), "open_15m 净收益大于 0 的比例")
   ].join("");
   const rows = stats.exitTimingStats || [];
   els.exitTimingStatsRows.innerHTML = rows.length
@@ -248,9 +517,9 @@ function renderOptimizationStats(stats) {
         </td>
         <td>${timingPct(row.avgNetReturnPct)}</td>
         <td>${timingPct(row.medianNetReturnPct)}</td>
-        <td>${formatPct(row.successRate, true)}</td>
-        <td>${formatPct(row.strongSuccessRate, true)}</td>
-        <td>${formatPct(row.benchmarkWinRate, true)}</td>
+        <td>${formatRate(row.successRate)}</td>
+        <td>${formatRate(row.strongSuccessRate)}</td>
+        <td>${formatRate(row.benchmarkWinRate)}</td>
         <td>${formatInteger(row.sampleCount || 0)} / ${formatInteger(row.missingCount || 0)}</td>
       </tr>
     `).join("")
@@ -315,6 +584,10 @@ function renderDetail(run) {
     return;
   }
   const marketContext = run.market?.marketContext || {};
+  const openingEvidence = run.market?.openingEvidence || {};
+  const openingPrecheck = openingEvidence.precheck || {};
+  const openingSnapshot = openingEvidence.snapshot || {};
+  const openingLegacy = openingEvidence.status === "not_applicable_old_version";
   const tradeable = run.tradeableSummary || {};
   const summary = run.outcomeSummary || {};
   els.detailEyebrow.textContent = `${run.recommendationDate || "--"} ${run.scanTime || ""} · ${escapeHtml(reviewStatusLabel(run))}`;
@@ -327,12 +600,36 @@ function renderDetail(run) {
     metricCard("成功数量", `${formatInteger(summary.successCount || 0)} / ${formatInteger(summary.count || 0)}`, "强成功 / 成功溢价 / 弱成功"),
     metricCard("用于优化股票", formatInteger(run.learningEligibleCount || 0), learningScopeLabel(run)),
     metricCard("验证进度", outcomeStatusLabel(run.outcomeStatus), outcomeStatusHint(run.outcomeStatus, run)),
-    metricCard("市场状态", marketContext.label || "--", (run.market?.recommendationPolicy || {}).reason || run.error || "--")
+    metricCard("市场状态", marketContext.label || "--", (run.market?.recommendationPolicy || {}).reason || run.error || "--"),
+    metricCard(
+      "09:29 数据预检",
+      openingLegacy ? "旧版本未记录" : openingPrecheck.status === "ready" ? "已就绪" : openingPrecheck.status ? openingEvidenceStatusLabel(openingPrecheck.status) : "等待采集",
+      openingLegacy ? openingEvidence.reason : openingPrecheck.expectedCount ? `预期全市场 ${formatInteger(openingPrecheck.expectedCount)} 只` : "只检查数据源，不作为开盘交易证据"
+    ),
+    metricCard(
+      "09:31 早盘证据",
+      openingLegacy ? "旧版本未记录" : openingSnapshot.decisionEligible ? "可用于动态退出" : openingSnapshot.status ? openingEvidenceStatusLabel(openingSnapshot.status) : "等待采集",
+      openingLegacy ? "不使用当前规则倒推历史 Run" : openingSnapshot.snapshotId
+        ? `全市场覆盖 ${formatRate(openingSnapshot.marketCoveragePct)} · 四指数${openingSnapshot.mainIndexStatus === "available" ? "完整" : "不完整"}`
+        : "缺失或迟到时，低开风险分支不会触发"
+    )
   ].join("");
   renderUsageExplanation(run);
   renderPickSummary(run);
   renderShadow(run);
   renderOutcomes(run);
+}
+
+function openingEvidenceStatusLabel(status) {
+  return {
+    available: "可用",
+    partial: "部分可用",
+    ready: "已就绪",
+    unavailable: "证据不足",
+    missed_deadline: "已错过截止",
+    late_snapshot: "采集迟到",
+    provider_failed: "数据源失败",
+  }[String(status || "")] || String(status || "--");
 }
 
 function renderUsageExplanation(run) {
@@ -408,18 +705,20 @@ function renderShadow(run) {
   const aiPicks = Array.isArray(ai.picks) ? ai.picks : [];
   const rows = Array.isArray(outcome.rows) ? outcome.rows : [];
   const aiRows = Array.isArray(outcome.deepSeekTailRows) ? outcome.deepSeekTailRows : [];
-  if (!rulePicks.length && !aiPicks.length && !rows.length && !aiRows.length) {
+  const legacyAvailable = rulePicks.length || aiPicks.length || rows.length || aiRows.length;
+  const policyHtml = policyExperimentRunSection(run);
+  if (!legacyAvailable && !policyHtml) {
     els.shadowPanel.innerHTML = `<section class="review-shadow-box"><strong>影子 Top3</strong><span>该 run 未记录影子推荐数据（旧 run 或生成时未启用影子链路）。</span></section>`;
     return;
   }
-  const cards = [
+  const cards = legacyAvailable ? [
     shadowReviewGroup("规则尾盘影子", rulePicks, rows),
     shadowReviewGroup("AI 尾盘影子", aiPicks, aiRows)
-  ].filter(Boolean).join("");
+  ].filter(Boolean).join("") : "";
   const finalReturn = outcome.final?.portfolioReturnPct ?? run.baselineComparison?.portfolio?.portfolioReturnPct ?? run.tradeableSummary?.avgNetReturnPct;
   const shadowReturn = outcome.shadow?.portfolioReturnPct;
   const aiReturn = outcome.deepSeekTail?.portfolioReturnPct;
-  els.shadowPanel.innerHTML = `
+  const legacyHtml = legacyAvailable ? `
     <section class="review-shadow-box">
       <div class="review-shadow-head">
         <div><strong>影子 Top3 对比</strong><small>旁路验证尾盘承接和低开风险，不影响正式推荐或策略学习</small></div>
@@ -433,7 +732,177 @@ function renderShadow(run) {
       ${cards}
       ${outcome.reason ? `<small class="review-shadow-note">${escapeHtml(outcome.reason)}</small>` : ""}
     </section>
+  ` : "";
+  els.shadowPanel.innerHTML = `${legacyHtml}${policyHtml}`;
+}
+
+function policyExperimentRunSection(run) {
+  const market = run?.market || {};
+  const policy = market.strategyPolicy || {};
+  if (!policy.strategyPolicyVersion) return "";
+
+  const gateAudit = policy.negativeGateAudit || {};
+  const eventAudit = market.eventRiskAudit || {};
+  const calibration = policy.executionCalibrationAudit || {};
+  const gateHits = Object.values(gateAudit.gates || {})
+    .filter((gate) => Number(gate.hitCount || 0) > 0)
+    .map((gate) => `${gate.label === "1m 尾盘承接" ? "1 分钟尾盘承接" : (gate.label || gate.gateKey)} ${formatInteger(gate.hitCount)} 只`);
+
+  const roles = [
+    policyRunRole(
+      "市场门禁",
+      policy.marketGateShadowPortfolio,
+      policyRunResultReason("市场门禁", policy, market),
+      "市场风险预算后的影子组合"
+    ),
+    policyRunRole(
+      "风险门禁",
+      policy.riskGateTreatmentPortfolio,
+      policyRunResultReason("风险门禁", policy, market, gateHits),
+      "板块、尾盘、隔夜、追高和事件风险"
+    ),
+    policyRunRole(
+      "组合去同质化",
+      policy.portfolioDiversityTreatmentPortfolio,
+      policyRunResultReason("组合去同质化", policy, market),
+      "行业与主驱动独立性"
+    ),
+    policyRunRole(
+      "第三槽",
+      policy.rank3ShadowPortfolio,
+      policyRunResultReason("第三槽", policy, market),
+      "第三槽影子，不强补"
+    ),
+    policyRunRole(
+      "净期望排序",
+      policy.netExpectationTreatmentPortfolio,
+      policyRunResultReason("净期望排序", policy, market),
+      "只读取此前日期的执行样本"
+    ),
+    policyRunRole(
+      "动态退出",
+      policy.frozenDecisionRanking,
+      policyRunResultReason("动态退出", policy, market),
+      "同一持仓对比固定 open_15m"
+    )
+  ].join("");
+
+  const requestedEvents = Number(eventAudit.requestedCount || 0);
+  const coveredEvents = Number(eventAudit.coveredCount || 0);
+  const calibrationCount = Number(calibration.selectedCount || calibration.selectedCandidateCount || calibration.sampleCount || 0);
+  return `
+    <section class="review-shadow-box policy-run-shadow">
+      <div class="review-shadow-head">
+        <div>
+          <strong>本期策略实验 · 当日冻结结果</strong>
+          <small>推荐日即可查看名单和空组合原因；收益要到下一交易日验证后才进入跨 Run 统计</small>
+        </div>
+        <span class="review-shadow-badge">仅影子</span>
+      </div>
+      <div class="policy-run-meta">
+        <span><small>策略版本</small><strong>${escapeHtml(policy.strategyPolicyVersion)}</strong></span>
+        <span><small>事件风险</small><strong>${requestedEvents ? `${formatInteger(coveredEvents)} / ${formatInteger(requestedEvents)}` : "未采集"}</strong></span>
+        <span><small>执行校准</small><strong>${formatInteger(calibrationCount)} 只</strong></span>
+        <span><small>正式影响</small><strong>${policy.affectsOfficialRecommendation ? "已启用" : "无"}</strong></span>
+      </div>
+      <div class="policy-run-role-list">${roles}</div>
+      <small class="review-shadow-note">空影子组合是可审计结果，不等于链路没有运行。顶部跨 Run 收益统计需等待次日结果。</small>
+    </section>
   `;
+}
+
+function policyRunRole(title, rawPicks, status, note) {
+  const picks = Array.isArray(rawPicks) ? rawPicks : [];
+  const chips = picks.length
+    ? picks.map((pick, index) => `<a href="${escapeHtml(stockAnalysisHref(pick))}" title="打开个股分析"><b>#${formatInteger(pick.originalAiRank || pick.aiRank || index + 1)}</b>${escapeHtml(pick.name || normalizedStockCode(pick.code))}<small>${escapeHtml(normalizedStockCode(pick.code))}</small></a>`).join("")
+    : `<span class="policy-run-empty">Top0</span>`;
+  return `
+    <article class="policy-run-role">
+      <div class="policy-run-role-head"><strong>${escapeHtml(title)}</strong><span>${formatInteger(picks.length)} 只</span></div>
+      <small class="policy-run-meaning"><b>作用</b>${escapeHtml(policyRunMeaning(title))}</small>
+      <div class="policy-run-result"><small>本次为什么是 ${formatInteger(picks.length)} 只</small><p>${escapeHtml(status || "等待数据")}</p></div>
+      <small>${escapeHtml(note || "")}</small>
+      <div class="policy-run-picks">${chips}</div>
+    </article>
+  `;
+}
+
+function policyRunResultReason(title, policy = {}, market = {}, gateHits = []) {
+  const frozenCount = Array.isArray(policy.frozenDecisionRanking) ? policy.frozenDecisionRanking.length : 0;
+  const auditCandidateCount = Number((policy.negativeGateAudit || {}).candidateCount || 0);
+  const commonCount = Math.max(
+    Array.isArray(policy.existingGuardrailSequence) ? policy.existingGuardrailSequence.length : 0,
+    auditCandidateCount,
+    frozenCount
+  );
+  if (title === "市场门禁") {
+    const limit = Number(policy.maxOfficialPicksCandidate || 0);
+    const resultCount = Array.isArray(policy.marketGateShadowPortfolio) ? policy.marketGateShadowPortfolio.length : 0;
+    const state = marketStateLabel(policy.baseMarketState);
+    if (!limit) return `当日市场为${state}，市场风险预算不允许持仓，因此结果为 0 只。`;
+    return `当日市场为${state}，风险预算最多 ${formatInteger(limit)} 只；${formatInteger(commonCount)} 只候选中按 AI 原排序保留 ${formatInteger(resultCount)} 只。`;
+  }
+  if (title === "风险门禁") {
+    const audit = policy.negativeGateAudit || {};
+    const checked = Math.max(Number(audit.candidateCount || 0), (policy.riskGateBlockedCandidates || []).length, commonCount);
+    const blockedCount = Number(audit.blockedCandidateCount ?? (policy.riskGateBlockedCandidates || []).length);
+    const passed = Array.isArray(policy.riskGateTreatmentPortfolio) ? policy.riskGateTreatmentPortfolio.length : Math.max(0, checked - blockedCount);
+    if (blockedCount) return `共检查 ${formatInteger(checked)} 只，${formatInteger(blockedCount)} 只命中风险项（${gateHits.join("；") || "详见门禁证据"}），通过 ${formatInteger(passed)} 只。`;
+    return `共检查 ${formatInteger(checked)} 只，没有候选命中已启用的负向风险项，因此通过 ${formatInteger(passed)} 只。`;
+  }
+  if (title === "组合去同质化") {
+    const upstream = Array.isArray(policy.riskGateTreatmentSequence) ? policy.riskGateTreatmentSequence.length : 0;
+    const audit = policy.portfolioDiversityAudit || {};
+    const resultCount = Array.isArray(policy.portfolioDiversityTreatmentPortfolio) ? policy.portfolioDiversityTreatmentPortfolio.length : 0;
+    if (!upstream) return "风险门禁后没有剩余候选，本项没有股票可做行业和驱动分散，因此为 0 只。";
+    if (resultCount < 2) return `风险门禁后有 ${formatInteger(upstream)} 只；第二只因同类集中或身份信息不足未开放，最终保留 ${formatInteger(resultCount)} 只。`;
+    return `风险门禁后有 ${formatInteger(upstream)} 只，通过行业和上涨驱动检查后保留 ${formatInteger(resultCount)} 只${Number(audit.replacementCount || 0) ? `，替换 ${formatInteger(audit.replacementCount)} 只` : ""}。`;
+  }
+  if (title === "第三槽") {
+    const rankedCount = Math.max(frozenCount, Array.isArray(policy.rank3ShadowPortfolio) ? policy.rank3ShadowPortfolio.length : 0);
+    return (policy.rank3Audit || {}).available
+      ? `AI 冻结排序共有 ${formatInteger(rankedCount)} 只；这里展示完整 Top3，用来比较“持有第 3 只”和“第三槽留现金”，因此为 3 只。`
+      : `AI 冻结排序只有 ${formatInteger(rankedCount)} 只，不足 3 只，不能形成第三槽对照，因此为 0 只。`;
+  }
+  if (title === "净期望排序") {
+    const model = policy.netExpectationModel || {};
+    const samples = Number(model.sampleCount || 0);
+    const minimum = Number(model.minimumTotalSamples || 150);
+    if (!model.rankingReady) return `历史完整执行样本仅 ${formatInteger(samples)} 笔，尚未达到至少 ${formatInteger(minimum)} 笔的启用门槛，所以不生成排序，结果为 0 只。`;
+    const count = Array.isArray(policy.netExpectationTreatmentPortfolio) ? policy.netExpectationTreatmentPortfolio.length : 0;
+    return `历史样本已达到启用门槛，按扣除成本后的保守期望收益排序，并经风险与分散检查后保留 ${formatInteger(count)} 只。`;
+  }
+  if (title === "动态退出") {
+    const eligible = Boolean(((market.openingEvidence || {}).snapshot || {}).decisionEligible);
+    return eligible
+      ? `这 ${formatInteger(frozenCount)} 只是今日冻结持仓的退出跟踪名单；次日 09:31 证据已具备，等待分钟回放得出退出结果。`
+      : `这 ${formatInteger(frozenCount)} 只是今日冻结持仓的退出跟踪名单，并非新增推荐；需等下一交易日 09:29/09:31 数据后才能判断如何退出。`;
+  }
+  return "等待本次冻结数据。";
+}
+
+function policyRunMeaning(title) {
+  return {
+    "市场门禁": "根据大盘和市场广度控制整体风险预算，不直接判断单只股票。",
+    "风险门禁": "检查尾盘承接、隔夜、追高和事件风险，命中时作为回避参考。",
+    "组合去同质化": "避免组合集中在同一行业或同一上涨逻辑，降低同跌风险。",
+    "第三槽": "单独观察 AI 排名第 3 只与现金仓位的差异，不强行补足推荐数量。",
+    "净期望排序": "用历史真实执行结果估算扣成本后的期望收益，样本不足时只观察。",
+    "动态退出": "用次日开盘后的分钟数据决定是否提前退出，不改变今日买入名单。"
+  }[title] || "用于观察策略效果，不改变正式推荐。";
+}
+
+function marketStateLabel(value) {
+  return {
+    panic: "恐慌退潮",
+    heavy_down: "重跌",
+    mild_down: "偏弱",
+    mixed: "震荡分化",
+    mild_up: "温和上涨",
+    trend_up: "趋势上涨",
+    euphoric: "情绪高潮",
+    unknown: "数据不足"
+  }[String(value || "")] || String(value || "--");
 }
 
 function shadowReturnCard(label, value, note, tone) {
@@ -512,7 +981,7 @@ function renderBaseline(run) {
   const criticPair = baseline.criticPair || {};
   els.baselinePanel.innerHTML = [
     metricCard("组合收益", formatPct(portfolio.portfolioReturnPct), `现金槽 ${formatInteger(portfolio.cashSlots || 0)} / ${formatInteger(portfolio.slotCount || 3)}`),
-    metricCard("最终均值", formatPct(final.avgNetReturnPct), `成功率 ${formatPct(final.successRate, true)}`),
+    metricCard("最终均值", formatPct(final.avgNetReturnPct), `成功率 ${formatRate(final.successRate)}`),
     metricCard("指数基准", formatPct(index.avgNetReturnPct ?? index.avgBenchmarkReturnPct), index.reason || "同口径指数/ETF参考"),
     metricCard("AI自检对照", formatPct(criticPair.deltaPct ?? criticPair.returnDeltaPct), criticPair.reason || "没有对照数据")
   ].join("");
@@ -630,6 +1099,20 @@ function normalizeReviewFilter(value) {
   if (text === "rules_fallback") return "";
   if (["reviewable", "learnable", "partial", "waiting", "diagnostic", ""].includes(text)) return text;
   return "reviewable";
+}
+
+function normalizeShadowFamily(value) {
+  const family = String(value || "");
+  return Object.hasOwn(SHADOW_ROLES, family) ? family : "legacy_tail_rule";
+}
+
+function defaultShadowRole(family) {
+  return (SHADOW_ROLES[normalizeShadowFamily(family)] || [])[0]?.value || "tail_rule";
+}
+
+function normalizeShadowWindow(value) {
+  const windowKey = String(value || "all");
+  return ["all", "20d", "discovery60", "confirmation60"].includes(windowKey) ? windowKey : "all";
 }
 
 function reviewStatusKey(run) {
@@ -837,6 +1320,9 @@ function syncUrl() {
   });
   if (state.statusFilter && state.statusFilter !== "reviewable") params.set("reviewStatus", state.statusFilter);
   if (state.runId > 0) params.set("runId", String(state.runId));
+  params.set("shadowFamily", state.shadowFamily);
+  params.set("shadowRole", state.shadowRole);
+  if (state.shadowWindow !== "all") params.set("shadowWindow", state.shadowWindow);
   window.history.replaceState(null, "", `?${params.toString()}`);
 }
 
@@ -846,11 +1332,18 @@ function clampNumber(value, min, max, fallback) {
   return Math.max(min, Math.min(max, Math.trunc(number)));
 }
 
-function formatPct(value, alreadyPct = false) {
+function formatPct(value) {
+  if (value == null || value === "") return "--";
   const number = Number(value);
   if (!Number.isFinite(number)) return "--";
-  const normalized = alreadyPct ? number : number;
-  return `${normalized > 0 ? "+" : ""}${normalized.toFixed(2).replace(/\.00$/, "")}%`;
+  return `${number > 0 ? "+" : ""}${number.toFixed(2).replace(/\.00$/, "")}%`;
+}
+
+function formatRate(value) {
+  if (value == null || value === "") return "--";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return `${number.toFixed(2).replace(/\.00$/, "")}%`;
 }
 
 function formatPrice(value) {
@@ -864,6 +1357,7 @@ function formatInteger(value) {
 }
 
 function formatNumber(value, digits = 1) {
+  if (value == null || value === "") return "--";
   const number = Number(value);
   if (!Number.isFinite(number)) return "--";
   return number.toFixed(digits).replace(/\.0+$/, "");
