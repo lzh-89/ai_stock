@@ -478,7 +478,8 @@ class T1ShadowAnalyticsService:
             "shadowFamily": family,
             "shadowRole": role,
             "scope": "role_diagnostic",
-            "strategyPolicyVersion": LEGACY_POLICY_VERSION,
+            "strategyPolicyVersion": (LEGACY_POLICY_VERSION + ":" + str(market["selectionPolicyVersion"]))
+                if market.get("selectionPolicyVersion") else LEGACY_POLICY_VERSION,
             "outcomeScenario": DEFAULT_OUTCOME_SCENARIO,
             "executionProfileVersion": str(((market.get("executionProfile") or {}).get("version") or "legacy_execution_profile")),
             "comparisonKey": f"{role}_descriptive",

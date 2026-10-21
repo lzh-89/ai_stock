@@ -211,14 +211,22 @@ class T1EntryExecutionEvidenceService:
             ]
         missing = [code for code in codes if not rows_by_code.get(code)]
         now_at = now_dt.isoformat(timespec="seconds")
-        if missing and now_at < job["deadlineAt"]:
+        if now_at < job["deadlineAt"]:
             due_at = min(
                 now_dt + timedelta(seconds=config["retryIntervalSeconds"]),
                 datetime.fromisoformat(job["deadlineAt"]),
             ).isoformat(timespec="seconds")
-            error = provider_error or f"等待信号发布后的完整 1 分钟成交：{','.join(missing)}"
+            error = provider_error or (
+                f"等待尾盘成交窗口结束；暂缺分钟线：{','.join(missing)}" if missing else "等待尾盘成交窗口结束。"
+            )
             self.database.retry_t1_entry_execution_job(job["id"], due_at, error)
-            return {"jobId": job["id"], "status": "retry_wait", "missingCodes": missing, "error": error}
+            return {
+                "jobId": job["id"],
+                "status": "retry_wait",
+                "missingCodes": missing,
+                "collectedCodes": [code for code in codes if rows_by_code.get(code)],
+                "error": error,
+            }
 
         source_map = getattr(self.analysis_service.kline_provider, "last_sources_by_code", {}) or {}
         default_source = str(getattr(self.analysis_service.kline_provider, "source", "") or "minute_provider")

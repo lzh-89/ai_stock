@@ -301,7 +301,7 @@ class ArchiveTrackingTest(unittest.TestCase):
         self.db.upsert_t1_overnight_selection_items(run_id, [pick], "semifinal")
         self.db.update_t1_overnight_selection_run(run_id, dict(batchSize=80, batchPick=8, finalLimit=3,
             completedBatchCount=1, batchSummary=[dict(batchIndex=1,candidateCount=80,pickCount=1,picks=[pick])],
-            request=dict(poolSize=500,poolCandidateCodes=[x["code"] for x in candidates],selectionCandidateCodes=[x["code"] for x in candidates]),
+            request=dict(selectionPolicyVersion=selection.selection_policy.VERSION, poolSize=500,poolCandidateCodes=[x["code"] for x in candidates],selectionCandidateCodes=[x["code"] for x in candidates]),
             market=dict(marketContext={},dataQualityStats={},validationAllocation={"version":"frozen"}), evidenceRunId=1))
         service._load_market_data_for_t1 = Mock(side_effect=AssertionError("resume must use checkpoint"))
         calls=[]

@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import urllib.request
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List
 
@@ -165,22 +166,44 @@ def _aggregate_series(series: List[Dict[str, float]], period_minutes: int) -> Li
     if period_minutes <= 1:
         return series
 
-    aggregated: List[Dict[str, float]] = []
-    for start in range(0, len(series), period_minutes):
-        bucket = series[start : start + period_minutes]
-        if not bucket:
+    # Tencent labels the END of each minute. 09:30/13:00 are opening
+    # observations, not an extra minute that shifts every subsequent bucket.
+    buckets = {}
+    for point in series:
+        raw = str(point.get("time") or "")
+        try:
+            moment = datetime.fromisoformat(raw) if len(raw) > 5 else datetime.fromisoformat("2000-01-01T" + raw)
+        except ValueError:
             continue
+        minute = moment.hour * 60 + moment.minute
+        session_start = 570 if 570 <= minute <= 690 else 780 if 780 <= minute <= 900 else None
+        if session_start is None:
+            continue
+        offset = minute - session_start
+        end_offset = ((max(1, offset) - 1) // period_minutes + 1) * period_minutes
+        end = moment.replace(hour=session_start // 60, minute=session_start % 60, second=0) + timedelta(minutes=end_offset)
+        key = (end, session_start)
+        buckets.setdefault(key, {})[moment] = point
+    aggregated: List[Dict[str, float]] = []
+    for (end, _), members in sorted(buckets.items()):
+        start = end - timedelta(minutes=period_minutes)
+        bucket = [members[t] for t in sorted(members)]
+        dated = len(str(bucket[0].get("time") or "")) > 5
+        label = lambda value: value.isoformat(sep=" ", timespec="minutes") if dated else value.strftime("%H:%M")
+        expected = {start + timedelta(minutes=i) for i in range(1, period_minutes + 1)}
         aggregated.append(
             {
                 "open": bucket[0]["open"],
                 "high": max(item["high"] for item in bucket),
                 "low": min(item["low"] for item in bucket),
                 "close": bucket[-1]["close"],
-                "time": bucket[-1].get("time", ""),
+                "time": label(end),
                 "timeLabel": "end",
-                "bucketStart": bucket[0].get("time", ""),
-                "bucketEnd": bucket[-1].get("time", ""),
-                "bucketComplete": len(bucket) == period_minutes,
+                "bucketStart": label(start),
+                "bucketEnd": label(end),
+                "actualLastTime": bucket[-1].get("time", ""),
+                "bucketComplete": expected.issubset(members),
+                "minuteCoverage": len(expected.intersection(members)),
                 "volume": sum(item["volume"] for item in bucket),
                 "amount": sum(item.get("amount", 0.0) for item in bucket),
             }

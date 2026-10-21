@@ -1047,6 +1047,9 @@ function renderMarketContext(run) {
   const entryEvidence = run?.entryExecutionEvidence || market.entryExecutionEvidence || {};
   const evidenceCoverage = evidence.evidenceCoverage || sectorLayerCounts;
   const allocation = market.validationAllocation || {};
+  const formal = market.formalEligibilitySummary || {};
+  const scope = market.selectionScopeCoverage || {};
+  const sourceCoverage = market.cacheStatus?.coverage || {};
   const aiParticipation = market.aiParticipation || {};
   const indexView = marketIndexView(market, metrics);
   const realIndices = indexView.realIndices;
@@ -1070,8 +1073,10 @@ function renderMarketContext(run) {
     return;
   }
   els.marketContextPanel.innerHTML = `
-    ${(allocation.rounds || []).map((round) => `<div class="market-status-card neutral"><span>15m 验证第 ${formatInteger(round.round)} 轮</span><strong>计划 ${formatInteger(round.planned)} · 合格 ${formatInteger(round.eligible)}</strong><small>请求 ${formatInteger(round.requested)} · 真实可用 ${formatInteger(round.available)}</small></div>`).join("")}
-    ${allocation.version ? `<div class="market-status-card neutral"><span>尾盘 1m 影子验证</span><strong>计划 ${formatInteger(allocation.tail1m?.planned)} · 可用 ${formatInteger(allocation.tail1m?.available)}</strong><small>请求 ${formatInteger(allocation.tail1m?.requested)} · AI 批次后按需验证</small><a class="market-archive-link" href="./t1-overnight-review.html?runId=${Number(run.id || run.runId || 0)}&reviewStatus=all">查看筛选档案与次日效果</a></div>` : ""}
+    ${(allocation.rounds || []).map((round) => `<div class="market-status-card neutral"><span>15m 验证第 ${formatInteger(round.round)} 轮</span><strong>计划 ${formatInteger(round.planned)} · 数据合格 ${formatInteger(round.eligible)}</strong><small>请求 ${formatInteger(round.requested)} · 真实可用 ${formatInteger(round.available)}${market.selectionPolicyVersion ? ` · 形态成立 ${formatInteger(round.setupEligible)}` : ""}</small></div>`).join("")}
+    ${allocation.version ? `<div class="market-status-card neutral"><span>尾盘 1m 证据验证</span><strong>计划 ${formatInteger(allocation.tail1m?.planned)} · 可用 ${formatInteger(allocation.tail1m?.available)}</strong><small>请求 ${formatInteger(allocation.tail1m?.requested)} · ${market.selectionPolicyVersion ? "优先覆盖全部半决赛，正式推荐与影子独立使用" : "历史版主要用于影子对照"}</small><a class="market-archive-link" href="./t1-overnight-review.html?runId=${Number(run.id || run.runId || 0)}&reviewStatus=all">查看筛选档案与次日效果</a></div>` : ""}
+    ${market.selectionPolicyVersion ? `<div class="market-status-card neutral"><span>正式推荐资格</span><strong>半决赛 ${formatInteger(formal.semifinalCount)} · 可推荐 ${formatInteger(formal.eligibleCount)}</strong><small>数据可用、形态成立和尾盘承接通过后，仍需满足市场风险与发布时限。</small><small>${escapeHtml((formal.rejected || []).flatMap(x => x.reasons || []).filter((x, i, all) => all.indexOf(x) === i).slice(0, 3).join("；") || "最终数量由证据与 AI 比较共同决定，允许少选或空仓。")}</small><small>版本 ${escapeHtml(market.selectionPolicyVersion)}</small></div>` : ""}
+    ${scope.received != null ? `<div class="market-status-card neutral"><span>行情覆盖与适用范围</span><strong>收到 ${formatInteger(scope.received)} · 硬过滤后 ${formatInteger(scope.hardFiltered)}</strong><small>全源覆盖率 ${sourceCoverage.coveragePct == null ? "未知" : `${sourceCoverage.coveragePct}%`} · 失败页 ${formatInteger(sourceCoverage.pagesFailed)}</small><small>${escapeHtml(sourceCoverage.reason || "尚无权威股票全集可验证覆盖率；筛选范围不等于全市场完整性。")}</small></div>` : ""}
     <div class="market-status-card ${marketContextTone(context)}">
       <span>市场状态</span>
       <strong>${escapeHtml(context.label || context.state || "--")}</strong>
@@ -1095,7 +1100,7 @@ function renderMarketContext(run) {
     </div>
     <div class="market-status-card ${Number(quality.eligibleForRealTop || 0) > 0 ? "good" : "bad"}">
 	      <span>数据质量</span>
-	      <strong>${formatInteger(quality.eligibleForRealTop)} 只可交易</strong>
+	      <strong>${formatInteger(quality.eligibleForRealTop)} 只数据可用</strong>
 	      <small>完整 ${formatInteger(counts.A)} · 可用 ${formatInteger(counts.B)} · 有限 ${formatInteger(counts.C)} · 不足 ${formatInteger(counts.D)} · 模拟 ${formatInteger(quality.simulatedKeyData)}</small>
 	      <small>${escapeHtml(coverageDetail(evidenceCoverage) || `板块证据 可用 ${formatInteger(sectorCounts.available)} · 部分 ${formatInteger(sectorCounts.partial)} · 过期 ${formatInteger(sectorCounts.stale)} · 不可用 ${formatInteger(sectorCounts.unavailable)}`)}</small>
 	      <small>${escapeHtml(formatKlineSourceCounts(quality.klineSourceCounts))}</small>
@@ -1247,6 +1252,7 @@ function renderPicks(picks, run = null) {
       ${sectorEvidenceBadgeHtml(pick)}
       ${sectorStateBadgeHtml(pick)}
       ${aiEvidenceValidationHtml(pick)}
+      ${formalEvidenceHtml(pick)}
       ${t1ScoreBreakdownHtml(pick)}
       ${sectorSemanticsHtml(pick)}
       ${pick.criticReplacement ? `<div class="critic-note">Critic 替换：${escapeHtml(pick.criticReplacement.reason || "--")}</div>` : ""}
@@ -1267,6 +1273,14 @@ function renderPicks(picks, run = null) {
     </article>
   `).join("");
   els.pickGrid.innerHTML = `${formalHtml}${shadowTop3Html(run)}`;
+}
+
+function formalEvidenceHtml(pick) {
+  if (!pick.selectionPolicyVersion) return pick.candidateType === "late_money_inflow"
+    ? '<p class="t1-risk-breakdown">旧版分类，非真实尾盘资金回流确认；保留当时原始推荐。</p>' : "";
+  const setup = pick.setupEvidence || {};
+  const tail = pick.tailSupportPackV2 || {};
+  return `<div class="t1-risk-breakdown"><strong>交易逻辑：${escapeHtml(pick.candidateTypeLabel || "未确认")}</strong><br>数据 ${pick.dataEligible ? "可用" : "不足"} · 形态 ${pick.setupEligible ? "成立" : "未成立"} · 正式资格 ${pick.formalEligible ? "通过" : "未通过"}<br>尾盘：${escapeHtml(tail.label || "证据不足")} · 证据截止 ${escapeHtml(tail.actualLastTime || "未知")}<br>${escapeHtml((pick.formalExclusionReasons || setup.reasons || []).join("；") || "已通过必要结构、尾盘证据检查；仍须遵守市场与交易约束。回踩均价为分钟价格与成交量估算，不是资金流。")}<br><small>评分/形态版本 ${escapeHtml(pick.selectionPolicyVersion)} · 分数与信心均不是盈利概率</small></div>`;
 }
 
 function shadowTop3Html(run) {
@@ -1291,7 +1305,7 @@ function shadowTop3Html(run) {
         <span class="shadow-badge">规则${changedCount > 0 ? `不同 ${formatInteger(changedCount)} 只` : "一致"} · AI${aiPicks.length ? (aiChangedCount > 0 ? `不同 ${formatInteger(aiChangedCount)} 只` : "一致") : "未生成"}</span>
       </div>
       ${shadowPickGroupHtml("规则尾盘影子", "系统假设更重视尾盘承接时的规则对照。", picks, finalCodes)}
-      ${shadowPickGroupHtml("AI 尾盘影子", "DeepSeek 额外看到 T1 尾盘细节后重新终选，只做复盘对照。", aiPicks, finalCodes)}
+      ${shadowPickGroupHtml("AI 尾盘影子", "独立的尾盘证据对照选择；新版正式推荐也使用尾盘证据，影子模式仍单独保存。", aiPicks, finalCodes)}
       ${!aiPicks.length && aiShadow.reason ? `<p class="shadow-top3-note">${escapeHtml(aiShadow.reason)}</p>` : ""}
       ${aiShadow.error && !aiPicks.length ? `<p class="shadow-top3-note">${escapeHtml(aiShadow.error)}</p>` : ""}
       ${comparison.reason ? `<p class="shadow-top3-note">${escapeHtml(comparison.reason)}</p>` : ""}
@@ -2404,7 +2418,7 @@ function t1ScoreBreakdownHtml(item) {
       ${t1MetricHtml("隔夜风险", formatNumber(dimensions.overnightRisk), "今天尾盘买入后持有到明天的风险评分，越低越好。会考虑市场状态、跌停扩散、板块证据缺失、可交易性、高位放量和数据完整度。")}
       ${shadowRisk}
       ${t1MetricHtml("板块强度", formatNumber(dimensions.sectorStrength), "行业/概念对这只股票的支持评分。外部全市场板块证据优先；如果只有候选池聚合，会限制分数并提示不能当作全市场排名。")}
-      ${t1MetricHtml("成交活跃度", formatNumber(dimensions.fundStrength), "个股成交活跃度评分，主要看成交额强度、量比、涨幅和成交规模。它不是主力净流入，也不等于真实机构资金。")}
+      ${t1MetricHtml("成交活跃度", formatNumber(dimensions.fundStrength), item.selectionPolicyVersion ? "新版仅根据真实成交规模评分，不重复叠加估算量比与涨幅。不是资金净流入。" : "旧版成交活跃度代理评分，不是资金净流入，也不等于真实机构资金。")}
     </div>
     ${riskItems.length ? `<div class="t1-risk-breakdown">风险拆分：${escapeHtml(riskItems.join("；"))}</div>` : ""}
   `;

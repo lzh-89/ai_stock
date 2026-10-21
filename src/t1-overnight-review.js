@@ -500,13 +500,16 @@ function renderReviewNote(stats, autoFreeze = {}) {
 function renderOptimizationStats(stats) {
   if (!els.optimizationStatsGrid || !els.exitTimingStatsRows) return;
   const primary = stats.primary || {};
-  els.optimizationStatsMeta.textContent = `${formatInteger(stats.runCount || 0)} 个 run · ${formatInteger(stats.outcomeCount || 0)} 只股票`;
+  els.optimizationStatsMeta.textContent = `${formatInteger(stats.runCount || 0)} 个 run · ${formatInteger(stats.outcomeCount || 0)} 只股票 · 当前统计版本 ${stats.selectionPolicyVersion || "legacy（旧版）"}`;
   els.optimizationStatsGrid.innerHTML = [
     metricCard("统计范围", stats.scopeLabel || "可用于优化", "不受下方筛选和列表加载数量影响"),
     metricCard("主KPI", stats.primaryScenarioLabel || "开盘后15分钟", "固定主口径，缺失不 fallback"),
     metricCard("平均净收益", formatPct(primary.avgNetReturnPct), "可用于优化样本的 open_15m 均值"),
     metricCard("成功率", formatRate(primary.successRate), "open_15m 净收益大于 0 的比例")
   ].join("");
+  els.optimizationStatsGrid.innerHTML += (stats.versionGroups || []).map((group) => metricCard(
+    group.selectionPolicyVersion === "legacy" ? "旧版基线" : `版本 ${group.selectionPolicyVersion}`,
+    formatPct(group.primary?.avgNetReturnPct), `${formatInteger(group.runCount)} 个可优化 run · 固定开盘后15分钟净收益，按版本独立统计`)).join("");
   const rows = stats.exitTimingStats || [];
   els.exitTimingStatsRows.innerHTML = rows.length
     ? rows.map((row) => `
@@ -717,6 +720,9 @@ function renderPickSummary(run) {
         <span class="review-official-field"><small>open_15m</small><strong class="${returnTone(returnValue)}">${returnValue == null ? "待验证" : formatPct(returnValue)}</strong></span>
       </span>
       <span class="review-official-status ${escapeHtml(outcomeStatusTone(run.outcomeStatus))}">${escapeHtml(status)}</span>
+      <div class="review-official-evidence">${pick.selectionPolicyVersion
+        ? `<strong>${escapeHtml(pick.candidateTypeLabel || "形态待确认")}</strong> · 数据${pick.dataEligible ? "可用" : "不足"} / 形态${pick.setupEligible ? "成立" : "未成立"} / 正式资格${pick.formalEligible ? "通过" : "未通过"}<br>尾盘：${escapeHtml(pick.tailSupportPackV2?.label || "证据不足")} · 截止 ${escapeHtml(pick.tailSupportPackV2?.actualLastTime || "未知")}<br>${escapeHtml((pick.formalExclusionReasons || []).join("；"))}<small>冻结版本 ${escapeHtml(pick.selectionPolicyVersion)}；评分不是资金流或收益概率。</small>`
+        : `${escapeHtml(pick.candidateTypeLabel || "旧版分类")} · 旧版分类，非真实尾盘回流确认；保留当时原始依据。`}</div>
     </article>`;
   }).join("");
   els.pickSummary.innerHTML = `<section class="review-official-section"><div class="review-official-head"><div><strong>正式推荐</strong><small>系统最终交易组合，进入次日验证与策略复盘</small></div><span class="review-official-count">正式组合 · ${formatInteger(picks.length)} 只</span></div><div class="review-official-list">${rows}</div></section>`;
@@ -755,7 +761,7 @@ function renderShadow(run) {
       <div class="review-shadow-returns">
         ${shadowReturnCard("正式 Top3", finalReturn, "正式推荐组合", "formal")}
         ${shadowReturnCard("规则尾盘影子", shadowReturn, "尾盘承接加权", "rule")}
-        ${shadowReturnCard("AI 尾盘影子", aiReturn, "DeepSeek 额外读取 T1", "ai")}
+        ${shadowReturnCard("AI 尾盘影子", aiReturn, "独立尾盘证据对照", "ai")}
       </div>
       ${cards}
       ${outcome.reason ? `<small class="review-shadow-note">${escapeHtml(outcome.reason)}</small>` : ""}

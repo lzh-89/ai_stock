@@ -5,10 +5,10 @@
   const pct = (value) => value == null ? "--" : `${Number(value).toFixed(2)}%`;
   const returnValue = (value) => `<span class="${value == null || Number(value) === 0 ? "" : Number(value) > 0 ? "proxy-positive" : "proxy-negative"}">${pct(value)}</span>`;
   const metric = (label, value) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`;
-  const names = { all500:"全部宽召回", requested120:"分配15m验证", available15m:"15m真实可用", eligiblePool:"通过门禁", notRequested:"未分配15m", core:"核心", single:"单项突出", boundary:"边界分歧", coverage:"行业覆盖", explore:"探索" };
+  const names = { all500:"全部宽召回", requested120:"分配15m验证", available15m:"15m真实可用", eligiblePool:"数据合格", notRequested:"未分配15m", core:"核心", single:"单项突出", boundary:"边界分歧", coverage:"行业覆盖", explore:"探索" };
   const statuses = {not_planned:"未计划", planned:"已计划", requested:"已请求", available:"可用", partial:"部分可用", failed:"失败", quality_rejected:"门禁淘汰", stale:"过期", not_needed:"无需请求"};
   const taskNames = {pending_target:"等待目标日",waiting_close:"等待收盘",collecting:"采集中",retry_wait:"等待重试",partial:"部分缺失",complete:"已完整",terminal_missing:"补拉期结束",waiting_trade_date_confirmation:"等待交易日确认"};
-  const stageNames = {"15m_round1_planned":"第一轮分配", "15m_round1_requested":"第一轮请求", "15m_round1_result":"第一轮结果", "15m_round2_planned":"第二轮分配", "15m_round2_requested":"第二轮请求", "15m_result":"15m门禁与评分", "ai_batch_requested":"AI批次请求", "ai_batch":"AI批次结果", "1m_planned":"尾盘影子分配", "1m_requested":"尾盘影子请求", "1m_result":"尾盘影子结果", decision:"最终去向"};
+  const stageNames = {"15m_round1_planned":"第一轮分配", "15m_round1_requested":"第一轮请求", "15m_round1_result":"第一轮结果", "15m_round2_planned":"第二轮分配", "15m_round2_requested":"第二轮请求", "15m_result":"15m数据质量与评分", setup_validation:"交易形态验证", formal_tail_validation:"正式尾盘资格", "ai_batch_requested":"AI批次请求", "ai_batch":"AI批次结果", "1m_planned":"尾盘证据分配", "1m_requested":"尾盘证据请求", "1m_result":"尾盘证据结果", decision:"最终去向"};
   const allocationReasons = {core:"低成本综合排序靠前",single:"量能或相对强度单项突出",boundary:"初筛边界或评分分歧",coverage:"补充行业覆盖",explore:"按冻结种子从不同排名区间探索"};
   const relaxNames = {"industry15%":"行业集中度15%上限", "candidateType30%":"类型集中度30%上限", "highRisk10%":"高风险占比10%上限",group_shortage:"分组候选不足"};
   const corporateNames = {unknown:"未知",none:"无",ex_right:"除权",ex_dividend:"除息",confirmed:"已确认",suspected:"疑似"};
@@ -42,7 +42,7 @@
       archiveReady = !archive.legacy;
       $("archiveMeta").textContent = archive.legacy ? "旧版本未记录，不能倒推重建" : `${archive.total} 只 · ${archive.archiveVersion}`;
       $("archiveDetails").hidden = archive.legacy;
-      $("archiveFunnel").innerHTML = archive.legacy ? "" : archive.rounds.map((r) => `<div class="archive-round"><strong>15m · 第${esc(r.round)}轮</strong><dl class="archive-metrics">${metric("计划", r.planned)}${metric("请求", r.requested)}${metric("真实可用", r.available)}${metric("通过门禁", r.eligible)}</dl></div>`).join("");
+      $("archiveFunnel").innerHTML = archive.legacy ? "" : archive.rounds.map((r) => `<div class="archive-round"><strong>15m · 第${esc(r.round)}轮</strong><dl class="archive-metrics">${metric("计划", r.planned)}${metric("请求", r.requested)}${metric("真实可用", r.available)}${metric("数据合格", r.eligible)}${archive.selectionPolicyVersion && archive.selectionPolicyVersion !== "legacy" ? metric("形态成立", r.setupEligible) + metric("正式证据通过", r.formalEligible) : ""}</dl></div>`).join("");
       loadPage();
     } catch (error) {
       if (current(g)) {
@@ -103,7 +103,7 @@
       if (!current(g) || version !== tableVersion) return;
       total = data.total;
       $("archiveRows").innerHTML = data.items.map((x) => {
-        const decision = [x.officialSelected && "正式", x.ruleShadowSelected && "规则影子", x.aiShadowSelected && "AI影子", x.semifinalSelected && "半决赛"].filter(Boolean).join(" / ") || (x.qualityEligible ? "合格待选" : "研究观察");
+        const decision = [x.officialSelected && "正式", x.ruleShadowSelected && "规则影子", x.aiShadowSelected && "AI影子", x.semifinalSelected && "半决赛"].filter(Boolean).join(" / ") || (x.setupEligible ? "形态成立，待选" : x.qualityEligible ? "数据合格，形态未确认" : "研究观察");
         return `<tr><td><strong>${esc(x.name)}</strong><small>${esc(x.code)}</small></td><td>#${x.preliminaryScoreRank} / ${Number(x.preliminaryScore).toFixed(1)}</td><td>${esc(names[x.primaryGroup] || "未分配")}<small>${x.allocationRound ? `第${x.allocationRound}轮` : "--"}</small></td><td>${esc(statuses[x.minute15mStatus] || x.minute15mStatus)} / ${esc(statuses[x.minute1mStatus] || x.minute1mStatus)}</td><td>${esc(decision)}</td><td>${pct(x.nextDay?.openProxyReturnPct)}</td><td>${pct(x.nextDay?.closeProxyReturnPct)}</td><td><button type="button" class="secondary-button" data-candidate="${esc(x.code)}">查看</button></td></tr>`;
       }).join("") || '<tr><td colspan="8">无符合条件的候选。</td></tr>';
       $("archivePageMeta").textContent = `第 ${page} / ${Math.max(1, Math.ceil(total / 50))} 页 · ${total} 只`;
@@ -156,7 +156,9 @@
       $("archiveEvidence").hidden = false;
       const metric = c.nextDay || {};
       const daily = metric.dailyBar || {};
+      const qualification = c.selectionPolicyVersion ? `<section class="archive-note"><strong>本次筛选依据</strong><p>数据${c.dataEligible ? "可用" : "不足"} · 形态${c.setupEligible ? "成立" : "未成立"} · 正式证据${c.formalEligible ? "通过" : "未通过或未检查"}</p><p>${esc((c.formalExclusionReasons || c.setupEvidence?.reasons || []).join("；") || "必要形态已确认，仍以正式最终去向为准")}</p><p>形态：${esc((c.verifiedCandidateTypes || []).map((kind) => ({relative_strength_leader:"相对强势延续",vwap_support:"回踩承接",breakout_hold:"突破维持",low_reversal_intraday:"日内转强"})[kind] || "未确认").join("、"))} · 尾盘 ${esc(c.tailSupportPack?.label || "未检查/证据不足")}</p><p>评分分项 ${esc(Object.entries(c.scoreComponents || {}).map(([key,value]) => `${({liquidity:"成交规模",relativeStrength:"日内相对强度",structure:"结构",industry:"真实行业支持",tail:"尾盘承接"})[key] || key}：${value == null ? "未知" : Number(value).toFixed(1)}`).join("；"))}</p><small>冻结版本 ${esc(c.selectionPolicyVersion)}；未获120个验证名额不等于交易不合格。</small></section>` : '<p class="archive-note">旧版分类与资格口径；不能追改为新版已确认形态。</p>';
       $("archiveEvidence").innerHTML = `<h3>${esc(c.name)} ${esc(c.code)} · 冻结依据</h3><p>初筛分 ${esc(c.preliminaryScore)} · 冻结价 ${esc(c.frozenScanPrice)} · 行业 ${esc(c.industry || "身份缺失")}</p><p>分配：${esc(names[c.primaryGroup] || "未分配验证名额")} ${c.allocationRound ? `第${c.allocationRound}轮` : ""} · 依据 ${esc(reasonText(c))} · 约束放宽：${esc((c.relaxationReason || "").split(",").filter(Boolean).map((x) => relaxNames[x] || x).join("；") || "无")}</p><p>15m来源 ${esc(c.minute15mSource || "--")} · 有效点数 ${esc(c.minute15mPointCount ?? "--")} · 截止 ${esc(c.minute15mCutoff || "--")} · 真实评分 ${esc(c.verifiedScore ?? "--")} / 排名 ${esc(c.verifiedRank ?? "--")}</p><p>数据缺口：${esc(c.minute15mError || (c.dataQuality?.missing || []).join("；") || c.exclusionReason || "无")}</p><p>风险：${esc((c.riskFlags || []).join("；") || "--")}</p><p>次日 ${esc(metric.targetTradeDate || "待采集")} · 来源 ${esc(metric.dailyBarSource || "--")} · 开/高/低/收 ${[daily.open, daily.high, daily.low, daily.close].map((x) => esc(x ?? "--")).join(" / ")} · 除权状态 ${esc(corporateNames[metric.corporateActionStatus] || "未知")}</p><p>开盘/收盘代理 ${pct(metric.openProxyReturnPct)} / ${pct(metric.closeProxyReturnPct)} · 排除原因 ${esc((metric.exclusionReasons || []).join("；") || "无")}</p><p>最高机会 / 最低不利：${pct(metric.highOpportunityPct)} / ${pct(metric.lowAdversePct)} · 隔夜缺口 ${pct(metric.overnightGapPct)}</p><ol>${data.events.map((x) => `<li>${esc(x.createdAt)} · ${esc(stageNames[x.stage] || x.stage)} · ${esc(statuses[x.status] || stageNames[x.status] || x.status)}</li>`).join("")}</ol>`;
+      $("archiveEvidence").innerHTML = qualification + $("archiveEvidence").innerHTML;
     } catch (error) { if (current(g) && version === detailVersion) { $("archiveEvidence").hidden = false; $("archiveEvidence").textContent = error.message; } }
   });
   $("nextDayRetry").addEventListener("click", async () => {

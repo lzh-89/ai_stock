@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 from backend.app.database import Database
 from backend.app.engines.filter_engine import hard_filter_reason
 from backend.app.engines.scoring_engine import score_stock
+from backend.app.engines import t1_selection_policy as selection_policy
 from backend.app.engines.timing_engine import attach_plan
 from backend.app.engines.t1_candidate_allocation import (
     VERSION as T1_ALLOCATION_VERSION,
@@ -111,7 +112,7 @@ AI_RESULT_CACHE_LIMIT = 80
 AI_CALL_AUDIT_LIMIT = 24
 BASELINE_MARKET_SAMPLE_LIMIT = 60
 RANDOM_BASELINE_ITERATIONS = 30
-AI_EVIDENCE_VALIDATION_VERSION = "v4_structured_selection_slip"
+AI_EVIDENCE_VALIDATION_VERSION = "v5_formal_evidence_selection_slip"
 T1_EVIDENCE_VERSION = "v4_layered_sector_state_shadow"
 T1_TRADE_DATE_GUARD_VERSION = "v1_t1_trade_date_guard"
 T1_SECTOR_STATE_SHADOW_VERSION = "v1_t1_sector_state_shadow"
@@ -121,7 +122,7 @@ T1_TAIL_SUPPORT_SHADOW_VERSION = "v2_tail_support_shadow"
 T1_GAP_DOWN_RISK_SHADOW_VERSION = "v1_gap_down_risk_shadow"
 T1_RULE_TAIL_SHADOW_VERSION = "v1_rule_tail_shadow_top3"
 T1_DEEPSEEK_TAIL_SHADOW_VERSION = "v1_deepseek_tail_shadow_top3"
-T1_STRATEGY_POLICY_VERSION = "2026-10-13收益优化.shadow.v5"
+T1_STRATEGY_POLICY_VERSION = "2026-10-16正式推荐修复.v6"
 T1_MARKET_GATE_VERSION = "market_gate_candidate_v1"
 T1_NEGATIVE_GATE_VERSION = "negative_gate_shadow_v2"
 T1_DRIVER_TAXONOMY_VERSION = "t1_driver_taxonomy_v1"
@@ -1231,6 +1232,7 @@ class T1OvernightSelectionService:
             learning_eligible_count=learning_eligible_count,
             primary_entry_not_executable_count=int(tradeable_summary.get("primaryEntryNotExecutableCount") or 0),
             primary_minute_missing_count=int(tradeable_summary.get("primaryMinuteMissingCount") or 0),
+            primary_partial_execution_count=int(tradeable_summary.get("primaryPartialExecutionCount") or 0),
         )
         display = _review_display_meta(run, sample, outcome_status, run_role)
         ai_decision = _review_ai_decision_meta(run)
@@ -1258,6 +1260,8 @@ class T1OvernightSelectionService:
             "learningScopeLabel": learning_scope["label"],
             "learningScopeReason": learning_scope["reason"],
             "selectionMode": run.get("selectionMode") or "",
+            "selectionPolicyVersion": (run.get("market") or {}).get("selectionPolicyVersion") or "legacy",
+            "selectionScoreVersion": (run.get("market") or {}).get("selectionScoreVersion") or "legacy",
             "actualSource": run.get("actualSource") or "",
             "requestedSource": run.get("requestedSource") or "",
             "poolSize": int(run.get("poolSize") or 0),
@@ -1296,6 +1300,7 @@ class T1OvernightSelectionService:
             learning_eligible_count=learning_eligible_count,
             primary_entry_not_executable_count=int(tradeable_summary.get("primaryEntryNotExecutableCount") or 0),
             primary_minute_missing_count=int(tradeable_summary.get("primaryMinuteMissingCount") or 0),
+            primary_partial_execution_count=int(tradeable_summary.get("primaryPartialExecutionCount") or 0),
         )
         display = _review_display_meta(run, sample, outcome_status, run_role)
         ai_decision = _review_ai_decision_meta(run)
@@ -1315,6 +1320,12 @@ class T1OvernightSelectionService:
         market = run.get("market") or {}
         baseline_comparison = _review_baseline_comparison(market.get("baselineComparison") or {})
         compact_market = {
+            "selectionPolicyVersion": market.get("selectionPolicyVersion") or "legacy",
+            "selectionScoreVersion": market.get("selectionScoreVersion") or "legacy",
+            "selectionParameters": market.get("selectionParameters") or {},
+            "formalEligibilitySummary": market.get("formalEligibilitySummary") or {},
+            "selectionScopeCoverage": market.get("selectionScopeCoverage") or {},
+            "cacheStatus": market.get("cacheStatus") or {},
             "marketContext": market.get("marketContext") or {},
             "recommendationPolicy": market.get("recommendationPolicy") or {},
             "baselineComparison": baseline_comparison,
@@ -2888,9 +2899,12 @@ class T1OvernightSelectionService:
             window_runs=window_runs,
             source_run_id=source_run_id,
             trigger_source=trigger_source,
+            selection_version=selection_policy.VERSION,
         )
-        feedback["sampleAudit"] = _strategy_sample_audit(recent_outcomes, outcomes)
-        feedback["portfolio"] = self._portfolio_feedback(window_runs)
+        version_outcomes = [item for item in outcomes if _outcome_selection_version(item) == selection_policy.VERSION]
+        feedback["sampleAudit"] = _strategy_sample_audit(recent_outcomes, version_outcomes)
+        feedback["sampleAudit"]["excludedOtherVersions"] = len(outcomes) - len(version_outcomes)
+        feedback["portfolio"] = self._portfolio_feedback(window_runs, selection_version=selection_policy.VERSION)
         feedback["promptSummary"] = _feedback_prompt_summary(feedback)
         reused = bool(
             trigger_source == "manual_refresh"
@@ -2981,7 +2995,7 @@ class T1OvernightSelectionService:
         feedback = self.refresh_strategy_feedback(source_run_id=run_id, trigger_source="manual_run_role")
         return {"run": self.get_run(run_id), "feedback": feedback, "criticStatus": self.critic_status()}
 
-    def _portfolio_feedback(self, window_runs: int) -> Dict[str, Any]:
+    def _portfolio_feedback(self, window_runs: int, selection_version: str = "") -> Dict[str, Any]:
         with self.database.connect() as connection:
             rows = connection.execute(
                 """
@@ -2995,6 +3009,8 @@ class T1OvernightSelectionService:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
             run = self.database._t1_overnight_run_from_row(row)
+            if selection_version and (run.get("market") or {}).get("selectionPolicyVersion", "legacy") != selection_version:
+                continue
             if _historical_treatment_applied(run.get("market") or {}, run.get("request") or {}):
                 continue
             if _run_role(run) != "official":
@@ -3109,6 +3125,8 @@ class T1OvernightSelectionService:
         existing_archive = self.candidate_store.all(selection_run_id) if selection_run_id else []
         saved_run = (self.database.load_t1_overnight_selection_run(selection_run_id) or {}) if selection_run_id else {}
         saved_request = saved_run.get("request") or {}
+        if existing_archive and saved_request.get("selectionPolicyVersion") != selection_policy.VERSION:
+            raise RuntimeError("旧版 Run 不能在本次升级后中途切换正式评分，请保留原档案并新建 Run。")
         if existing_archive and saved_request.get("poolCandidateCodes"):
             saved_items = {x["code"]: x.get("item") or x.get("pick") for x in self.database.load_t1_overnight_selection_items(selection_run_id)}
             pool_codes = saved_request["poolCandidateCodes"]
@@ -3137,21 +3155,31 @@ class T1OvernightSelectionService:
         market_context["stageControls"] = stage_controls
         market["tradeDateStatus"] = trade_date_status
         market["stageControls"] = stage_controls
+        market["selectionPolicyVersion"] = selection_policy.VERSION
+        market["selectionScoreVersion"] = selection_policy.VERSION
+        market["selectionParameters"] = copy.deepcopy(selection_policy.PARAMETERS)
         if stage_callback:
             stage_callback()
         filtered = self.analysis_service._apply_scope(raw_stocks, "all")
         hard_filtered: List[RawStock] = []
+        hard_filter_counts = {}
         for stock in filtered:
-            allowed, _ = hard_filter_reason(
+            allowed, filter_reason = hard_filter_reason(
                 stock,
                 include_bse=self.settings.include_bse,
                 include_star_market=self.settings.include_star_market,
             )
             if not allowed:
+                label = str(filter_reason or "不满足交易范围")
+                hard_filter_counts[label] = hard_filter_counts.get(label, 0) + 1
                 continue
             if stock.limit_status in {"down", "limit_down", "one_word_limit_down"}:
+                hard_filter_counts["跌停或一字跌停"] = hard_filter_counts.get("跌停或一字跌停", 0) + 1
                 continue
             hard_filtered.append(stock)
+        market["selectionScopeCoverage"] = {"received": len(raw_stocks), "scoped": len(filtered),
+            "hardFiltered": len(hard_filtered), "excludedReasons": hard_filter_counts,
+            "meaning": "实际收到行情中适合本策略的数量，不代表全市场采集覆盖率"}
         identities = self.database.load_t1_stock_sector_identity_cache([stock.code for stock in hard_filtered])
         cheap = [preliminary_candidate(stock, {"industry": (identities.get(stock.code) or {}).get("industrySector")})
                  for stock in hard_filtered]
@@ -3187,7 +3215,9 @@ class T1OvernightSelectionService:
                     roundQuotas=[{"core":45,"single":15,"boundary":10,"coverage":7,"explore":3},
                     {"core":10,"single":5,"boundary":10,"coverage":8,"explore":7}],
                     concentrationLimits={"industry":.15,"candidateType":.30,"highRisk":.10},
-                    minuteBudgets={"15m":T1_MINUTE_MAX_CODES,"1m":T1_TAIL_MINUTE_MAX_CODES})
+                    minuteBudgets={"15m":T1_MINUTE_MAX_CODES,"1m":T1_TAIL_MINUTE_MAX_CODES},
+                    selectionPolicyVersion=selection_policy.VERSION, selectionScoreVersion=selection_policy.VERSION,
+                    selectionParameters=copy.deepcopy(selection_policy.PARAMETERS))
                 self.database.update_t1_overnight_selection_run(selection_run_id, {"request": saved_request})
                 self.candidate_store.update(selection_run_id, round_one, "15m_round1_planned")
             self.candidate_store.update(selection_run_id,
@@ -3216,10 +3246,15 @@ class T1OvernightSelectionService:
             series = clip_minute_series(row.get("series") or [], recommendation_date, scan_time, "15m")
             stock.kline_series, stock.kline_source, stock.kline_period = series, str(row.get("source") or ""), "15m"
             base = attach_plan(score_stock(stock, risk_mode=risk_mode), scan_time=scan_time) if len(series) >= 8 else item
+            base.update(amount=stock.amount, featureProvenance=selection_policy.provenance(stock, provider.source),
+                        quoteAsOfTime=stock.quote_time, quoteTradeDate=stock.trade_date)
             evaluated = _apply_data_quality(_annotate_t1_candidate(base, scan_time=scan_time,
                 market_context=market_context, sector_evidence=sector_evidence_by_code.get(item["code"])), provider.source, market)
             first_feedback[item["code"]] = dict(series=series,
                 qualityEligible=bool((evaluated.get("dataQuality") or {}).get("eligibleForRealTop")),
+                setupEligible=evaluated.get("setupEligible"), setupStatus=evaluated.get("setupStatus"),
+                confirmedTypes=(evaluated.get("setupEvidence") or {}).get("confirmedTypes") or [],
+                failureReasons=(evaluated.get("setupEvidence") or {}).get("reasons") or [],
                 verifiedScore=evaluated.get("t1Score") or 0,
                 scoreDisagreement=(evaluated.get("t1Score") or 0) - item["preliminaryScore"])
         if selection_run_id:
@@ -3267,6 +3302,8 @@ class T1OvernightSelectionService:
         rescored = []
         for stock, original in preliminary:
             base = attach_plan(score_stock(stock, risk_mode=risk_mode), scan_time=scan_time) if len(stock.kline_series) >= 8 else original
+            base.update(amount=stock.amount, featureProvenance=selection_policy.provenance(stock, provider.source),
+                        quoteAsOfTime=stock.quote_time, quoteTradeDate=stock.trade_date)
             annotated = _annotate_t1_candidate(
                 base,
                 scan_time=scan_time,
@@ -3274,8 +3311,6 @@ class T1OvernightSelectionService:
                 sector_evidence=sector_evidence_by_code.get(_normalize_code(stock.code)),
             )
             if len(stock.kline_series) < 8:
-                annotated["candidateTypes"] = original["candidateTypes"]
-                annotated["candidateType"] = original["candidateTypes"][0]
                 annotated["t1Dimensions"]["intradayStructure"] = None
                 annotated["t1Dimensions"]["intradayStructureStatus"] = "unavailable"
             enriched = _apply_data_quality(annotated, provider.source, market)
@@ -3284,7 +3319,7 @@ class T1OvernightSelectionService:
             if allocation:
                 for key in ("primaryGroup", "groupTags", "allocationRound", "allocationPriority",
                             "allocationReason", "relaxationReason", "preliminaryScore",
-                            "preliminaryScoreRank", "recallRank", "industry"):
+                            "preliminaryScoreRank", "recallRank", "industry", "opportunityFeedback"):
                     enriched[key] = allocation.get(key)
                 enriched["minute15mRequested"] = provider.source != "mock"
                 enriched["minute15mAvailable"] = bool((minute_by_code.get(code) or {}).get("series"))
@@ -3317,11 +3352,11 @@ class T1OvernightSelectionService:
         verified = [item for item in ranked if item.get("minute15mAvailable")]
         for index, item in enumerate(sorted(verified, key=lambda x: (-float(x.get("t1Score") or 0), x.get("code") or "")), 1):
             item["verifiedRank"] = index
-        selection_ranked = [item for item in ranked if (item.get("dataQuality") or {}).get("eligibleForRealTop")]
+        selection_ranked = [item for item in ranked if item.get("dataEligible") and item.get("setupEligible")]
         if selection_run_id:
             self.candidate_store.update(selection_run_id, [dict(code=item["code"],
                 minute15mStatus=item["minute15mStatus"], minute15mRequested=item["minute15mRequested"],
-                minute15mAvailable=item["minute15mAvailable"], qualityEligible=item in selection_ranked,
+                minute15mAvailable=item["minute15mAvailable"], qualityEligible=bool(item.get("dataEligible")),
                 verifiedRank=item["verifiedRank"], verifiedScore=item.get("t1Score") if item["verifiedRank"] else None,
                 minute15mSource=(minute_by_code.get(item["code"]) or {}).get("source", ""),
                 minute15mPointCount=len((minute_by_code.get(item["code"]) or {}).get("series") or []),
@@ -3329,6 +3364,15 @@ class T1OvernightSelectionService:
                 minute15mCutoff=f"{recommendation_date}T{scan_time}", dataQuality=item.get("dataQuality"),
                 exclusionReason="未分配15m验证名额" if not item.get("allocationRound") else "",
                 verifiedCandidateTypes=item.get("candidateTypes")) for item in ranked], "15m_result")
+            self.candidate_store.update(selection_run_id, [dict(code=item["code"],
+                dataEligible=item.get("dataEligible"), setupStatus=item.get("setupStatus"),
+                setupEligible=item.get("setupEligible"), setupEvidence=item.get("setupEvidence"),
+                selectionPolicyVersion=item.get("selectionPolicyVersion"), scoreComponents=item.get("scoreComponents"),
+                featureProvenance=item.get("featureProvenance"),
+                exclusionReason="未分配15m验证名额" if not item.get("allocationRound") else
+                    "数据不合格" if not item.get("dataEligible") else
+                    "；".join((item.get("setupEvidence") or {}).get("reasons") or []) if not item.get("setupEligible") else "")
+                for item in ranked], "setup_validation")
         data_quality_stats = _data_quality_stats(ranked)
         evidence_request = dict(evidence_run.get("request") or {})
         evidence_request.update(minuteCodes=minute_layer_codes, minuteCandidateCount=len(minute_layer_codes), allocationVersion=T1_ALLOCATION_VERSION)
@@ -3354,7 +3398,8 @@ class T1OvernightSelectionService:
         market["validationAllocation"] = {"version": T1_ALLOCATION_VERSION, "seed": seed,
             "rounds": [{"round": n, "planned": len(rows), "requested": len(rows) if provider.source != "mock" else 0,
                 "available": sum(bool((minute_by_code.get(x["code"]) or {}).get("series")) for x in rows),
-                "eligible": sum(x.get("allocationRound") == n for x in selection_ranked)}
+                "eligible": sum(x.get("allocationRound") == n and bool(x.get("dataEligible")) for x in ranked),
+                "setupEligible": sum(x.get("allocationRound") == n for x in selection_ranked)}
                 for n, rows in ((1, round_one), (2, round_two))],
             "distinctPlanned": len(set(minute_layer_codes)), "budget": T1_MINUTE_MAX_CODES,
             "tail1m": {"planned": 0, "status": "waiting_for_ai_batch"}}
@@ -4501,6 +4546,26 @@ class T1OvernightSelectionService:
                         },
                     )
                 )
+                if candidate.get("selectionPolicyVersion") == selection_policy.VERSION:
+                    tail = dict(candidate.get("tailSupportShadow") or {})
+                    tail["actualLastTime"] = str((row["series"][-1] if row["series"] else {}).get("time") or "")
+                    tail.update(source=row.get("source"), tradeDate=run.get("recommendationDate"),
+                        vwapMethod="amount_volume_if_units_match_else_close_volume_estimate")
+                    selection_policy.formal_tail(candidate, tail, scan)
+        if market.get("selectionPolicyVersion") == selection_policy.VERSION:
+            for candidate in pool + semifinal:
+                if candidate["code"] not in codes:
+                    selection_policy.formal_tail(candidate, {}, scan)
+            self.candidate_store.update(run_id, [dict(code=c["code"], formalEligible=c.get("formalEligible", False),
+                formalExclusionReasons=c.get("formalExclusionReasons") or [], tailSupportPack=c.get("tailSupportPackV2") or {},
+                finalScore=c.get("t1Score"), scoreComponents=c.get("scoreComponents"))
+                for c in pool], "formal_tail_validation")
+            if semifinal:
+                self.database.upsert_t1_overnight_selection_items(run_id, semifinal, stage="semifinal")
+            market["formalEligibilitySummary"] = {"version": selection_policy.VERSION,
+                "semifinalCount": len(semifinal), "eligibleCount": sum(bool(c.get("formalEligible")) for c in semifinal),
+                "rejected": [{"code": c["code"], "reasons": c.get("formalExclusionReasons") or []}
+                             for c in semifinal if not c.get("formalEligible")]}
         market["baselineGroups"]["tailSupportShadow"] = _tail_support_shadow_top_picks(pool, DEFAULT_FINAL_LIMIT)
         market["shadowTop3"]["picks"] = [dict(x) for x in market["baselineGroups"]["tailSupportShadow"]]
         market["shadowTop3"].update(candidateScope="dynamic_1m_after_batch", candidateCount=len(codes))
@@ -4618,6 +4683,8 @@ class T1OvernightSelectionService:
                 "error": "AI 未配置，跳过 DeepSeek 尾盘影子终选。",
             }
         shadow_candidates = [_with_tail_shadow_prompt_evidence(item) for item in candidates or []]
+        for candidate in shadow_candidates:
+            candidate.pop("selectionPolicyVersion", None)
         shadow_candidates = [
             item
             for item in shadow_candidates
@@ -4633,10 +4700,11 @@ class T1OvernightSelectionService:
             }
         shadow_market = copy.deepcopy(market or {})
         shadow_market["shadowSelectionMode"] = "deepseek_tail_shadow"
+        shadow_market.pop("selectionPolicyVersion", None)
         picks, error = self._select_with_ai(shadow_candidates, shadow_market, limit, stage="final", batch_index=-901)
         ai_zero_pick = bool(not picks and not error and ((shadow_market.get("lastAiZeroPick") or {}).get("stage") == "final"))
         selected = _apply_picks(shadow_candidates, picks, limit=limit, batch_index=-901)
-        selected = _apply_final_guardrails(selected, market, limit)
+        selected = _apply_final_guardrails(selected, shadow_market, limit)
         for rank, item in enumerate(selected, start=1):
             item["aiRank"] = rank
             item["rank"] = rank
@@ -4668,7 +4736,13 @@ class T1OvernightSelectionService:
     ) -> tuple[List[Dict[str, Any]], str]:
         if not candidates or limit <= 0:
             return [], ""
+        controls = market.get("stageControls") or {}
+        if not _stage_control_enabled(controls, "sectorStatePrompt", T1_SECTOR_STATE_PROMPT_ENABLED):
+            candidates = [_without_shadow_sector_prompt_fields(c) for c in candidates]
         system_content = _role_prompt(stage)
+        if not _stage_control_enabled(controls, "sectorStatePrompt", T1_SECTOR_STATE_PROMPT_ENABLED):
+            system_content = system_content.replace(
+                "sectorStateShadow 若出现在输入中，是系统阶段1影子计算结果；你只能引用该状态，不能自行计算或猜测行业退潮、轮入、派发、过热。", "")
         feedback = self.latest_strategy_feedback() if stage == "final" else {}
         base_user_content = _user_prompt(
             candidates,
@@ -4677,6 +4751,16 @@ class T1OvernightSelectionService:
             stage,
             feedback,
         )
+        if len(base_user_content) + len(system_content) > 110000:
+            market.setdefault("aiContextBudget", []).append({"stage": stage, "candidateCount": len(candidates),
+                "characters": len(base_user_content) + len(system_content), "limit": 110000, "action": "stable_split" if stage == "batch" else "reject"})
+            if stage != "batch" or len(candidates) < 2:
+                return [], "AI 上下文超过预算，未截断证据，停止本次选择。"
+            split = len(candidates) // 2
+            left_limit = max(1, round(limit * split / len(candidates)))
+            left, left_error = self._select_with_ai(candidates[:split], market, left_limit, stage, batch_index)
+            right, right_error = self._select_with_ai(candidates[split:], market, max(1, limit-left_limit), stage, batch_index)
+            return _unique_by_code(left + right)[:limit], "；".join(e for e in [left_error, right_error] if e)
         fingerprint = _ai_input_fingerprint(
             provider=self.settings.ai_provider,
             model=self.settings.ai_model,
@@ -4688,11 +4772,6 @@ class T1OvernightSelectionService:
         cached_picks = self._cached_ai_picks(fingerprint)
         if cached_picks is not None:
             cached_validation = _validate_ai_picks_evidence(cached_picks, candidates, stage)
-            if not cached_validation.get("valid"):
-                partial_cached_validation = _partial_ai_pick_validation(cached_picks, candidates, stage)
-                if partial_cached_validation.get("valid"):
-                    cached_validation = partial_cached_validation
-                    cached_picks = partial_cached_validation.get("picks") or []
             if not cached_validation.get("valid"):
                 _record_ai_call_audit(
                     market,
@@ -4759,7 +4838,10 @@ class T1OvernightSelectionService:
 
         last_error = ""
         validation_feedback = ""
-        for attempt in range(1, 3):
+        locked_picks = []
+        repair_codes = None
+        validation_errors = []
+        for attempt in range(1, 4):
             user_content = base_user_content
             current_fingerprint = fingerprint
             if validation_feedback:
@@ -4768,9 +4850,10 @@ class T1OvernightSelectionService:
                     "上一次输出未通过后端证据校验，请修正后只输出 JSON。"
                     "只输出 picks，每个 pick 只包含 code、rank、supportingEvidenceRefs、counterEvidenceRefs、decisionTags、confidence。"
                     "不要输出 reason/strategyHypothesis/buyPlan/sellPlan/risk/entryCondition/invalidCondition/marketFit/sectorFit/confidenceReason。"
-                    "如果不能确认板块状态，就删除 sector_state_supported 标签；如果引用板块状态，supportingEvidenceRefs 必须包含可用的 S2。"
+                    "只使用逐股允许的标签和可用引用，删除不被证据支持的标签。"
                     "不要写板块资金、主力净流入、资金共振、行业前排等自然语言结论。"
                     f"校验错误：{validation_feedback}"
+                    f"\n仅修复这些原始不合格代码：{json.dumps(sorted(repair_codes or []))}；已通过代码不可改写，不得新增原输出以外代码；不支持的候选可以删除。"
                 )
                 current_fingerprint = _ai_input_fingerprint(
                     provider=self.settings.ai_provider,
@@ -4807,6 +4890,7 @@ class T1OvernightSelectionService:
                 with urllib.request.urlopen(request, timeout=T1_TIMEOUT_SECONDS) as response:
                     data = json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as error:
+                market["aiEvidenceValidationStatus"] = "network_failure"
                 _record_ai_call_audit(
                     market,
                     {
@@ -4826,8 +4910,11 @@ class T1OvernightSelectionService:
                         "prompt": user_content,
                     },
                 )
+                if locked_picks:
+                    break
                 return [], _http_error_message(error)
             except (urllib.error.URLError, TimeoutError, socket.timeout, http.client.IncompleteRead, json.JSONDecodeError) as error:
+                market["aiEvidenceValidationStatus"] = "network_failure"
                 last_error = f"{self.settings.ai_provider} T+1 超短线筛选调用失败：{error}"
                 LOGGER.warning(
                     "t1 overnight call failed stage=%s batch=%s attempt=%s elapsed_ms=%.0f error=%s",
@@ -4859,8 +4946,22 @@ class T1OvernightSelectionService:
                 )
                 continue
             content = _extract_chat_content(data)
-            picks = _extract_picks(content)
+            try:
+                envelope = json.loads(content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip())
+                envelope_ok = (isinstance(envelope, dict) and isinstance(envelope.get("picks"), list)
+                    and all(isinstance(p, dict) for p in envelope["picks"]))
+            except (ValueError, TypeError):
+                envelope_ok = False
+            picks = envelope["picks"] if envelope_ok else []
             validation = _validate_ai_picks_evidence(picks, candidates, stage)
+            if not envelope_ok:
+                validation = {"valid": False, "status": "parse_failure", "errors": ["返回内容不包含合法 picks 数组"]}
+            if repair_codes is not None and envelope_ok:
+                unauthorized = [_normalize_code(p.get("code")) for p in picks if _normalize_code(p.get("code")) not in repair_codes]
+                picks = [p for p in picks if _normalize_code(p.get("code")) in repair_codes]
+                validation = _validate_ai_picks_evidence(picks, candidates, stage)
+                if unauthorized:
+                    validation = {"valid": False, "status": "failed", "errors": ["修复返回了原不合格名单以外代码，已拒绝"]}
             effective_picks = picks
             effective_validation = validation
             if picks and not validation.get("valid"):
@@ -4868,6 +4969,13 @@ class T1OvernightSelectionService:
                 if partial_validation.get("valid"):
                     effective_picks = partial_validation.get("picks") or []
                     effective_validation = partial_validation
+            accepted = effective_picks if effective_validation.get("valid") else []
+            accepted_codes = {_normalize_code(p.get("code")) for p in accepted}
+            locked_picks = _unique_by_code(locked_picks + accepted)[:limit]
+            failed_codes = {_normalize_code(p.get("code")) for p in picks if _normalize_code(p.get("code")) not in accepted_codes}
+            validation_errors = _unique_strings(validation_errors + list(validation.get("errors") or []))
+            if envelope_ok and (failed_codes or not effective_validation.get("valid")):
+                repair_codes = failed_codes if repair_codes is None else repair_codes - accepted_codes
             LOGGER.info(
                 "t1 overnight call ok stage=%s batch=%s attempt=%s elapsed_ms=%.0f picks=%s accepted=%s content_len=%s evidence_valid=%s validation_status=%s",
                 stage,
@@ -4886,6 +4994,8 @@ class T1OvernightSelectionService:
                     "stage": stage,
                     "batchIndex": batch_index,
                     "attempt": attempt,
+                    "repairAttempt": max(0, attempt-1), "lockedPickCount": len(locked_picks),
+                    "repairCodes": sorted(repair_codes or []),
                     "provider": self.settings.ai_provider,
                     "model": self.settings.ai_model,
                     "temperature": 0,
@@ -4904,7 +5014,11 @@ class T1OvernightSelectionService:
                     "rawResponse": content,
                 },
             )
-            if effective_validation.get("valid") and effective_validation.get("status") == "zero_pick":
+            if effective_validation.get("valid") and effective_validation.get("status") == "zero_pick" and not locked_picks:
+                if repair_codes is not None:
+                    market["aiEvidenceValidationStatus"] = "repair_exhausted"
+                    market["aiEvidenceValidationErrors"] = validation_errors
+                    return [], "原输出全部证据校验不合格，修复未产生有效结果；不计为正常空仓。"
                 market["aiEvidenceValidationStatus"] = "zero_pick"
                 market["aiEvidenceValidationErrors"] = []
                 market["lastAiZeroPick"] = _ai_zero_pick_meta(stage, batch_index, len(candidates), limit, cached=False)
@@ -4923,12 +5037,19 @@ class T1OvernightSelectionService:
                     },
                 )
                 return [], ""
-            if effective_picks and effective_validation.get("valid"):
+            if locked_picks and effective_validation.get("valid"):
+                if failed_codes and attempt < 3:
+                    validation_feedback = "；".join(validation.get("errors") or [])
+                    continue
+                effective_picks = locked_picks
+                effective_validation.update(acceptedPickCount=len(locked_picks), repairAttempts=attempt-1,
+                    errors=validation_errors, status="partial_passed" if failed_codes else
+                    "repaired" if attempt > 1 else effective_validation.get("status"))
                 clean_picks = _attach_ai_validation_to_picks(effective_picks, effective_validation)
                 market["aiEvidenceValidationStatus"] = effective_validation.get("status") or "passed"
                 market["aiEvidenceValidationErrors"] = effective_validation.get("errors") or []
                 self._save_ai_picks_cache(
-                    current_fingerprint,
+                    fingerprint,
                     clean_picks,
                     {
                         "stage": stage,
@@ -4956,6 +5077,15 @@ class T1OvernightSelectionService:
                 continue
             LOGGER.warning("t1 overnight invalid_json stage=%s batch=%s preview=%s", stage, batch_index, content[:500].replace("\n", " "))
             last_error = f"{self.settings.ai_provider} 返回内容不是有效 T+1 选股 JSON"
+            market["aiEvidenceValidationStatus"] = "parse_failure"
+            market["aiEvidenceValidationErrors"] = validation.get("errors") or []
+        if locked_picks:
+            validation = {"version": AI_EVIDENCE_VALIDATION_VERSION, "valid": True,
+                "status": "partial_passed", "errors": validation_errors,
+                "acceptedPickCount": len(locked_picks), "repairAttempts": 2}
+            market["aiEvidenceValidationStatus"] = "partial_passed"
+            market["aiEvidenceValidationErrors"] = validation_errors
+            return _attach_ai_validation_to_picks(locked_picks, validation), ""
         if last_error.startswith("AI 输出证据校验失败"):
             market["aiEvidenceValidationStatus"] = "failed"
         return [], last_error
@@ -6728,6 +6858,7 @@ def _annotate_t1_candidate(
     volume_ratio = float(item.get("volumeRatio") or 0)
     rel_strength = float(item.get("relStrength") or 0)
     risk_penalty = float(dimensions.get("riskPenalty") or 0)
+    risk_penalty = len(item.get("riskFlags") or []) * 4 + max(0, float(item.get("turnover") or 0) - 12)
     score = float(item.get("score") or 0)
     semantics = _sector_semantics(item, sector_evidence)
     market_context = market_context or {}
@@ -6807,16 +6938,39 @@ def _annotate_t1_candidate(
         "sectorStateAffectsScore": bool(sector_state_downgrade),
         "sectorStateDowngradeMode": ((stage_controls.get("sectorRetreatDowngrade") or {}).get("mode") or "off"),
     }
+    industry_available = _t1_layer_available(_sector_layers_from_evidence(item.get("sectorEvidence") or {},
+        str(item.get("industrySector") or ""), list(item.get("conceptSectors") or [])), "sectorSnapshot")
+    item = selection_policy.annotate(item, sector_strength if industry_available else None)
     item["evidenceRefs"] = _candidate_evidence_refs(item, market_context)
+    item["evidenceRefs"].append({"id": "P1", "type": "confirmed_setup", "status": "available" if item.get("setupEligible") else "unavailable",
+        "summary": f"{item['candidateTypeLabel']}；结构状态{item['setupStatus']}；{';'.join((item.get('setupEvidence') or {}).get('reasons') or [])}"})
+    setup_as_of = str((item.get("setupEvidence") or {}).get("asOfTime") or "")
+    quote_as_of = str(item.get("quoteAsOfTime") or item.get("quoteTime") or "")
+    cutoff_date = setup_as_of[:10] or str(item.get("quoteTradeDate") or "")
+    cutoff = f"{cutoff_date}T{scan_time[:5]}:59" if cutoff_date else ""
+    sector = item.get("sectorEvidence") or {}
+    for ref in item["evidenceRefs"]:
+        ref.update(version=selection_policy.VERSION, scanCutoff=cutoff)
+        if ref["id"] == "P1":
+            ref.update(source=item.get("klineSource") or "unavailable", asOfTime=setup_as_of)
+        elif ref["id"] in {"S1", "S2"}:
+            ref.update(source=sector.get("source") or "unavailable", asOfTime=sector.get("asOfTime") or "")
+        else:
+            ref.update(source="frozen_quote" if ref["id"] in {"Q1", "B1"} else "frozen_rule_context",
+                       asOfTime=quote_as_of if ref["id"] == "Q1" else setup_as_of)
     risk_profile = _risk_profile(item)
     item["riskProfile"] = risk_profile
     item["riskProfileKey"] = risk_profile["key"]
     item["riskProfileLabel"] = risk_profile["label"]
-    candidate_types = _candidate_types(item)
+    candidate_types = item["candidateTypes"]
     item["candidateTypes"] = candidate_types
     item["candidateType"] = candidate_types[0]
-    item["candidateTypeLabel"] = _candidate_type_label(item["candidateType"])
+    item["candidateTypeLabel"] = selection_policy.SETUP_LABELS.get(item["candidateType"], "形态未确认")
     item["scanTime"] = scan_time
+    item["buyWindow"] = "14:30-14:50"
+    item["sellWindow"] = "下一交易日开盘后15分钟"
+    item["buyTrigger"] = "形态成立、真实尾盘证据和正式守门同时通过后，按发布后可执行价格验证"
+    item["invalidCondition"] = "形态失效、尾盘持续卖压未恢复或必要证据不足，不进入正式推荐"
     return item
 
 
@@ -7002,8 +7156,11 @@ def _tail_support_shadow(candidate: Dict[str, Any], minute_series: List[Dict[str
             max_drawdown = drawdown
 
     def window_change(count: int) -> Optional[float]:
-        window = tail_rows[-count:]
-        if len(window) < 2:
+        last_minute = _minute_time(tail_rows[-1]) or "00:00"
+        last_index = int(last_minute[:2]) * 60 + int(last_minute[3:5])
+        window = [r for r in tail_rows if 0 <= last_index - (
+            int((_minute_time(r) or "00:00")[:2]) * 60 + int((_minute_time(r) or "00:00")[3:5])) < count]
+        if len({_minute_time(r) for r in window}) < count:
             return None
         start = _safe_number(window[0].get("close") or window[0].get("open"))
         end = _safe_number(window[-1].get("close") or window[-1].get("open"))
@@ -7012,6 +7169,10 @@ def _tail_support_shadow(candidate: Dict[str, Any], minute_series: List[Dict[str
     change_3m = window_change(3)
     change_5m = window_change(5)
     change_10m = window_change(10)
+    last_time = _minute_time(tail_rows[-1]) or "00:00"
+    last_index = int(last_time[:2]) * 60 + int(last_time[3:5])
+    recent_five = [r for r in tail_rows if 0 <= last_index - (
+        int((_minute_time(r) or "00:00")[:2]) * 60 + int((_minute_time(r) or "00:00")[3:5])) < 5]
 
     sell_pressure = 0
     longest_sell_pressure = 0
@@ -7124,6 +7285,8 @@ def _tail_support_shadow(candidate: Dict[str, Any], minute_series: List[Dict[str
         "score": score,
         "minuteUsableAsOfTime": minute_usable_time,
         "pointCount": len(tail_rows),
+        "recent5MinuteCount": len({_minute_time(r) for r in recent_five}),
+        "recent5VolumePointCount": sum((_safe_number(r.get("volume")) or 0) > 0 for r in recent_five),
         "tailChangePct": tail_change,
         "tailPullbackPct": max_drawdown,
         "tailMaxDrawdownPct": max_drawdown,
@@ -7483,7 +7646,7 @@ def _overnight_risk_score(
             add("真实行业/概念涨停扩散不足", 4, "limitUpCount=0")
 
     if change >= 7.5 and amount_factor >= 1.6:
-        add("高位放量隔夜兑现", 10, f"change={change:.2f}, amountFactor={amount_factor:.2f}")
+        add("高位活跃隔夜兑现", 10, f"change={change:.2f}, 横向成交活跃代理={amount_factor:.2f}，不是自身放量")
     elif change >= 6:
         add("涨幅偏高次日低开风险", 6, f"change={change:.2f}")
 
@@ -7586,7 +7749,7 @@ def _candidate_evidence_refs(candidate: Dict[str, Any], market_context: Dict[str
             "id": "Q1",
             "type": "quote",
             "status": "available",
-            "summary": f"实时快照：涨跌幅 {candidate.get('change')}%，量比 {candidate.get('volumeRatio')}，成交额强度 {candidate.get('amountFactor')}。",
+            "summary": f"实时快照：涨跌幅 {candidate.get('change')}%；成交额 {candidate.get('amount')}。量比/成交额强度若为代理，只代表估算活跃度，不代表自身历史放量或资金净流入。",
         },
         {
             "id": "M1",
@@ -7784,6 +7947,7 @@ def _apply_data_quality(candidate: Dict[str, Any], snapshot_source: str, market:
     }
     if grade in {"C", "D", "E"}:
         item["researchOnly"] = True
+    item["dataEligible"] = item["dataQuality"]["eligibleForRealTop"]
     return item
 
 
@@ -9331,12 +9495,60 @@ def _prompt_contract(stage: str) -> Dict[str, Any]:
 
 
 def _compact_candidate_for_prompt(candidate: Dict[str, Any], stage: str, include_sector_state: bool) -> Dict[str, Any]:
+    if candidate.get("selectionPolicyVersion") == selection_policy.VERSION:
+        clean = candidate if include_sector_state else _without_shadow_sector_prompt_fields(candidate)
+        item = _compact_batch_candidate(clean, include_sector_state=include_sector_state)
+        # One shared compact contract for batch/final; no series, debug objects,
+        # historical stock snapshots or repeated shadow packs in the AI context.
+        item.update(selectionPolicyVersion=selection_policy.VERSION,
+                    setupEvidence=candidate.get("setupEvidence") or {},
+                    qualifications={"dataEligible": candidate.get("dataEligible"),
+                        "setupEligible": candidate.get("setupEligible"), "formalEligible": candidate.get("formalEligible"),
+                        "formalExclusionReasons": candidate.get("formalExclusionReasons") or []},
+                    scoreComponents=candidate.get("scoreComponents") or {},
+                    featureProvenance=candidate.get("featureProvenance") or {},
+                    evidenceRefs=clean.get("evidenceRefs") or [],
+                    allowedDecisionTags=_available_decision_tags(clean))
+        item["scorePack"]["fundStrengthLabel"] = "成交活跃度，非资金净流入"
+        item["qualityPack"] = {key: item["qualityPack"].get(key) for key in
+            ("grade", "label", "eligibleForRealTop", "reasons")}
+        if stage == "final":
+            item["tailSupportPack"] = candidate.get("tailSupportPackV2") or {}
+        return item
     if stage == "batch":
         return _compact_batch_candidate(candidate, include_sector_state=include_sector_state)
     item = _compact_candidate(candidate)
     if not include_sector_state:
         return _without_shadow_sector_prompt_fields(item)
     return item
+
+
+def _available_decision_tags(candidate):
+    tags = {"market_fit", "counter_risk_accepted", "avoid_chase"}
+    refs = {r.get("id"): r for r in candidate.get("evidenceRefs") or [] if isinstance(r, dict)}
+    if (candidate.get("dataQuality") or {}).get("eligibleForRealTop"):
+        tags.add("data_quality_ok")
+    if (candidate.get("tradeability") or {}).get("level") not in {"not-buyable", "hard-to-buy", "hard-to-sell"}:
+        tags.add("liquidity_ok")
+    if (candidate.get("t1Dimensions") or {}).get("overnightRisk") is not None and float((candidate.get("t1Dimensions") or {})["overnightRisk"]) < 55:
+        tags.add("low_overnight_risk")
+    if "vwap_support" in (candidate.get("setupEvidence") or {}).get("confirmedTypes", []):
+        tags.add("vwap_support")
+    if refs.get("T1", {}).get("status") == "available" and (candidate.get("tailSupportPackV2") or {}).get("status") == "supported":
+        tags.add("tail_support")
+    layers = _sector_layers_from_evidence(candidate.get("sectorEvidence") or {},
+        candidate.get("industrySector") or "", candidate.get("conceptSectors") or [])
+    if _t1_layer_available(layers, "identity"):
+        tags.add("sector_identity_available")
+    if _t1_layer_available(layers, "sectorSnapshot"):
+        tags.add("sector_snapshot_available")
+    if refs.get("S2", {}).get("status") == "available":
+        tags.add("sector_state_supported")
+    # volume_confirmed requires a true historical same-clock ratio, not a proxy.
+    meta = (candidate.get("featureProvenance") or {}).get("volumeRatio") or {}
+    if meta.get("isProxy") is False and meta.get("status") == "available":
+        tags.add("volume_confirmed")
+    return sorted(tags)
 
 
 def _compact_batch_candidate(candidate: Dict[str, Any], include_sector_state: bool) -> Dict[str, Any]:
@@ -9548,7 +9760,7 @@ def _compact_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _without_shadow_sector_prompt_fields(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    item = dict(candidate)
+    item = copy.deepcopy(candidate)
     for key in (
         "sectorStateShadow",
         "sectorStateLabel",
@@ -9594,6 +9806,17 @@ def _without_shadow_sector_prompt_fields(candidate: Dict[str, Any]) -> Dict[str,
     ):
         dimensions.pop(key, None)
     item["t1Dimensions"] = dimensions
+    # Remove nested state explanations as well as S2 itself.
+    def scrub(value):
+        if isinstance(value, dict):
+            return {key: scrub(val) for key, val in value.items()
+                    if not key.startswith("sectorState") and key not in {"sectorRiskScore", "sectorFlowInterpretation", "sectorExceptionEligible", "primarySectorStateSource"}}
+        if isinstance(value, list):
+            return [scrub(val) for val in value
+                    if not (isinstance(val, str) and ("sector_state_supported" in val or val == "S2"))
+                    and not (isinstance(val, dict) and val.get("id") == "S2")]
+        return value
+    item = scrub(item)
     return item
 
 
@@ -9635,6 +9858,18 @@ def _user_prompt(
         "confirmedStrategyConstraints": (feedback.get("activeConstraints") or []) if use_feedback else [],
         "candidates": compact_candidates,
     }
+    if not sector_state_prompt_enabled:
+        payload["promptContract"]["allowedDecisionTags"] = [tag for tag in payload["promptContract"]["allowedDecisionTags"]
+            if tag != "sector_state_supported"]
+    if market.get("selectionPolicyVersion") == selection_policy.VERSION:
+        payload["promptContract"].update(candidatePayload="versioned_compact_evidence",
+            allowedDecisionTags=sorted({tag for c in compact_candidates for tag in c.get("allowedDecisionTags") or []}),
+            scoreRule="评分不是资金流或收益概率；各股 allowedDecisionTags 是最终权限。终选必须引用 P1 和 T1，遵守 formalEligible。")
+        if feedback.get("selectionPolicyVersion") != selection_policy.VERSION:
+            payload["objectiveStrategyFeedback"] = {"enabled": False,
+                "reason": "没有同版本严格执行样本；旧标签统计不进入自动反馈"}
+        payload["market"] = {k: compact_market[k] for k in ("indices", "breadth", "limitUp", "limitDown", "scanTime",
+            "marketContext", "recommendationPolicy", "aiParticipation", "stageControls", "styleRegimeShadow") if k in compact_market}
     return (
         f"{instruction}\n\n"
         "下面是结构化输入。请只根据 JSON 中的 market、task、objectiveStrategyFeedback、confirmedStrategyConstraints、candidates 判断。"
@@ -9736,7 +9971,7 @@ def _role_prompt(stage: str) -> str:
         "你的任务是从系统提供的候选池中选择适合“今天买入、下个交易日卖出”的隔夜超短线标的。"
         "系统已经完成硬过滤，包括 ST、退市风险、停牌、极低流动性、明显数据异常和不支持市场范围。"
         "你不能选择候选池外股票，不能输出确定性收益表达。"
-        "你必须重点比较真实证据支持下的资金强度、行业/概念证据、个股相对地位、分时结构、次日溢价潜力和隔夜风险。"
+        "你必须比较独立交易形态、实际成交活跃度、真实行业证据、价格结构、买入可行性和隔夜风险。成交额或估算活跃度不等于资金净流入。"
         "不要只按 t1Score、ruleScore 或涨幅排序，必须横向比较不同 candidateType。"
         "riskProfile 是系统规则画像，用于解释进攻性和隔夜风险；你可以参考它，但不能把高风险说成低风险。"
         "dataQuality 是硬约束，不能把含模拟关键数据或仅缓存观察的数据说成真实可交易信号。"
@@ -9759,7 +9994,7 @@ def _role_prompt(stage: str) -> str:
         "marketContext 是总开关，恐慌退潮或放量大跌时允许少选甚至不选。"
         "输出严格 JSON，根字段 picks；每项只包含 code、rank、supportingEvidenceRefs、counterEvidenceRefs、decisionTags、confidence。"
         "不要输出 reason、strategyHypothesis、buyPlan、sellPlan、risk、entryCondition、invalidCondition、marketFit、sectorFit、confidenceReason；这些页面文字由后端根据冻结证据生成。"
-        f"decisionTags 只能来自：{','.join(sorted(AI_DECISION_TAG_LABELS.keys()))}。"
+        "decisionTags 只能来自 promptContract.allowedDecisionTags；逐股存在 allowedDecisionTags 时必须再取交集。"
         "禁止 Markdown，禁止必涨、稳赚、满仓、无风险等确定性表达。"
         f"当前阶段：{stage}。"
     )
@@ -9769,11 +10004,11 @@ def _batch_prompt(limit: int) -> str:
     return (
         "当前是超短线 T+1 推荐的批次初筛阶段。\n"
         f"请从 candidates 中选择最多 {limit} 只进入半决赛池。\n"
-        "选择目标：今天接近尾盘仍有资金承接、板块不退潮、明天有冲高或溢价预期，适合今天买入、下个交易日卖出的候选。\n"
-        "不能只按规则分或涨幅排序。必须比较尾盘资金回流、VWAP 承接、真实行业/概念证据、个股相对地位、成交额和量比、是否追高、次日溢价潜力、隔夜风险。\n"
+        "选择目标：从已确认结构中比较今天买入、下个交易日卖出的可行性，允许少选和不选。\n"
+        "不能只按分数或涨幅排序。分别比较突破维持、回踩承接、日内转强、相对强势延续的证据及反证；批筛未取得1分钟尾盘证据时不能猜测尾盘回流。代理量比不能作为独立量能确认。\n"
         "板块适配只通过 evidenceRefs 和 decisionTags 表达；不要写自然语言板块事实，不要使用资金共振、主力净流入、行业前排、龙头等未经证据允许的词。\n"
         "如果没有足够证据，不要为了凑数量强行选择。\n"
-        "输出 JSON：{\"picks\":[{\"code\":\"股票代码，必须来自 candidates\",\"rank\":1,\"supportingEvidenceRefs\":[\"Q1\",\"M1\"],\"counterEvidenceRefs\":[\"R1\"],\"decisionTags\":[\"premium_potential\",\"low_overnight_risk\"],\"confidence\":62}]}\n"
+        "输出结构：{\"picks\":[{\"code\":\"候选代码\",\"rank\":1,\"supportingEvidenceRefs\":[],\"counterEvidenceRefs\":[],\"decisionTags\":[],\"confidence\":62}]}；此为结构示例，必须填写实际可用支持引用，新版必须包含 P1，标签从逐股允许清单选择。\n"
         f"要求：picks 最多 {limit} 个；code 必须完全来自 candidates；confidence 是相对信心，不是收益承诺。"
     )
 
@@ -9782,11 +10017,11 @@ def _final_prompt(limit: int) -> str:
     return (
         "当前是超短线 T+1 Top3 终选阶段。\n"
         f"请从 semifinal candidates 中选择最多 {limit} 只，作为今天买入、下个交易日卖出的最终推荐。\n"
-        "最终选择要求：必须优先考虑尾盘资金态度、真实行业/概念持续性和个股辨识度；不要只选涨幅最高；不要选择尾盘跳水、炸板回落、放量滞涨且没有承接证据的股票。"
+        "最终选择要求：比较已确认形态及T1实际尾盘价格与成交证据；新版 formalEligible=false 不可选择。每只新版推荐必须同时引用 P1 和 T1。不要选择尾盘持续卖压未恢复、不可交易或证据不足的股票。"
         "如果选择高位股，必须用 counterEvidenceRefs 和 decisionTags 表达你已接受哪些风险；如果选择非涨停股，必须引用支持其次日溢价潜力的证据 ID。\n"
         "不要输出自然语言 marketFit/sectorFit/reason；后端会按你引用的证据 ID 生成页面说明。\n"
         "如果市场环境或候选质量不足，可以少于上限；不要为了凑满数量选择不适合隔夜的股票。\n"
-        "输出 JSON：{\"picks\":[{\"code\":\"股票代码，必须来自 candidates\",\"rank\":1,\"supportingEvidenceRefs\":[\"Q1\",\"M1\",\"R1\"],\"counterEvidenceRefs\":[\"S2\"],\"decisionTags\":[\"premium_potential\",\"counter_risk_accepted\"],\"confidence\":62}]}\n"
+        "输出结构：{\"picks\":[{\"code\":\"候选代码\",\"rank\":1,\"supportingEvidenceRefs\":[],\"counterEvidenceRefs\":[],\"decisionTags\":[],\"confidence\":62}]}；此为结构示例，必须填写实际可用支持引用，新版必须包含 P1 和 T1，标签从逐股允许清单选择。\n"
         f"要求：picks 最多 {limit} 个；code 必须完全来自 candidates；confidence 是相对信心，不是收益承诺。"
     )
 
@@ -11442,6 +11677,11 @@ def _apply_final_guardrails(picks: List[Dict[str, Any]], market: Dict[str, Any],
         return []
     guarded = []
     for item in picks:
+        if (market.get("selectionPolicyVersion") == selection_policy.VERSION
+                and item.get("formalEligible") is not True):
+            market.setdefault("formalGuardrailRejections", []).append({"code": item.get("code"),
+                "reasons": item.get("formalExclusionReasons") or ["缺少新版正式交易资格"]})
+            continue
         quality = item.get("dataQuality") or {}
         if quality and not quality.get("eligibleForRealTop"):
             continue
@@ -11849,6 +12089,9 @@ def _validate_ai_picks_evidence(picks: List[Dict[str, Any]], candidates: List[Di
             "zeroPick": True,
         }
     for index, pick in enumerate(picks, start=1):
+        if not isinstance(pick, dict):
+            errors.append(f"第 {index} 项不是合法选股对象。")
+            continue
         code = _normalize_code((pick or {}).get("code"))
         if not code or code not in by_code:
             errors.append(f"第 {index} 项 code={code or '--'} 不在候选池。")
@@ -11866,6 +12109,41 @@ def _validate_ai_picks_evidence(picks: List[Dict[str, Any]], candidates: List[Di
         if missing_refs:
             errors.append(f"{code} 引用了不存在的证据ID：{','.join(missing_refs[:5])}。")
         decision_tags = _normalize_decision_tags(pick.get("decisionTags") or pick.get("decision_tags"))
+        if candidate.get("selectionPolicyVersion") == selection_policy.VERSION:
+            raw_tags = pick.get("decisionTags") or pick.get("decision_tags") or []
+            if isinstance(raw_tags, str):
+                raw_tags = re.split(r"[,，、\s]+", raw_tags)
+            if not isinstance(raw_tags, list):
+                raw_tags = [str(raw_tags)]
+            unsupported = {str(tag) for tag in raw_tags} - set(_available_decision_tags(candidate))
+            if unsupported:
+                errors.append(f"{code} 使用无证据支持的标签：{','.join(sorted(unsupported))}。")
+            if not candidate.get("dataEligible") or not candidate.get("setupEligible"):
+                errors.append(f"{code} 缺少可用数据或已确认交易形态。")
+            if "P1" not in support_refs:
+                errors.append(f"{code} 必须引用已确认形态 P1。")
+            if stage == "final":
+                if not candidate.get("formalEligible"):
+                    errors.append(f"{code} 未满足正式推荐资格：{'；'.join(candidate.get('formalExclusionReasons') or [])}。")
+                if "T1" not in support_refs:
+                    errors.append(f"{code} 正式终选必须引用真实尾盘证据 T1。")
+            for ref in support_refs:
+                if evidence_refs.get(ref, {}).get("status") in {"unavailable", "stale", "insufficient"}:
+                    errors.append(f"{code} 不可把缺失或过期证据 {ref} 作为正向理由。")
+                meta = evidence_refs.get(ref, {})
+                cutoff = str(meta.get("scanCutoff") or "")
+                as_of = str(meta.get("asOfTime") or "")
+                if cutoff and as_of:
+                    try:
+                        if datetime.fromisoformat(as_of).replace(tzinfo=None) > datetime.fromisoformat(cutoff).replace(tzinfo=None):
+                            errors.append(f"{code} 引用 {ref} 超过扫描截止时间。")
+                        if as_of[:10] != cutoff[:10]:
+                            errors.append(f"{code} 引用 {ref} 不属于本交易日。")
+                    except ValueError:
+                        errors.append(f"{code} 引用 {ref} 的时间口径不完整。")
+            text = _ai_pick_text(pick)
+            if any(term in text for term in ("主力净流入", "资金回流", "真实量比", "资金净流入")):
+                errors.append(f"{code} 输入仅有价格与成交证据，不支持资金流或真实量比结论。")
         sector_status = str(candidate.get("sectorEvidenceStatus") or "unavailable")
         layers = _sector_layers_from_evidence(
             candidate.get("sectorEvidence") or {},
@@ -12459,7 +12737,7 @@ def _adaptive_exit_enabled_for_run(run: Dict[str, Any]) -> bool:
     strategy = market.get("strategyPolicy") or {}
     execution = market.get("executionProfile") or {}
     return bool(
-        str(strategy.get("strategyPolicyVersion") or "") == T1_STRATEGY_POLICY_VERSION
+        str(strategy.get("strategyPolicyVersion") or "") in {"2026-10-13收益优化.shadow.v5", T1_STRATEGY_POLICY_VERSION}
         and str(execution.get("version") or strategy.get("executionProfileVersion") or "")
         == T1_EXECUTION_PROFILE_VERSION
     )
@@ -12526,7 +12804,8 @@ def _build_outcome(
         recommendation_minute_series=entry_execution_minute_series or [],
         execution_profile=execution_profile,
     )
-    simulated_entry_price = _safe_number(entry_execution.get("price")) if entry_execution.get("executable") else None
+    filled_quantity = int(entry_execution.get("filledQuantity") or 0)
+    simulated_entry_price = _safe_number(entry_execution.get("price")) if filled_quantity > 0 else None
     trade_base_price = simulated_entry_price or buy_reference
     effective_data_source = (
         f"minute_intraday:{minute_source or 'minute'}"
@@ -12565,6 +12844,9 @@ def _build_outcome(
         "riskProfile": pick.get("riskProfile") or {},
         "candidateType": pick.get("candidateType", ""),
         "candidateTypeLabel": pick.get("candidateTypeLabel", ""),
+        "selectionPolicyVersion": pick.get("selectionPolicyVersion") or (run.get("market") or {}).get("selectionPolicyVersion") or "legacy",
+        "selectionScoreVersion": pick.get("selectionScoreVersion") or "legacy",
+        "setupVersion": (pick.get("setupEvidence") or {}).get("version") or "legacy",
         "dataQuality": pick.get("dataQuality") or {},
         "marketContext": (run.get("market") or {}).get("marketContext") or {},
         "priceConsistency": price_consistency,
@@ -12640,7 +12922,7 @@ def _build_outcome(
             profile=execution_profile,
         )
         scenarios.append(adaptive_exit)
-    if not entry_execution.get("executable"):
+    if filled_quantity <= 0:
         scenarios = _mark_entry_not_executable_scenarios(scenarios, entry_execution)
     rule_execution = _rule_execution_result(code, scenarios, open_return, high_return, close_return, daily_status)
     stored_scenarios = list(scenarios)
@@ -14254,6 +14536,7 @@ def _review_sample_meta(
     learning_eligible_count: int,
     primary_entry_not_executable_count: int = 0,
     primary_minute_missing_count: int = 0,
+    primary_partial_execution_count: int = 0,
 ) -> Dict[str, str]:
     recommendation_date = str(run.get("recommendationDate") or "")
     trade_date_status = _t1_trade_date_status(recommendation_date, str(run.get("scanTime") or ""))
@@ -14298,6 +14581,12 @@ def _review_sample_meta(
             "sampleReason": f"只有 {tradeable_count}/{outcome_count} 只股票拿到次日开盘后 15 分钟价格，只能看局部结果，不能用于优化策略。",
         }
     if tradeable_count > 0 and outcome_status in {"verified", "provisional"}:
+        if primary_partial_execution_count > 0:
+            return {
+                "sampleClass": "usable",
+                "sampleLabel": "部分成交样本",
+                "sampleReason": f"{primary_partial_execution_count}/{outcome_count} 只股票未完成目标买入数量；展示已成交部分的收益，但不纳入策略优化。",
+            }
         if run_role == "official" and learning_eligible_count > 0:
             return {"sampleClass": "learning", "sampleLabel": "可用于优化", "sampleReason": "这是正式交易日推荐，次日 15 分钟价格完整，结果可以用于后续优化策略。"}
         if run_role == "official":
@@ -14694,8 +14983,13 @@ def _outcome_scenario_by_key(item: Dict[str, Any], key: str) -> Dict[str, Any]:
     return {}
 
 
-def _optimization_review_stats(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    learning = [run for run in runs if run.get("reviewStatus") == "learnable"]
+def _optimization_review_stats(runs: List[Dict[str, Any]], _version_group=False) -> Dict[str, Any]:
+    groups = {}
+    for run in runs:
+        groups.setdefault(run.get("selectionPolicyVersion") or "legacy", []).append(run)
+    active_version = selection_policy.VERSION if selection_policy.VERSION in groups else "legacy"
+    scoped_runs = runs if _version_group else groups.get(active_version, [])
+    learning = [run for run in scoped_runs if run.get("reviewStatus") == "learnable"]
     timing_rows: List[Dict[str, Any]] = []
     for definition in TRADEABLE_SCENARIO_DEFINITIONS:
         key = str(definition.get("key") or "")
@@ -14730,6 +15024,10 @@ def _optimization_review_stats(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
     primary = next((item for item in timing_rows if item.get("scenarioKey") == PRIMARY_TRADEABLE_SCENARIO_KEY), {})
     return {
         "title": "可用于优化样本统计",
+        "selectionPolicyVersion": active_version if not _version_group else next(iter(groups), "legacy"),
+        "versionGroups": [] if _version_group else [dict(selectionPolicyVersion=version,
+            runCount=len([r for r in rows if r.get("reviewStatus") == "learnable"]),
+            primary=_optimization_review_stats(rows, True)["primary"]) for version, rows in sorted(groups.items())],
         "scope": "learnable",
         "scopeLabel": "可用于优化",
         "runCount": len(learning),
@@ -14738,9 +15036,9 @@ def _optimization_review_stats(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "primaryScenarioLabel": _scenario_definition_label(PRIMARY_TRADEABLE_SCENARIO_KEY),
         "primary": _public_timing_stat(primary),
         "exitTimingStats": [_public_timing_stat(row) for row in timing_rows],
-        "note": "顶部统计只使用“可用于优化”的样本；下方筛选条件只影响历史 run 列表，不改变这组统计。",
+        "note": "顶部统计只使用当前可用版本的可优化样本；各版本分别列出，不混合收益。列表筛选不改变统计。",
         "metricNotes": {
-            "avgNetReturnPct": "平均净收益：按推荐冻结价买入、对应时点卖出的平均结果，已扣除页面配置的滑点/交易成本。",
+            "avgNetReturnPct": "平均净收益：按该版本冻结的入场与固定卖出证据计算，扣除滑点和交易成本；严格发布后入场与旧版近似买入分版本查看。",
             "medianNetReturnPct": "中位数净收益：把收益从低到高排队后取中间值，能减少单个极端样本的影响。",
             "successRate": "成功率：该卖出时点净收益大于 0 的比例。",
             "strongSuccessRate": "强成功率：该卖出时点净收益达到 2% 及以上的比例。",
@@ -14823,6 +15121,9 @@ def _review_pick_names(picks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "name": str(pick.get("name") or ""),
                 "aiRank": pick.get("aiRank") or pick.get("rank"),
                 "poolRank": pick.get("poolRank"),
+                **{key: pick[key] for key in ("candidateType", "candidateTypeLabel", "selectionPolicyVersion",
+                    "selectionScoreVersion", "setupEvidence", "setupEligible", "dataEligible", "formalEligible",
+                    "formalExclusionReasons", "tailSupportPackV2", "scoreComponents") if key in pick},
             }
         )
     return rows
@@ -15009,14 +15310,18 @@ def _tradeable_summary(outcomes: List[Dict[str, Any]]) -> Dict[str, Any]:
     minute_missing_scenario_count = 0
     primary_minute_missing_count = 0
     primary_entry_not_executable_count = 0
+    primary_partial_execution_count = 0
     for item in outcomes:
         tradeable = (item.get("outcome") or {}).get("tradeable") or {}
         primary = tradeable.get("primaryScenario") or {}
+        entry_execution = tradeable.get("entryExecution") or {}
         primary_status = str(primary.get("dataStatus") or "")
         if primary_status == "minute_missing":
             primary_minute_missing_count += 1
         if primary_status == "entry_not_executable":
             primary_entry_not_executable_count += 1
+        if str(entry_execution.get("status") or "") == "partial_execution" and int(entry_execution.get("filledQuantity") or 0) > 0:
+            primary_partial_execution_count += 1
         net = primary.get("netReturnPct")
         missing_minute_scenarios = [
             scenario
@@ -15041,6 +15346,7 @@ def _tradeable_summary(outcomes: List[Dict[str, Any]]) -> Dict[str, Any]:
         "minuteMissingScenarioCount": minute_missing_scenario_count,
         "primaryMinuteMissingCount": primary_minute_missing_count,
         "primaryEntryNotExecutableCount": primary_entry_not_executable_count,
+        "primaryPartialExecutionCount": primary_partial_execution_count,
         "avgNetReturnPct": _avg([item.get("netReturnPct") for item in tradeable_rows]),
         "ruleTradeableCount": len(rule_rows),
         "avgRuleNetReturnPct": _avg(rule_rows),
@@ -15456,7 +15762,18 @@ def _index_benchmark_comparison(
     }
 
 
-def _build_strategy_feedback(outcomes: List[Dict[str, Any]], window_runs: int, source_run_id: int, trigger_source: str) -> Dict[str, Any]:
+def _outcome_selection_version(item):
+    return str(item.get("selectionPolicyVersion") or _outcome_payload(item).get("selectionPolicyVersion") or "legacy")
+
+
+def _build_strategy_feedback(outcomes: List[Dict[str, Any]], window_runs: int, source_run_id: int, trigger_source: str,
+                             selection_version: str = "") -> Dict[str, Any]:
+    version_counts = {}
+    for item in outcomes:
+        key = _outcome_selection_version(item)
+        version_counts[key] = version_counts.get(key, 0) + 1
+    if selection_version:
+        outcomes = [item for item in outcomes if _outcome_selection_version(item) == selection_version]
     valid = [item for item in outcomes if item.get("outcomeLabel") != "数据不足"]
     labels = [item.get("outcomeLabel") for item in valid]
     success_labels = {"强成功", "成功溢价", "弱成功"}
@@ -15478,6 +15795,8 @@ def _build_strategy_feedback(outcomes: List[Dict[str, Any]], window_runs: int, s
         "validationVersion": TRADEABLE_VALIDATION_VERSION,
         "sourceRunId": source_run_id,
         "triggerSource": trigger_source,
+        "selectionPolicyVersion": selection_version or "legacy",
+        "versionSampleCounts": version_counts,
     }
     patterns = _pattern_stats(valid)
     best = sorted(patterns, key=lambda item: (item.get("successRate") or 0, item.get("avgHighReturnPct") or 0), reverse=True)[:5]

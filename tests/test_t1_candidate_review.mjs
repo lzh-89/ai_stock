@@ -39,7 +39,7 @@ test('next-day failure does not block archive success', async () => {
   const app = setup(async url => url.endsWith('archive-summary') ? ok(archive) : oldBackend());
   app.select(92); await flush();
   assert.match(app.element('archiveMeta').textContent, /500/);
-  assert.match(app.element('archiveFunnel').innerHTML, /通过门禁/);
+  assert.match(app.element('archiveFunnel').innerHTML, /数据合格/);
   assert.match(app.element('nextDayMeta').textContent, /加载失败/);
   assert.equal(app.element('nextDayReload').hidden, false);
 });

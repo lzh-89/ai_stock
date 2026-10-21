@@ -341,6 +341,9 @@ a.secondary-button {
 .review-official-head small { margin-top: 3px; color: var(--muted); font-size: 12px; }
 .review-official-count { color: var(--green); font-size: 12px; font-weight: 800; }
 .review-official-list { display: grid; }
+.review-official-evidence { grid-column: 1 / -1; padding: 8px 12px; border-radius: 8px; background: rgba(100, 116, 139, .06); color: var(--muted); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.review-official-evidence strong { color: var(--ink); }
+.review-official-evidence small { display: block; }
 .review-official-pick {
   grid-template-columns: auto minmax(140px, 1.5fr) minmax(270px, 2.1fr) auto;
   gap: 12px;

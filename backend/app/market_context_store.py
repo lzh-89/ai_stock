@@ -237,10 +237,14 @@ class FullMarketContextStore:
     ) -> Dict[str, Any]:
         generated_at = datetime.now().isoformat(timespec="seconds")
         provider_meta = dict(provider_meta or {})
-        expected_rows = max(FULL_MARKET_CONTEXT_EXPECTED_ROWS, len(stocks))
-        coverage_pct = round(min(100.0, len(stocks) / expected_rows * 100), 2) if expected_rows else 0.0
-        status = "ready" if coverage_pct >= 90.0 else "partial"
         failed_pages = int(provider_meta.get("pagesFailed") or 0)
+        # A received/cache code list is not a certified market universe.
+        universe = {str(c).zfill(6) for c in provider_meta.get("universeCodes") or []}
+        certified = bool(universe and provider_meta.get("universeVersion") and provider_meta.get("universeAuthoritative"))
+        received = {s.code for s in stocks}
+        expected_rows = len(universe) if certified else None
+        coverage_pct = round(len(received & universe) / len(universe) * 100, 2) if certified else None
+        status = "ready" if certified and coverage_pct >= 90 and not failed_pages else "partial"
         payload = {
             "version": FULL_MARKET_CONTEXT_CACHE_VERSION,
             "snapshotVersion": f"{date.today().isoformat()}-{uuid.uuid4().hex[:12]}",
@@ -258,6 +262,10 @@ class FullMarketContextStore:
                 "rows": len(stocks),
                 "expectedRows": expected_rows,
                 "coveragePct": coverage_pct,
+                "status": "verified" if certified and not failed_pages else "partial" if certified else "unknown",
+                "version": "2026-10-16.universe.v1",
+                "universeVersion": provider_meta.get("universeVersion") if certified else None,
+                "reason": "以权威代码全集核验；失败页单独记录" if certified else "未取得带版本的权威代码全集，不能证明全市场覆盖率",
                 "pagesOk": int(provider_meta.get("pagesOk") or 0),
                 "pagesFailed": failed_pages,
             },
@@ -347,6 +355,11 @@ def _runtime_payload(payload: Dict[str, Any], cache_hit: bool, stale: bool) -> D
     market = payload.get("market") if isinstance(payload.get("market"), dict) else {}
     if not market and stocks:
         market = market_from_stocks(stocks)
+    coverage = dict(payload.get("coverage") or {})
+    if coverage.get("version") != "2026-10-16.universe.v1":
+        coverage.update(coveragePct=None, expectedRows=None, status="unknown",
+                        version="2026-10-16.universe.v1",
+                        reason="旧缓存没有带版本的权威股票全集，覆盖率未知")
     return {
         "source": payload.get("source", ""),
         "requestedSource": payload.get("requestedSource", ""),
@@ -358,7 +371,7 @@ def _runtime_payload(payload: Dict[str, Any], cache_hit: bool, stale: bool) -> D
         "generatedAt": generated_at,
         "count": len(stocks) or int(payload.get("count") or 0),
         "ttlSeconds": int(payload.get("ttlSeconds") or FULL_MARKET_CONTEXT_TTL_SECONDS),
-        "coverage": payload.get("coverage") or {},
+        "coverage": coverage,
         "failedPages": payload.get("failedPages") or [],
         "ageSeconds": age_seconds,
         "cacheHit": cache_hit,

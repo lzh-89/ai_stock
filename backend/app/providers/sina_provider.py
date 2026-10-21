@@ -323,6 +323,15 @@ def _normalize_row(row: Dict[str, Any], index: int, context: Dict[str, Any]) -> 
         limit_status=limit_status,
         amount=amount,
         open=open_price or None, high=high or None, low=low or None, pre_close=prev_close or None,
+        feature_provenance={
+            key: {"source": "sina", "asOfTime": str(row.get("ticktime") or ""),
+                  "method": method, "isProxy": True, "status": "proxy"}
+            for key, method in {
+                "amountFactor": "current_amount_divided_by_market_median_clipped",
+                "volumeRatio": "estimated_activity_from_amount_factor_and_turnover",
+                "relStrength": "daily_change_cross_section_percentile",
+            }.items()
+        },
     )
 
 
