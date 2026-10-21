@@ -1198,7 +1198,7 @@ function entryExecutionEvidenceDetail(evidence = {}) {
   if (job.error) return job.error;
   if (job.dueAt) return `预计 ${String(job.dueAt).slice(11, 19)} 起采集正式推荐发布后的第一根完整 1 分钟行情。`;
   return evidence.status === "legacy_not_recorded"
-    ? "历史 Run 没有独立保存发布后成交证据，不能用当前规则倒推。"
+    ? "历史 Run 没有独立保存发布后分钟行情，不能用当前规则倒推正式入场价。"
     : "正式推荐生成后自动登记，不复用选股阶段的提前冻结价格。";
 }
 
@@ -1488,7 +1488,7 @@ function renderOutcomes(run) {
         <strong>${stockAnalysisNameLink(item)}</strong>
         <small>${escapeHtml((item.outcome || {}).riskProfile?.label || "")}</small>
       </td>
-      <td>${formatPrice(item.buyReferencePrice)}</td>
+      <td>${formatPrice((item.outcome || {}).simulatedEntryPrice ?? item.buyReferencePrice)}</td>
       <td>${escapeHtml(item.nextTradeDate || "--")}</td>
       <td>${scenarioNetHtml(primaryScenario(item))}</td>
       <td>${scenarioNetHtml(scenarioByKey(item, "open"))}</td>

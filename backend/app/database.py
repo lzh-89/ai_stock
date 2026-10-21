@@ -4771,7 +4771,7 @@ class Database:
             quality = payload.get("dataQuality") or {}
             primary = ((payload.get("tradeable") or {}).get("primaryScenario") or {})
             if (
-                payload.get("validationVersion") == "v2_tradeable"
+                payload.get("validationVersion") == "v3_unit_return"
                 and payload.get("validationStatus") == "final"
                 and quality.get("grade") in {"A", "B"}
                 and primary.get("scenarioKey") == "open_15m"

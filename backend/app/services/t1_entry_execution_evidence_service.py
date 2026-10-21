@@ -255,7 +255,7 @@ class T1EntryExecutionEvidenceService:
                 "triggerSource": trigger_source,
                 "decisionEligible": eligible,
                 "lateBackfill": late_backfill,
-                "reason": "已冻结正式推荐发布后的分钟成交证据。" if eligible else provider_error or "截止时间前未取得发布后的分钟成交。",
+                "reason": "已冻结正式推荐发布后的分钟定价证据。" if eligible else provider_error or "截止时间前未取得发布后的分钟定价证据。",
             }
             snapshots.append(
                 {

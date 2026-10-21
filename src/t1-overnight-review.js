@@ -631,7 +631,7 @@ function renderDetail(run) {
 
 function entryExecutionReviewLabel(status) {
   return {
-    available: "可用于成交回放",
+    available: "可用于正式入场定价",
     scheduled: "等待采集",
     running: "正在采集",
     retry_wait: "等待重试",
@@ -647,8 +647,8 @@ function entryExecutionReviewDetail(evidence = {}) {
   const ready = (evidence.snapshots || []).filter((item) => item.decisionEligible);
   if (ready.length) return ready.map((item) => `${item.code || "--"} ${item.entryTime || "--"} ${formatNumber(item.price)}`).join("；");
   if (evidence.job?.error) return evidence.job.error;
-  if (evidence.status === "legacy_not_recorded") return "当时未独立冻结正式推荐发布后的分钟成交，不能倒推为可优化样本。";
-  return "只认信号发布后的真实分钟成交；提前冻结选股价格不能替代。";
+  if (evidence.status === "legacy_not_recorded") return "当时未独立冻结正式推荐发布后的分钟行情，不能倒推正式入场价。";
+  return "正式复盘只使用下单时点后的第一根完整1分钟行情定价；提前冻结选股价格不能替代。";
 }
 
 function openingEvidenceStatusLabel(status) {
@@ -982,8 +982,8 @@ function renderOutcomes(run) {
       </td>
       <td>
         <span class="buy-price-cell">
-          <strong>${formatPrice(item.buyReferencePrice)}</strong>
-          <small>${escapeHtml(buyReferenceHint(item))}</small>
+          <strong>${formatPrice((item.outcome || {}).simulatedEntryPrice ?? item.buyReferencePrice)}</strong>
+          <small>${escapeHtml(formalEntryHint(item))}</small>
         </span>
       </td>
       <td>${escapeHtml(item.nextTradeDate || "--")}</td>
@@ -1042,7 +1042,13 @@ function primaryScenario(item) {
   return ((item.outcome || {}).tradeable || {}).primaryScenario || {};
 }
 
-function buyReferenceHint(item) {
+function formalEntryHint(item) {
+  const entry = (item.outcome || {}).entryExecution || {};
+  if (entry.status === "formal_entry_priced") {
+    return `正式单位入场价 · ${String(entry.entryTime || "").slice(11, 16) || "发布后完整分钟"}`;
+  }
+  if (entry.status === "entry_price_evidence_missing") return "正式买入价格证据不足";
+  if (entry.status === "entry_not_executable") return entry.label || "超过正式执行窗口";
   const consistency = (item.outcome || {}).priceConsistency || {};
   const source = consistency.referenceSource || "";
   const date = consistency.referenceDate || item.recommendationDate || "";

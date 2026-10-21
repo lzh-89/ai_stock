@@ -44,6 +44,8 @@ from backend.app.engines.t1_experiment_sampling import (
 from backend.app.engines.t1_exit_replay import (
     ADAPTIVE_EXIT_VERSION,
     EXECUTION_PROFILE_VERSION as REPLAY_EXECUTION_PROFILE_VERSION,
+    FORMAL_ENTRY_VERSION,
+    price_formal_entry,
     replay_adaptive_exit,
     simulate_entry_execution as replay_entry_execution,
 )
@@ -84,7 +86,7 @@ HISTORY_SOFT_CLEANUP_SETTING_KEY = "t1_overnight_history_soft_cleanup"
 VALIDATION_AUTO_FREEZE_STATE_KEY = "t1_overnight_validation_auto_freeze_state"
 AUTO_RUN_STATE_KEY = "t1_overnight_auto_run_state"
 MARKET_PREFETCH_STATE_KEY = "t1_overnight_market_prefetch_state"
-TRADEABLE_VALIDATION_VERSION = "v2_tradeable"
+TRADEABLE_VALIDATION_VERSION = "v3_unit_return"
 THEORETICAL_VALIDATION_VERSION = "v1_theoretical"
 HISTORY_SOFT_CLEANUP_VERSION = "v2_semantic_evidence_isolation"
 ZERO_PICK_SELECTION_MODES = {
@@ -117,7 +119,7 @@ T1_EVIDENCE_VERSION = "v4_layered_sector_state_shadow"
 T1_TRADE_DATE_GUARD_VERSION = "v1_t1_trade_date_guard"
 T1_SECTOR_STATE_SHADOW_VERSION = "v1_t1_sector_state_shadow"
 T1_STYLE_REGIME_SHADOW_VERSION = "v1_t1_style_regime_shadow"
-T1_EXECUTION_CONTRACT_VERSION = "v1_signal_published_execution"
+T1_EXECUTION_CONTRACT_VERSION = FORMAL_ENTRY_VERSION
 T1_TAIL_SUPPORT_SHADOW_VERSION = "v2_tail_support_shadow"
 T1_GAP_DOWN_RISK_SHADOW_VERSION = "v1_gap_down_risk_shadow"
 T1_RULE_TAIL_SHADOW_VERSION = "v1_rule_tail_shadow_top3"
@@ -1740,7 +1742,11 @@ class T1OvernightSelectionService:
                     verified_at=verified_at,
                     execution_profile=execution_profile,
                     recommendation_minute_series=recommendation_minute_by_code.get(str(pick.get("code") or "").zfill(6), []),
-                    entry_execution_minute_series=entry_execution_minute_by_code.get(str(pick.get("code") or "").zfill(6), []),
+                    entry_execution_minute_series=(
+                        entry_execution_minute_by_code.get(str(pick.get("code") or "").zfill(6), [])
+                        or recommendation_minute_by_code.get(str(pick.get("code") or "").zfill(6), [])
+                    ),
+                    entry_model="stress_participation",
                 )
                 for pick in group_picks
             ]
@@ -12656,77 +12662,38 @@ def _simulated_entry_execution(
     signal_published_at = str(timing.get("signalPublishedAt") or "")
     signal_time = _time_from_iso_text(signal_published_at) or str(run.get("scanTime") or DEFAULT_SCAN_TIME)
     recommendation_date = str(run.get("recommendationDate") or "")
-    replay = replay_entry_execution(
+    if signal_time > "14:50":
+        return {
+            "version": T1_EXECUTION_CONTRACT_VERSION,
+            "executable": False,
+            "status": "entry_not_executable",
+            "label": "已超过尾盘执行窗口",
+            "signalPublishedAt": signal_published_at,
+            "signalTime": signal_time,
+            "buyReferencePrice": buy_reference,
+            "reason": "正式推荐发布时间已超过 14:50 尾盘执行截止线。",
+        }
+    return price_formal_entry(
         series=recommendation_minute_series or [],
         recommendation_date=recommendation_date,
         signal_published_at=signal_published_at or f"{recommendation_date}T{signal_time}:00",
         reference_price=buy_reference,
         profile=_normalize_execution_config(execution_profile or DEFAULT_EXECUTION_PROFILE),
     )
-    if replay.get("status") in {"executed_from_minute", "partial_execution"}:
-        return replay
-    dated = _minute_series_for_trade_date(recommendation_minute_series or [], recommendation_date)
-    if not dated and recommendation_minute_series:
-        dated = list(recommendation_minute_series or [])
-    for item in sorted(dated, key=lambda row: _minute_time(row) or ""):
-        item_time = _minute_time(item)
-        if item_time and item_time < signal_time:
-            continue
-        price = _safe_number(item.get("close") or item.get("open"))
-        volume = _safe_number(item.get("volume"))
-        if price and price > 0 and (volume is None or volume > 0):
-            return {
-                "version": T1_EXECUTION_CONTRACT_VERSION,
-                "executable": True,
-                "status": "executed_from_minute",
-                "label": "信号发布后可成交",
-                "signalPublishedAt": signal_published_at,
-                "signalTime": signal_time,
-                "entryTime": item_time,
-                "price": price,
-                "buyReferencePrice": buy_reference,
-                "source": "recommendation_minute_snapshot",
-            }
-    if buy_reference and signal_time <= "14:50":
-        return {
-            "version": T1_EXECUTION_CONTRACT_VERSION,
-            "executable": True,
-            "status": "reference_price_without_minute",
-            "label": "缺分钟成交，用冻结价近似",
-            "signalPublishedAt": signal_published_at,
-            "signalTime": signal_time,
-            "entryTime": str(run.get("scanTime") or signal_time),
-            "price": buy_reference,
-            "buyReferencePrice": buy_reference,
-            "source": "buy_reference_fallback",
-            "qualityWarning": "没有推荐日信号发布后的分钟成交，只能用冻结价近似，不能作为最高等级成交证据。",
-        }
-    return {
-        "version": T1_EXECUTION_CONTRACT_VERSION,
-        "executable": False,
-        "status": "entry_not_executable",
-        "label": "买入不可确认",
-        "signalPublishedAt": signal_published_at,
-        "signalTime": signal_time,
-        "entryTime": "",
-        "price": None,
-        "buyReferencePrice": buy_reference,
-        "source": "",
-        "reason": "信号发布后没有可用分钟成交，或发布时间已不满足尾盘执行窗口。",
-    }
 
 
 def _mark_entry_not_executable_scenarios(scenarios: List[Dict[str, Any]], entry_execution: Dict[str, Any]) -> List[Dict[str, Any]]:
     result = []
     reason = str(entry_execution.get("reason") or "买入不可执行，不能计算真实交易收益。")
+    market_unexecutable = str(entry_execution.get("status") or "") == "entry_not_executable"
     for scenario in scenarios or []:
         row = dict(scenario)
         row["grossReturnPct"] = None
         row["netReturnPct"] = None
-        row["dataStatus"] = "entry_not_executable"
+        row["dataStatus"] = "entry_not_executable" if market_unexecutable else "minute_missing"
         row["validationStatus"] = "unavailable"
         row["status"] = "unavailable"
-        row["executionStatus"] = "entry_not_executable"
+        row["executionStatus"] = "entry_not_executable" if market_unexecutable else "entry_price_evidence_missing"
         row["reason"] = reason
         result.append(row)
     return result
@@ -12779,6 +12746,7 @@ def _build_outcome(
     execution_profile: Optional[Dict[str, Any]] = None,
     recommendation_minute_series: Optional[List[Dict[str, Any]]] = None,
     entry_execution_minute_series: Optional[List[Dict[str, Any]]] = None,
+    entry_model: str = "formal_unit",
 ) -> Dict[str, Any]:
     execution_profile = _normalize_execution_config(execution_profile or DEFAULT_EXECUTION_PROFILE)
     code = str(pick.get("code") or "").zfill(6)
@@ -12798,14 +12766,30 @@ def _build_outcome(
     daily_status = _daily_validation_status(next_trade_date, verified_at)
     if not buy_reference or buy_reference <= 0:
         buy_reference = _safe_number((recommendation_reference or {}).get("close"))
-    entry_execution = _simulated_entry_execution(
-        run=run,
-        buy_reference=buy_reference,
-        recommendation_minute_series=entry_execution_minute_series or [],
-        execution_profile=execution_profile,
-    )
-    filled_quantity = int(entry_execution.get("filledQuantity") or 0)
-    simulated_entry_price = _safe_number(entry_execution.get("price")) if filled_quantity > 0 else None
+    if entry_model == "formal_unit":
+        entry_execution = _simulated_entry_execution(
+            run=run,
+            buy_reference=buy_reference,
+            recommendation_minute_series=entry_execution_minute_series or [],
+            execution_profile=execution_profile,
+        )
+        entry_priced = str(entry_execution.get("status") or "") == "formal_entry_priced"
+    else:
+        timing = (run.get("market") or {}).get("decisionTiming") or {}
+        signal_published_at = str(timing.get("signalPublishedAt") or "")
+        signal_time = _time_from_iso_text(signal_published_at) or str(run.get("scanTime") or DEFAULT_SCAN_TIME)
+        entry_execution = replay_entry_execution(
+            series=entry_execution_minute_series or [],
+            recommendation_date=recommendation_date,
+            signal_published_at=signal_published_at or f"{recommendation_date}T{signal_time}:00",
+            reference_price=buy_reference,
+            profile=execution_profile,
+        )
+        entry_priced = (
+            str(entry_execution.get("status") or "") in {"executed_from_minute", "partial_execution"}
+            and int(entry_execution.get("filledQuantity") or 0) > 0
+        )
+    simulated_entry_price = _safe_number(entry_execution.get("price")) if entry_priced else None
     trade_base_price = simulated_entry_price or buy_reference
     effective_data_source = (
         f"minute_intraday:{minute_source or 'minute'}"
@@ -12836,6 +12820,7 @@ def _build_outcome(
         "buyReferencePrice": buy_reference,
         "simulatedEntryPrice": simulated_entry_price,
         "entryExecution": entry_execution,
+        "entryModel": entry_model,
         "verifiedAt": verified_at,
         "dataSource": effective_data_source,
         "minuteSource": minute_source,
@@ -12907,6 +12892,16 @@ def _build_outcome(
         verified_at=verified_at,
     )
     if _adaptive_exit_enabled_for_run(run):
+        timing = (run.get("market") or {}).get("decisionTiming") or {}
+        signal_published_at = str(timing.get("signalPublishedAt") or "")
+        signal_time = _time_from_iso_text(signal_published_at) or str(run.get("scanTime") or DEFAULT_SCAN_TIME)
+        adaptive_entry_execution = replay_entry_execution(
+            series=entry_execution_minute_series or [],
+            recommendation_date=recommendation_date,
+            signal_published_at=signal_published_at or f"{recommendation_date}T{signal_time}:00",
+            reference_price=buy_reference,
+            profile=execution_profile,
+        )
         adaptive_exit = replay_adaptive_exit(
             code=code,
             industry_group=str(
@@ -12917,12 +12912,13 @@ def _build_outcome(
             ),
             next_trade_date=next_trade_date,
             minute_series=minute_series,
-            entry_execution=entry_execution,
+            entry_execution=adaptive_entry_execution,
             opening_evidence=((run.get("market") or {}).get("openingRiskSnapshot") or {}),
             profile=execution_profile,
         )
+        adaptive_exit["entryStressExecution"] = adaptive_entry_execution
         scenarios.append(adaptive_exit)
-    if filled_quantity <= 0:
+    if not entry_priced:
         scenarios = _mark_entry_not_executable_scenarios(scenarios, entry_execution)
     rule_execution = _rule_execution_result(code, scenarios, open_return, high_return, close_return, daily_status)
     stored_scenarios = list(scenarios)
@@ -12978,11 +12974,15 @@ def _build_outcome(
         price_consistency=price_consistency,
         validation_status=validation_status,
     )
-    if str(entry_execution.get("status") or "") != "executed_from_minute":
+    if not entry_priced or entry_model != "formal_unit":
         learning_eligible = False
         exclusion_reasons = _unique_strings(
             list(exclusion_reasons or [])
-            + [entry_execution.get("qualityWarning") or entry_execution.get("reason") or "模拟买入成交证据不足"]
+            + [
+                "资金容量压力测试不进入正式策略学习"
+                if entry_model != "formal_unit"
+                else entry_execution.get("qualityWarning") or entry_execution.get("reason") or "正式买入价格证据不足"
+            ]
         )
     trade_quality["failureTags"] = failure_tags
     if not price_consistency.get("ok"):
@@ -14638,9 +14638,9 @@ def _review_display_meta(run: Dict[str, Any], sample: Dict[str, str], outcome_st
             reason = sample_reason or "研究/手动重跑结果可以参考，但不会用于优化。"
         return {
             "reviewStatus": "reviewable",
-            "reviewStatusLabel": "可看结果",
+            "reviewStatusLabel": "部分成交样本" if sample.get("sampleLabel") == "部分成交样本" else "可看结果",
             "reviewStatusReason": reason,
-            "reviewStatusTone": "neutral",
+            "reviewStatusTone": "warn" if sample.get("sampleLabel") == "部分成交样本" else "neutral",
         }
     if sample_class == "zero_pick":
         return {
@@ -15585,7 +15585,8 @@ def _portfolio_comparison(outcomes: List[Dict[str, Any]], slot_count: int = PORT
     components = ordered[:slot_count]
     component_returns = [_primary_net_return(item) for item in components]
     tradeable_returns = [value for value in component_returns if value is not None]
-    cash_slots = max(0, slot_count - len(tradeable_returns))
+    cash_slots = max(0, slot_count - len(components))
+    data_missing_slots = len(component_returns) - len(tradeable_returns)
     locked_items = [
         _outcome_payload(item).get("tradeable", {}).get("entryExecution", {})
         for item in ordered[:slot_count]
@@ -15593,12 +15594,17 @@ def _portfolio_comparison(outcomes: List[Dict[str, Any]], slot_count: int = PORT
         and _outcome_payload(item).get("recommendationQualityEligible") is True
     ]
     locked_capital_pct = round(len(locked_items) / slot_count * 100, 2) if slot_count else 0.0
-    portfolio_return = round(sum(tradeable_returns) / slot_count, 2) if slot_count else None
+    portfolio_return = (
+        round(sum(tradeable_returns) / slot_count, 2)
+        if slot_count and data_missing_slots == 0
+        else None
+    )
     return {
         "slotCount": slot_count,
         "componentCount": len(component_returns),
         "tradeableCount": len(tradeable_returns),
         "cashSlots": cash_slots,
+        "dataMissingSlots": data_missing_slots,
         "lockedCapitalPct": locked_capital_pct,
         "componentReturnsPct": component_returns,
         "componentRows": [
@@ -15613,7 +15619,7 @@ def _portfolio_comparison(outcomes: List[Dict[str, Any]], slot_count: int = PORT
         ],
         "portfolioReturnPct": portfolio_return,
         "avgTradeableReturnPct": _avg(tradeable_returns),
-        "status": "ok" if tradeable_returns or cash_slots == slot_count else "data_insufficient",
+        "status": "ok" if portfolio_return is not None else "data_insufficient",
     }
 
 
@@ -15867,7 +15873,7 @@ def _learning_exclusion_reasons_for_loaded_outcome(item: Dict[str, Any]) -> List
         return explicit
     reasons: List[str] = []
     if payload.get("validationVersion") != TRADEABLE_VALIDATION_VERSION:
-        reasons.append("验证版本不是 v2_tradeable")
+        reasons.append(f"验证版本不是 {TRADEABLE_VALIDATION_VERSION}")
     if payload.get("validationStatus") and payload.get("validationStatus") != "final":
         reasons.append(f"验证状态 {payload.get('validationStatus')}")
     source_text = str(item.get("actualSource") or payload.get("actualSource") or item.get("dataSource") or payload.get("dataSource") or "")

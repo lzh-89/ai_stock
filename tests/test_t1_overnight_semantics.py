@@ -54,6 +54,46 @@ class T1OvernightSemanticsTest(unittest.TestCase):
         self.assertEqual(display["reviewStatus"], "partial")
         self.assertEqual(display["reviewStatusLabel"], "部分缺数据")
 
+    def test_partial_execution_has_its_own_review_label(self):
+        sample = svc._review_sample_meta(
+            run={"recommendationDate": "2026-08-03", "scanTime": "14:40", "status": "done"},
+            outcome_status="verified",
+            run_role="official",
+            tradeable_count=1,
+            outcome_count=1,
+            learning_eligible_count=0,
+            primary_partial_execution_count=1,
+        )
+        display = svc._review_display_meta({}, sample, "verified", "official")
+        self.assertEqual(sample["sampleClass"], "usable")
+        self.assertEqual(sample["sampleLabel"], "部分成交样本")
+        self.assertEqual(display["reviewStatusLabel"], "部分成交样本")
+        self.assertEqual(display["reviewStatusTone"], "warn")
+
+    def test_portfolio_keeps_true_empty_slot_as_cash_but_rejects_missing_component_data(self):
+        complete = {
+            "code": "000001",
+            "aiRank": 1,
+            "tradeable": {"primaryScenario": {"dataStatus": "ok", "netReturnPct": 3.0}},
+            "tradeReturnEligible": True,
+            "recommendationQualityEligible": True,
+        }
+        two_pick = svc._portfolio_comparison([complete, {**complete, "code": "000002", "aiRank": 2}])
+        self.assertEqual(two_pick["cashSlots"], 1)
+        self.assertEqual(two_pick["portfolioReturnPct"], 2.0)
+        missing = {
+            "code": "000003",
+            "aiRank": 3,
+            "tradeable": {"primaryScenario": {"dataStatus": "minute_missing", "netReturnPct": None}},
+            "tradeReturnEligible": False,
+            "recommendationQualityEligible": True,
+        }
+        incomplete = svc._portfolio_comparison([complete, {**complete, "code": "000002", "aiRank": 2}, missing])
+        self.assertEqual(incomplete["cashSlots"], 0)
+        self.assertEqual(incomplete["dataMissingSlots"], 1)
+        self.assertIsNone(incomplete["portfolioReturnPct"])
+        self.assertEqual(incomplete["status"], "data_insufficient")
+
     def test_data_insufficient_official_run_is_partial_not_diagnostic(self):
         sample = svc._review_sample_meta(
             run={"recommendationDate": "2026-08-03", "scanTime": "14:40", "status": "done"},
@@ -122,7 +162,7 @@ class T1OvernightSemanticsTest(unittest.TestCase):
         )
         self.assertTrue(any("正式推荐发布后的分钟成交证据" in reason for reason in reasons))
 
-    def test_post_publish_minute_produces_strict_entry_execution(self):
+    def test_formal_entry_does_not_depend_on_board_lot_capacity(self):
         result = svc._simulated_entry_execution(
             run={
                 "recommendationDate": "2026-10-14",
@@ -131,11 +171,14 @@ class T1OvernightSemanticsTest(unittest.TestCase):
             },
             buy_reference=10.0,
             recommendation_minute_series=[
-                {"time": "2026-10-14 14:42", "open": 10.1, "close": 10.2, "volume": 5000}
+                {"time": "2026-10-14 14:42", "timeLabel": "end", "open": 10.1, "close": 10.2, "volume": 1, "amount": 10.2},
+                {"time": "2026-10-14 14:43", "timeLabel": "end", "open": 10.2, "close": 10.3, "volume": 1, "amount": 10.3},
             ],
         )
-        self.assertEqual(result["status"], "executed_from_minute")
+        self.assertEqual(result["status"], "formal_entry_priced")
         self.assertTrue(result["executable"])
+        self.assertEqual(result["entryTime"], "2026-10-14T14:43:00")
+        self.assertNotIn("filledQuantity", result)
 
     def test_legacy_recommendation_snapshot_cannot_become_strict_entry_evidence(self):
         outcome = svc._build_outcome(
@@ -161,12 +204,27 @@ class T1OvernightSemanticsTest(unittest.TestCase):
             ],
             entry_execution_minute_series=[],
         )
-        self.assertEqual(outcome["entryExecution"]["status"], "reference_price_without_minute")
+        self.assertEqual(outcome["entryExecution"]["status"], "entry_price_evidence_missing")
         self.assertFalse(outcome["learningEligible"])
 
     def test_dedicated_post_publish_snapshot_can_become_strict_entry_evidence(self):
         post_publish = [
-            {"time": "2026-10-12 14:42", "open": 10.02, "close": 10.03, "volume": 5000}
+            {
+                "time": "2026-10-12 14:42",
+                "timeLabel": "end",
+                "open": 10.02,
+                "close": 10.03,
+                "volume": 1000,
+                "amount": 10.03 * 1000,
+            },
+            {
+                "time": "2026-10-12 14:43",
+                "timeLabel": "end",
+                "open": 10.02,
+                "close": 10.03,
+                "volume": 500000,
+                "amount": 10.03 * 500000,
+            }
         ]
         outcome = svc._build_outcome(
             run={
@@ -189,8 +247,67 @@ class T1OvernightSemanticsTest(unittest.TestCase):
             recommendation_minute_series=post_publish,
             entry_execution_minute_series=post_publish,
         )
-        self.assertEqual(outcome["entryExecution"]["status"], "executed_from_minute")
+        self.assertEqual(outcome["entryExecution"]["status"], "formal_entry_priced")
         self.assertTrue(outcome["learningEligible"])
+
+    def test_formal_entry_ignores_capital_participation_and_remains_learnable(self):
+        post_publish = [
+            {
+                "time": "2026-10-12 14:42",
+                "timeLabel": "end",
+                "open": 10.02,
+                "close": 10.03,
+                "volume": 1000,
+                "amount": 10.03 * 1000,
+            },
+            {
+                "time": "2026-10-12 14:43",
+                "timeLabel": "end",
+                "open": 10.02,
+                "close": 10.03,
+                "volume": 100000,
+                "amount": 10.03 * 100000,
+            },
+        ]
+        outcome = svc._build_outcome(
+            run={
+                "id": 96,
+                "recommendationDate": "2026-10-12",
+                "scanTime": "14:40",
+                "market": {"decisionTiming": {"signalPublishedAt": "2026-10-12T14:41:00"}},
+            },
+            pick={"code": "000001", "name": "测试股", "price": 10.0, "dataQuality": {"grade": "A"}},
+            series=[
+                {"date": "2026-10-12", "open": 9.8, "high": 10.1, "low": 9.7, "close": 10.0},
+                {"date": "2026-10-13", "open": 10.1, "high": 10.3, "low": 9.9, "close": 10.2},
+            ],
+            minute_series=[
+                {"time": "2026-10-13 09:45", "timeLabel": "end", "open": 10.1, "high": 10.2, "low": 10.0, "close": 10.15, "volume": 100000, "amount": 10.15 * 100000}
+            ],
+            data_source="daily_test",
+            minute_source="minute_test",
+            verified_at="2026-10-13T15:10:00",
+            recommendation_minute_series=post_publish,
+            entry_execution_minute_series=post_publish,
+        )
+        primary = outcome["tradeable"]["primaryScenario"]
+        self.assertEqual(outcome["entryExecution"]["status"], "formal_entry_priced")
+        self.assertNotIn("filledQuantity", outcome["entryExecution"])
+        self.assertIsNotNone(primary["netReturnPct"])
+        self.assertTrue(outcome["learningEligible"])
+
+    def test_no_post_publish_execution_after_cutoff_remains_unexecutable(self):
+        result = svc._simulated_entry_execution(
+            run={
+                "recommendationDate": "2026-10-12",
+                "scanTime": "14:56",
+                "market": {"decisionTiming": {"signalPublishedAt": "2026-10-12T14:56:00"}},
+            },
+            buy_reference=10.0,
+            recommendation_minute_series=[],
+        )
+        self.assertEqual(result["status"], "entry_not_executable")
+        self.assertFalse(result["executable"])
 
     def test_learnable_ai_semifinal_rules_final_keeps_ai_scope_separate(self):
         sample = {
