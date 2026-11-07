@@ -19,13 +19,15 @@ const state = {
   stageConfig: null,
   stageStatus: null,
   strategyGovernance: null,
+  strategyDeployment: null,
+  v3Replay: null,
   criticStatus: null,
   strategyFeedback: null,
   autoRunStatus: null,
   advancedGovernanceLoaded: false
 };
 
-const ZERO_PICK_SELECTION_MODES = ["market_risk_zero_pick", "data_quality_zero_pick", "guardrail_zero_pick", "invalid_non_trading_day"];
+const ZERO_PICK_SELECTION_MODES = ["market_risk_zero_pick", "data_quality_zero_pick", "guardrail_zero_pick", "invalid_non_trading_day", "v3_active_top0"];
 
 const els = {
   pageEyebrow: document.querySelector("#pageEyebrow"),
@@ -87,6 +89,14 @@ const els = {
   strategyPendingActions: document.querySelector("#strategyPendingActions"),
   strategyReviewProgress: document.querySelector("#strategyReviewProgress"),
   strategyStateHistory: document.querySelector("#strategyStateHistory"),
+  strategyDeploymentSummary: document.querySelector("#strategyDeploymentSummary"),
+  strategyDeploymentBlockers: document.querySelector("#strategyDeploymentBlockers"),
+  strategyDeploymentEvents: document.querySelector("#strategyDeploymentEvents"),
+  deploymentObserveButton: document.querySelector("#deploymentObserveButton"),
+  deploymentRejectButton: document.querySelector("#deploymentRejectButton"),
+  deploymentApproveButton: document.querySelector("#deploymentApproveButton"),
+  deploymentCancelButton: document.querySelector("#deploymentCancelButton"),
+  deploymentRollbackButton: document.querySelector("#deploymentRollbackButton"),
   refreshStrategyStateButton: document.querySelector("#refreshStrategyStateButton"),
   continueObserveButton: document.querySelector("#continueObserveButton"),
   pauseStrategyButton: document.querySelector("#pauseStrategyButton"),
@@ -103,6 +113,11 @@ const els = {
   verifyPendingButton: document.querySelector("#verifyPendingButton"),
   historyDryRunButton: document.querySelector("#historyDryRunButton"),
   historySoftCleanupButton: document.querySelector("#historySoftCleanupButton"),
+  v3ReplayDateFrom: document.querySelector("#v3ReplayDateFrom"),
+  v3ReplayDateTo: document.querySelector("#v3ReplayDateTo"),
+  v3ReplayButton: document.querySelector("#v3ReplayButton"),
+  v3ReplaySummary: document.querySelector("#v3ReplaySummary"),
+  v3ReplayRows: document.querySelector("#v3ReplayRows"),
   baselineComparison: document.querySelector("#baselineComparison"),
   outcomeSummary: document.querySelector("#outcomeSummary"),
   outcomeRows: document.querySelector("#outcomeRows"),
@@ -132,6 +147,11 @@ function init() {
   if (requestedPoolSize && Number(requestedPoolSize) !== state.poolSize) syncUrl();
   if (state.pageMode !== "config" || els.advancedGovernance?.open) loadAdvancedGovernanceData();
   if (els.strategyStateSummary) loadStrategyGovernance();
+  if (els.strategyDeploymentSummary) loadStrategyDeployment();
+  if (els.v3ReplaySummary) {
+    setValue(els.v3ReplayDateTo, new Date().toISOString().slice(0, 10));
+    loadV3Replay();
+  }
   loadAutoRunStatus();
   if (state.pageMode !== "config") loadLatest();
 }
@@ -164,10 +184,18 @@ function bindEvents() {
   on(els.runButton, "click", startRun);
   on(els.saveCriticConfigButton, "click", saveCriticConfig);
   on(els.saveStageConfigButton, "click", saveStageConfig);
-  on(els.refreshStrategyStateButton, "click", loadStrategyGovernance);
+  on(els.refreshStrategyStateButton, "click", () => {
+    loadStrategyGovernance();
+    loadStrategyDeployment();
+  });
   on(els.continueObserveButton, "click", () => reviewRiskPolicy("continue_observing"));
   on(els.pauseStrategyButton, "click", () => reviewRiskPolicy("pause"));
   on(els.recoverStrategyButton, "click", () => reviewRiskPolicy("recover"));
+  on(els.deploymentObserveButton, "click", () => reviewStrategyDeployment("continue_observing"));
+  on(els.deploymentRejectButton, "click", () => reviewStrategyDeployment("reject"));
+  on(els.deploymentApproveButton, "click", approveStrategyDeployment);
+  on(els.deploymentCancelButton, "click", cancelStrategyDeployment);
+  on(els.deploymentRollbackButton, "click", rollbackStrategyDeployment);
   on(els.advancedGovernance, "toggle", () => {
     if (els.advancedGovernance.open) loadAdvancedGovernanceData();
   });
@@ -178,6 +206,7 @@ function bindEvents() {
   on(els.verifyPendingButton, "click", verifyPendingRuns);
   on(els.historyDryRunButton, "click", historyDryRun);
   on(els.historySoftCleanupButton, "click", historySoftCleanup);
+  on(els.v3ReplayButton, "click", runV3Replay);
   on(els.refreshFeedbackButton, "click", refreshStrategyFeedback);
   on(els.feedbackSuggestions, "click", handleSuggestionAction);
   on(els.setOfficialButton, "click", () => updateRunRole("official"));
@@ -417,6 +446,108 @@ async function loadStrategyGovernance() {
   } finally {
     setDisabled(els.refreshStrategyStateButton, false);
   }
+}
+
+async function loadStrategyDeployment() {
+  if (!els.strategyDeploymentSummary) return;
+  try {
+    const response = await fetch("/api/t1-overnight-selection/strategy-deployment");
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `API ${response.status}`);
+    state.strategyDeployment = payload;
+    renderStrategyDeployment();
+  } catch (error) {
+    state.strategyDeployment = null;
+    setHtml(els.strategyDeploymentSummary, `<div class="governance-empty bad-text">正式策略切换状态加载失败：${escapeHtml(error?.message || error)}</div>`);
+  }
+}
+
+async function postStrategyDeployment(action, body) {
+  setActionLoading(true);
+  try {
+    const response = await fetch(`/api/t1-overnight-selection/strategy-deployment/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `API ${response.status}`);
+    state.strategyDeployment = payload;
+    renderStrategyDeployment();
+    renderNotice("正式策略切换决定已记录；历史 Run 不会被修改。");
+  } catch (error) {
+    renderError(error);
+  } finally {
+    setActionLoading(false);
+  }
+}
+
+async function reviewStrategyDeployment(decision) {
+  const reason = window.prompt(decision === "reject" ? "请填写拒绝本次晋级的原因：" : "请填写继续观察的原因或下次关注条件：", "");
+  if (!reason?.trim()) return;
+  let nextReviewDate = "";
+  if (decision === "continue_observing") {
+    nextReviewDate = window.prompt("可填写下次评审日期（可留空，格式 YYYY-MM-DD）：", "") || "";
+  }
+  await postStrategyDeployment("review", { decision, reason: reason.trim(), nextReviewDate, actor: "local_user" });
+}
+
+async function approveStrategyDeployment() {
+  const deployment = state.strategyDeployment || {};
+  const report = deployment.latestEvaluationReport || {};
+  if (!deployment.promotionReviewAllowed) return;
+  const metrics = report.metrics || {};
+  const accepted = window.confirm(
+    `请核对本次正式切换：\n\n当前正式：${deployment.currentOfficialVersion || "--"}\n目标版本：${deployment.targetStrategyVersion || "--"}\n` +
+    `冻结报告：#${report.id || "--"}，有效 ${report.effectiveDayCount || 0} 日\n平均扣费净收益：${formatPct(metrics.avgDailyNetReturnPct)}\n` +
+    `相对当前正式配对差：${formatPct(metrics.avgPairedDeltaPct)}\n最大回撤：${formatPct(metrics.maxDrawdownPct)}\n\n` +
+    "确认固定版本和阈值、只影响未来 Run，且发生技术失败时退回旧正式策略？"
+  );
+  if (!accepted) return;
+  const effectiveFromTradeDate = window.prompt("计划从哪个交易日的新 Run 开始生效？", deployment.nextAvailableTradeDate || "") || "";
+  if (!effectiveFromTradeDate) return;
+  const reason = window.prompt("请填写批准原因：", "V3 已通过冻结评审，批准从计划交易日开始正式生效") || "";
+  if (!reason.trim()) return;
+  const confirmationText = window.prompt(`请输入“${deployment.confirmationTextRequired || "确认启用V3"}”完成最终确认：`, "") || "";
+  if (!confirmationText) return;
+  await postStrategyDeployment("approve", {
+    deploymentRevision: deployment.deploymentRevision,
+    evaluationReportId: report.id,
+    evaluationReportHash: report.reportHash,
+    effectiveFromTradeDate,
+    confirmationText,
+    reason: reason.trim(),
+    actor: "local_user",
+    confirmations: {
+      readFrozenReport: true,
+      confirmFixedVersions: true,
+      futureRunsOnly: true,
+      understandRollback: true
+    }
+  });
+}
+
+async function cancelStrategyDeployment() {
+  const deployment = state.strategyDeployment || {};
+  const reason = window.prompt("请填写撤销待生效切换的原因：", "") || "";
+  if (!reason.trim()) return;
+  await postStrategyDeployment("cancel", { deploymentRevision: deployment.deploymentRevision, reason: reason.trim(), actor: "local_user" });
+}
+
+async function rollbackStrategyDeployment() {
+  const deployment = state.strategyDeployment || {};
+  if (!window.confirm(`将从下一个完整 Run 退回 ${deployment.fallbackStrategyVersion || "上一正式策略"}。历史 Run 和历史收益不会修改，是否继续？`)) return;
+  const effectiveFromTradeDate = window.prompt("回滚从哪个交易日的新 Run 开始生效？", deployment.nextAvailableTradeDate || "") || "";
+  if (!effectiveFromTradeDate) return;
+  const reason = window.prompt("请填写回滚原因：", "") || "";
+  if (!reason.trim()) return;
+  await postStrategyDeployment("rollback", {
+    deploymentRevision: deployment.deploymentRevision,
+    effectiveFromTradeDate,
+    reason: reason.trim(),
+    confirmHistoricalRunsUnchanged: true,
+    actor: "local_user"
+  });
 }
 
 async function reviewRiskPolicy(action) {
@@ -681,6 +812,87 @@ async function historySoftCleanup() {
   } finally {
     setActionLoading(false);
   }
+}
+
+async function loadV3Replay() {
+  try {
+    const response = await fetch("/api/t1-overnight-selection/v3-replay");
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `API ${response.status}`);
+    state.v3Replay = payload;
+    renderV3Replay(payload);
+  } catch (error) {
+    setHtml(els.v3ReplaySummary, `<div class="empty compact">${escapeHtml(error?.message || "重播报告加载失败")}</div>`);
+  }
+}
+
+async function runV3Replay() {
+  const dateFrom = els.v3ReplayDateFrom?.value || "";
+  const dateTo = els.v3ReplayDateTo?.value || "";
+  const ok = window.confirm("将生成一份新的 V3 历史只读重播报告。该操作不会修改任何历史推荐或结果，也不会让 V3 自动转为正式策略。是否继续？");
+  if (!ok) return;
+  setActionLoading(true);
+  startLongAction("正在生成 V3 历史重播报告", "只读检查历史证据，不改历史 run");
+  try {
+    const response = await fetch("/api/t1-overnight-selection/v3-replay/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dateFrom, dateTo })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `API ${response.status}`);
+    state.v3Replay = payload;
+    renderV3Replay(payload);
+    const message = `重播报告已生成：共 ${formatInteger(payload.runCount)} 个正式 run，A级 ${formatInteger(payload.gradeCounts?.A)}、B级 ${formatInteger(payload.gradeCounts?.B)}、C级 ${formatInteger(payload.gradeCounts?.C)}；历史数据${payload.historicalRowsUnchanged ? "确认未改变" : "校验异常，请停止使用报告"}。`;
+    renderNotice(message);
+    showActionModal({ tone: payload.historicalRowsUnchanged ? "good" : "bad", title: "V3 历史重播完成", message });
+  } catch (error) {
+    const message = error?.message || String(error || "V3 历史重播失败");
+    renderError(error);
+    showActionModal({ tone: "bad", title: "V3 历史重播失败", message });
+  } finally {
+    finishLongAction();
+    setActionLoading(false);
+  }
+}
+
+function renderV3Replay(payload = {}) {
+  if (!els.v3ReplaySummary) return;
+  if (!payload || payload.status === "not_run") {
+    setHtml(els.v3ReplaySummary, `<div class="empty compact">${escapeHtml(payload?.message || "尚未生成重播报告")}</div>`);
+    setHtml(els.v3ReplayRows, `<tr><td colspan="7" class="empty">暂无重播明细</td></tr>`);
+    return;
+  }
+  const grades = payload.gradeCounts || {};
+  const metrics = payload.metrics || {};
+  setHtml(els.v3ReplaySummary, [
+    ["覆盖正式 run", formatInteger(payload.runCount), `${payload.periodStart || "--"} 至 ${payload.periodEnd || "--"}`],
+    ["A级精确链路", formatInteger(grades.A), `已有精确结果 ${formatInteger(payload.exactOutcomeCount)}`],
+    ["B/C级受限证据", `${formatInteger(grades.B)} / ${formatInteger(grades.C)}`, "不计算晋级收益"],
+    ["V3精确平均净收益", formatPct(metrics.exactV3AverageNetReturnPct), "仅A级且已有精确成交结果"],
+    ["同日平均差值", formatPct(metrics.exactAveragePairedDeltaPct), "V3净收益－旧策略净收益"],
+    ["历史数据保护", payload.historicalRowsUnchanged ? "未改变" : "校验异常", "报告不影响正式推荐"]
+  ].map(([label, value, help]) => `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong><small>${escapeHtml(help)}</small></article>`).join(""));
+  const rows = Array.isArray(payload.details) ? payload.details : [];
+  setHtml(els.v3ReplayRows, rows.length ? rows.map((item) => `
+    <tr>
+      <td>${escapeHtml(item.recommendationDate || "--")}</td>
+      <td><span class="label-chip ${item.evidenceGrade === "A" ? "good" : item.evidenceGrade === "B" ? "warn" : "muted"}">${escapeHtml(item.evidenceGrade || "--")}级</span></td>
+      <td>${escapeHtml(v3ReplayStatusLabel(item.replayStatus))}</td>
+      <td>${formatPct(item.v3NetReturnPct)}</td>
+      <td>${formatPct(item.controlNetReturnPct)}</td>
+      <td>${formatPct(item.pairedDeltaPct)}</td>
+      <td>${escapeHtml(item.limitation || "--")}</td>
+    </tr>`).join("") : `<tr><td colspan="7" class="empty">所选日期内没有正式 run</td></tr>`);
+}
+
+function v3ReplayStatusLabel(status) {
+  return ({
+    exact_outcome_ready: "筛选链和收益均可精确复核",
+    exact_chain_waiting_outcome: "筛选链完整，等待次日收益",
+    evidence_gap_review_only: "只能检查证据缺口",
+    result_only_unreplayable: "无法还原筛选过程"
+  })[status] || "--";
 }
 
 async function updateRunRole(role) {
@@ -1288,10 +1500,24 @@ function shadowTop3Html(run) {
   const shadow = market.shadowTop3 || {};
   const aiShadow = market.shadowDeepSeekTailTop3 || {};
   const policy = market.strategyPolicy || {};
+  const v3Strategy = market.v3Strategy || {};
   const comparison = market.shadowComparison || {};
   const picks = Array.isArray(shadow.picks) ? shadow.picks : [];
   const aiPicks = Array.isArray(aiShadow.picks) ? aiShadow.picks : [];
-  if (!picks.length && !aiPicks.length && !aiShadow.error && !aiShadow.reason && !policy.strategyPolicyVersion) return "";
+  const legacyArchived = shadow.stage === "historical_archive" || market.legacyShadowArchive?.status === "future_generation_stopped";
+  if (!picks.length && !aiPicks.length && !aiShadow.error && !aiShadow.reason && !policy.strategyPolicyVersion && !v3Strategy.pipelineVersion && !v3Strategy.version) return "";
+  if (legacyArchived) return `
+    <section class="shadow-top3-panel">
+      <div class="shadow-top3-head">
+        <div>
+          <strong>V3 主影子与轻量基准</strong>
+          <small>旧规则尾盘、AI尾盘、动量、板块和第三槽等重复影子已停止新增；历史结果仍可在复盘页只读查看。</small>
+        </div>
+        <span class="shadow-badge">旧影子已归档</span>
+      </div>
+      ${v3StrategyHtml(v3Strategy)}
+      ${strategyPolicyShadowHtml(policy, market)}
+    </section>`;
   const finalCodes = new Set(Array.isArray(comparison.finalCodes) ? comparison.finalCodes : []);
   const changedCount = Number(comparison.changedCount || 0);
   const aiChangedCount = Number(comparison.deepSeekTailChangedCount || 0);
@@ -1309,9 +1535,39 @@ function shadowTop3Html(run) {
       ${!aiPicks.length && aiShadow.reason ? `<p class="shadow-top3-note">${escapeHtml(aiShadow.reason)}</p>` : ""}
       ${aiShadow.error && !aiPicks.length ? `<p class="shadow-top3-note">${escapeHtml(aiShadow.error)}</p>` : ""}
       ${comparison.reason ? `<p class="shadow-top3-note">${escapeHtml(comparison.reason)}</p>` : ""}
+      ${v3StrategyHtml(v3Strategy)}
       ${strategyPolicyShadowHtml(policy, market)}
     </section>
   `;
+}
+
+function v3StrategyHtml(strategy = {}) {
+  if (!strategy.pipelineVersion && !strategy.version) return "";
+  const recall = strategy.recallAllocation || {};
+  const validation = strategy.validationAllocation || {};
+  const model = strategy.netExpectationModel || {};
+  const tail = strategy.tailEvidence || strategy.tailAllocation || {};
+  const picks = Array.isArray(strategy.picks) ? strategy.picks : [];
+  const status = {
+    selected: `${picks.length} 只通过`,
+    active_top0: "主动空仓",
+    technical_failure: "技术失败，使用安全降级",
+    not_ready: "模型收集中"
+  }[strategy.decisionStatus] || "等待完成";
+  const chips = picks.length ? picks.map((pick, index) => `<a class="shadow-pick-chip" href="${escapeHtml(stockAnalysisHref(pick))}"><b>#${index + 1}</b>${escapeHtml(pick.name || normalizedStockCode(pick.code))}<small>${escapeHtml(normalizedStockCode(pick.code))}</small></a>`).join("") : `<span class="shadow-empty-chip">Top0</span>`;
+  return `<div class="shadow-policy-panel">
+    <div class="shadow-policy-head"><div><strong>V3 全链路主实验</strong><small>硬过滤后全市场 → 500 → 120 → 数据合格 → 1分钟尾盘 → 短名单 → Top0～Top2</small></div><span class="shadow-badge">${strategy.affectsOfficialRecommendation ? "本 Run 正式" : "仅影子"}</span></div>
+    <div class="shadow-policy-meta">
+      <span><small>500召回池</small><strong>${formatInteger(recall.selectedCount || 0)}</strong></span>
+      <span><small>15分钟验证</small><strong>${formatInteger(validation.selectedCount || strategy.validationCandidateCount || 0)}</strong></span>
+      <span><small>净期望模型</small><strong>${model.rankingReady ? "可排序" : "收集中"}</strong></span>
+      <span><small>1分钟可用</small><strong>${formatInteger(tail.available || 0)} / ${formatInteger(tail.planned || 0)}</strong></span>
+      <span><small>短名单</small><strong>${formatInteger(strategy.shortlistCount || 0)}</strong></span>
+      <span><small>最终状态</small><strong>${escapeHtml(status)}</strong></span>
+    </div>
+    <div class="shadow-policy-picks">${chips}</div>
+    <small class="shadow-top3-note">技术失败、模型未就绪与主动空仓分开记录；未经人工批准前不改变正式推荐。</small>
+  </div>`;
 }
 
 function strategyPolicyShadowHtml(policy = {}, market = {}) {
@@ -1869,6 +2125,58 @@ function renderStrategyGovernance() {
     const missing = (policy.recoveryProgress || {}).missingConditions || [];
     els.recoverStrategyButton.title = actions.recoverAllowed ? "恢复后开启新的监控周期" : missing.join("；") || "当前不需要恢复";
   }
+}
+
+function renderStrategyDeployment() {
+  if (!els.strategyDeploymentSummary) return;
+  const deployment = state.strategyDeployment || {};
+  const report = deployment.latestEvaluationReport || {};
+  const metrics = report.metrics || {};
+  const lifecycle = String(deployment.lifecycleState || "shadow_collecting");
+  const tone = lifecycle === "official" ? "good" : lifecycle === "scheduled" ? "warn" : lifecycle === "rolled_back" ? "neutral" : "warn";
+  setHtml(els.strategyDeploymentSummary, `
+    <article class="governance-state-card ${tone}">
+      <span>切换状态</span><strong>${escapeHtml(deployment.stateLabel || "影子验证中")}</strong>
+      <small>${escapeHtml(deployment.reason || "工程完成不会自动转正式")}</small>
+    </article>
+    <article class="governance-state-card">
+      <span>当前正式策略</span><strong>${escapeHtml(deployment.currentOfficialVersion || "--")}</strong>
+      <small>目标：${escapeHtml(deployment.targetStrategyVersion || "--")}</small>
+    </article>
+    <article class="governance-state-card ${deployment.promotionReviewAllowed ? "good" : "warn"}">
+      <span>120 日冻结报告</span><strong>${report.id ? `#${formatInteger(report.id)}` : "尚未形成"}</strong>
+      <small>有效 ${formatInteger(report.effectiveDayCount)} 日 · 覆盖率 ${formatPct(report.coveragePct)}</small>
+    </article>
+    <article class="governance-state-card">
+      <span>真实 open_15m 结果</span><strong>${formatPct(metrics.avgDailyNetReturnPct)}</strong>
+      <small>相对当前正式 ${formatPct(metrics.avgPairedDeltaPct)} · 最大回撤 ${formatPct(metrics.maxDrawdownPct)}</small>
+    </article>
+  `);
+  const blockers = deployment.promotionBlockers || [];
+  setHtml(els.strategyDeploymentBlockers, blockers.length ? blockers.map((reason) => `
+    <article class="governance-list-row pending-medium"><div><strong>尚未满足</strong><small>批准按钮保持禁用</small></div><p>${escapeHtml(reason)}</p></article>
+  `).join("") : `<div class="governance-empty good-text">冻结报告的自动检查已全部通过，可以提交人工批准。</div>`);
+  const events = deployment.events || [];
+  setHtml(els.strategyDeploymentEvents, events.length ? events.slice(0, 8).map((item) => `
+    <article class="governance-history-row"><time>${escapeHtml(item.createdAt || "--")}</time><strong>${escapeHtml(deploymentEventLabel(item.eventType))}</strong><span>修订 ${formatInteger(item.deploymentRevision)}</span><p>${escapeHtml(item.reason || "--")}</p></article>
+  `).join("") : `<div class="governance-empty">暂无正式策略切换记录</div>`);
+  setDisabled(els.deploymentApproveButton, !deployment.promotionReviewAllowed || !["shadow_collecting", "review_ready"].includes(lifecycle));
+  if (els.deploymentCancelButton) els.deploymentCancelButton.hidden = lifecycle !== "scheduled";
+  if (els.deploymentRollbackButton) els.deploymentRollbackButton.hidden = lifecycle !== "official";
+  setDisabled(els.deploymentObserveButton, lifecycle === "official" || lifecycle === "scheduled");
+  setDisabled(els.deploymentRejectButton, lifecycle === "official" || lifecycle === "scheduled");
+}
+
+function deploymentEventLabel(value) {
+  return {
+    continue_observing: "继续观察",
+    reject: "拒绝本次晋级",
+    approve_scheduled: "批准并等待生效",
+    cancel_scheduled: "撤销待生效切换",
+    promotion_effective: "V3 正式生效",
+    rollback_scheduled: "安排回滚",
+    rollback_effective: "回滚正式生效"
+  }[value] || value || "状态变更";
 }
 
 function policyModeLabel(value) {
@@ -3032,6 +3340,11 @@ function stockAnalysisHref(itemOrCode) {
   return `./index.html?stock=${encodeURIComponent(stockCode)}&analyze=1#stock`;
 }
 
+function normalizedStockCode(code) {
+  const value = String(code || "").trim();
+  return /^\d{1,6}$/.test(value) ? value.padStart(6, "0") : value;
+}
+
 function stockAnalysisNameLink(item) {
   const name = item?.name || "--";
   const code = item?.code || "";
@@ -3227,6 +3540,7 @@ function setActionButtons() {
   setDisabled(els.verifyPendingButton, disabled);
   setDisabled(els.historyDryRunButton, disabled);
   setDisabled(els.historySoftCleanupButton, disabled);
+  setDisabled(els.v3ReplayButton, disabled);
   setDisabled(els.refreshFeedbackButton, disabled);
   const role = state.run?.runRole || "";
   setDisabled(els.setOfficialButton, disabled || !state.run?.id || role === "legacy" || role === "official" || quickResearch);
@@ -3305,12 +3619,14 @@ function selectionModeLabel(value) {
     market_risk_zero_pick: "市场风险Top0",
     data_quality_zero_pick: "数据质量Top0",
     guardrail_zero_pick: "守门Top0",
+    v3_t1_official: "V3 T+1正式策略",
+    v3_active_top0: "V3主动空仓",
     invalid_non_trading_day: "非交易日"
   }[value] || value || "--";
 }
 
 function modeClass(value) {
-  if (value === "ai_t1_overnight") return "mode-ai";
+  if (["ai_t1_overnight", "v3_t1_official"].includes(value)) return "mode-ai";
   if (value === "ai_semifinal_rules_final") return "mode-fallback";
   if (value === "rules_fallback") return "mode-fallback";
   if (String(value || "").includes("zero_pick")) return "warning-text";

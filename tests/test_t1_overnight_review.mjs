@@ -188,6 +188,40 @@ test('adaptive-exit role renders only execution and exit-branch diagnostics', ()
   assert.doesNotMatch(node.innerHTML, /保守净期望模型/);
 });
 
+test('shadow summary isolates execution version and distinguishes business statuses', () => {
+  const app = setup();
+  vm.runInContext(`
+    state.shadowFamily = "policy_experiment";
+    state.shadowRole = "policy_market_gate";
+    state.shadowPayload = {
+      sourceType: "forward_policy_experiment",
+      roles: [{
+        strategyPolicyVersion: "policy-v1",
+        executionProfileVersion: "execution-v1",
+        effectiveDays: 1,
+        targetTradeDays: 2,
+        hitDays: 0,
+        positiveHoldingDayRate: null,
+        positiveEffectiveDayRate: 0,
+      }],
+      facts: [
+        { recommendationDate: "2026-10-01", canonicalRunId: 1, strategyPolicyVersion: "policy-v1", executionProfileVersion: "execution-v1", status: "active_cash" },
+        { recommendationDate: "2026-10-02", canonicalRunId: 2, strategyPolicyVersion: "policy-v1", executionProfileVersion: "execution-v1", status: "not_applicable" },
+        { recommendationDate: "2026-10-03", canonicalRunId: 3, strategyPolicyVersion: "policy-v1", executionProfileVersion: "execution-v2", status: "technical_failure" },
+      ],
+    };
+  `, app.context);
+  app.context.renderShadowAnalytics();
+  const rows = app.element('#shadowAnalyticsRows').innerHTML;
+  const metrics = app.element('#shadowAnalyticsMetrics').innerHTML;
+  assert.match(rows, /主动空仓/);
+  assert.match(rows, /本日不适用/);
+  assert.doesNotMatch(rows, /技术失败/);
+  assert.doesNotMatch(rows, /2026-10-03/);
+  assert.match(metrics, /执行 execution-v1/);
+  assert.match(metrics, /仅统计适用且处理\/控制结果完整的同日样本/);
+});
+
 test('run detail exposes opening evidence eligibility and coverage', () => {
   const app = setup();
   app.context.renderDetail({
@@ -285,4 +319,49 @@ test('legacy run without policy data keeps the old shadow fallback', () => {
   const node = app.element('#shadowPanel');
   assert.match(node.innerHTML, /该 run 未记录影子推荐数据/);
   assert.doesNotMatch(node.innerHTML, /本期策略实验/);
+});
+
+test('summary keeps current strict and historical analyzable samples separate', () => {
+  const app = setup();
+  vm.runInContext(`state.payload = { reviewStats: {
+    displayLearnableRuns: 10,
+    learningEligibleOutcomes: 22,
+    historicalAnalyzableRuns: 25,
+    historicalAnalyzableOutcomes: 52,
+    historicalLegacyRuns: 23,
+    totalAnalyzableRuns: 35,
+    totalAnalyzableOutcomes: 74,
+  }};`, app.context);
+  app.context.renderSummary([], null);
+  const node = app.element('#summaryGrid');
+  assert.match(node.innerHTML, /当前版本可优化/);
+  assert.match(node.innerHTML, /历史版本可分析/);
+  assert.match(node.innerHTML, /全部可分析/);
+  assert.match(node.innerHTML, />35</);
+  assert.match(node.innerHTML, /分组展示不混算收益/);
+});
+
+test('run detail separates official cash decision from AI research status', () => {
+  const app = setup();
+  app.context.renderDetail({
+    id: 113,
+    recommendationDate: '2026-11-06',
+    scanTime: '14:40',
+    selectionMode: 'market_risk_zero_pick',
+    aiDecisionLabel: 'AI研究正常 Top0',
+    aiDecisionReason: '每个研究批次都合法返回 Top0。',
+    reviewStatus: 'reviewable',
+    reviewStatusLabel: '可看结果',
+    outcomes: [],
+    finalPicks: [],
+    market: {
+      marketContext: { label: '恐慌退潮' },
+      recommendationPolicy: { reason: '市场风险要求空仓' },
+    },
+  });
+  const node = app.element('#detailMetrics');
+  assert.match(node.innerHTML, /正式决策/);
+  assert.match(node.innerHTML, /市场风险Top0/);
+  assert.match(node.innerHTML, /AI研究链路/);
+  assert.match(node.innerHTML, /AI研究正常 Top0/);
 });

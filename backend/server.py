@@ -24,6 +24,8 @@ from backend.app.services.t1_overnight_selection_service import RiskPolicyConfli
 from backend.app.services.t1_entry_execution_evidence_service import T1EntryExecutionEvidenceService
 from backend.app.services.t1_opening_evidence_service import T1OpeningEvidenceService
 from backend.app.services.t1_shadow_analytics_service import T1ShadowAnalyticsService
+from backend.app.services.t1_strategy_deployment_service import StrategyDeploymentConflictError
+from backend.app.services.t1_v3_replay_service import T1V3ReplayService
 from backend.app.services.watchlist_service import WatchlistService
 from backend.app.settings import PROJECT_ROOT, load_settings
 from backend.app.universe_store import universe_response
@@ -48,6 +50,7 @@ T1_OVERNIGHT_SELECTION = T1OvernightSelectionService(SETTINGS, ANALYSIS, DATABAS
 T1_ENTRY_EXECUTION_EVIDENCE = T1EntryExecutionEvidenceService(ANALYSIS, DATABASE)
 T1_OPENING_EVIDENCE = T1OpeningEvidenceService(ANALYSIS, DATABASE)
 T1_SHADOW_ANALYTICS = T1ShadowAnalyticsService(DATABASE)
+T1_V3_REPLAY = T1V3ReplayService(DATABASE)
 T1_OVERNIGHT_SELECTION.start_watchdog()
 DAILY_KLINE_CACHE = DailyKlineCacheService(AnalysisService(SETTINGS, DATABASE), DATABASE)
 MORNING_SECTOR_RADAR = MorningSectorRadarService(SETTINGS, DATABASE)
@@ -192,6 +195,9 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/t1-overnight-selection/strategy-state":
             self._json(T1_OVERNIGHT_SELECTION.strategy_governance_status())
             return
+        if parsed.path == "/api/t1-overnight-selection/strategy-deployment":
+            self._json(T1_OVERNIGHT_SELECTION.strategy_deployment.status())
+            return
         if parsed.path == "/api/t1-overnight-selection/event-risk/status":
             self._json(T1_OVERNIGHT_SELECTION.event_risk_status())
             return
@@ -212,6 +218,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/t1-overnight-selection/shadow-analytics/status":
             self._json(T1_SHADOW_ANALYTICS.status())
+            return
+        if parsed.path == "/api/t1-overnight-selection/v3-replay":
+            self._json(T1_V3_REPLAY.latest())
             return
         if parsed.path == "/api/t1-overnight-selection/strategy-feedback":
             self._json({"feedback": T1_OVERNIGHT_SELECTION.latest_strategy_feedback(), "criticStatus": T1_OVERNIGHT_SELECTION.critic_status()})
@@ -274,7 +283,9 @@ class AppHandler(SimpleHTTPRequestHandler):
                         data = store.page(run_id, page=_parse_int(query.get("page", ["1"])[0], 1),
                             page_size=_parse_int(query.get("pageSize", ["50"])[0], 50),
                             query=query.get("query", [""])[0], group=query.get("group", [""])[0],
-                            stage=query.get("stage", [""])[0], sort=query.get("sort", ["preliminary_rank"])[0])
+                            round_number=_parse_int(query.get("round", ["0"])[0], 0),
+                            stage=query.get("stage", [""])[0], identity=query.get("identity", [""])[0],
+                            sort=query.get("sort", ["preliminary_rank"])[0])
                     else:
                         raise ValueError("无效档案路径")
                     self._json(data)
@@ -774,6 +785,25 @@ class AppHandler(SimpleHTTPRequestHandler):
                 LOGGER.exception("request t1 kill switch review failed")
                 self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
             return
+        if parsed.path in {
+            "/api/t1-overnight-selection/strategy-deployment/review",
+            "/api/t1-overnight-selection/strategy-deployment/approve",
+            "/api/t1-overnight-selection/strategy-deployment/cancel",
+            "/api/t1-overnight-selection/strategy-deployment/rollback",
+        }:
+            payload = self._read_json()
+            action = parsed.path.rsplit("/", 1)[-1]
+            try:
+                handler = getattr(T1_OVERNIGHT_SELECTION.strategy_deployment, action)
+                self._json(handler(payload))
+            except StrategyDeploymentConflictError as error:
+                self._json({"error": str(error)}, status=HTTPStatus.CONFLICT)
+            except ValueError as error:
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_REQUEST)
+            except Exception as error:  # noqa: BLE001 - deployment failure cannot alter recommendation state.
+                LOGGER.exception("request t1 strategy deployment action failed action=%s", action)
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
+            return
         if parsed.path.startswith("/api/t1-overnight-selection/runs/") and parsed.path.endswith("/verify"):
             parts = parsed.path.strip("/").split("/")
             run_id = _parse_int(parts[-2] if len(parts) >= 2 else "", 0)
@@ -927,6 +957,21 @@ class AppHandler(SimpleHTTPRequestHandler):
                 self._json(T1_OVERNIGHT_SELECTION.history_soft_cleanup())
             except Exception as error:  # noqa: BLE001 - keep soft cleanup readable.
                 LOGGER.warning("request t1 overnight history soft cleanup failed error=%s", error)
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
+            return
+        if parsed.path == "/api/t1-overnight-selection/v3-replay/run":
+            payload = self._read_json()
+            try:
+                self._json(
+                    T1_V3_REPLAY.run(
+                        date_from=str(payload.get("dateFrom") or ""),
+                        date_to=str(payload.get("dateTo") or ""),
+                    )
+                )
+            except ValueError as error:
+                self._json({"error": str(error)}, status=HTTPStatus.BAD_REQUEST)
+            except Exception as error:  # noqa: BLE001 - replay is research-only and must fail independently.
+                LOGGER.warning("request T1 V3 history replay failed error=%s", error)
                 self._json({"error": str(error)}, status=HTTPStatus.BAD_GATEWAY)
             return
         if parsed.path == "/api/intraday-entry-audit/run":

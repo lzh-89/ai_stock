@@ -25,6 +25,7 @@ from backend.app.database import Database
 from backend.app.engines.filter_engine import hard_filter_reason
 from backend.app.engines.scoring_engine import score_stock
 from backend.app.engines import t1_selection_policy as selection_policy
+from backend.app.engines import t1_v3_pipeline as v3_pipeline
 from backend.app.engines.timing_engine import attach_plan
 from backend.app.engines.t1_candidate_allocation import (
     VERSION as T1_ALLOCATION_VERSION,
@@ -58,7 +59,8 @@ from backend.app.services.ai_selector import _extract_picks
 from backend.app.services.analysis_service import AnalysisService
 from backend.app.services.t1_candidate_tracking_service import CandidateTrackingService
 from backend.app.services.t1_entry_execution_evidence_service import ENTRY_EXECUTION_EVIDENCE_VERSION
-from backend.app.t1_candidate_store import CandidateStore
+from backend.app.services.t1_strategy_deployment_service import T1StrategyDeploymentService
+from backend.app.t1_candidate_store import CandidateStore, v3_candidate_review
 from backend.app.settings import Settings
 
 
@@ -96,6 +98,7 @@ ZERO_PICK_SELECTION_MODES = {
     "ai_zero_pick",
     "ai_technical_failure_zero_pick",
     "ai_unavailable_zero_pick",
+    "v3_active_top0",
 }
 PRIMARY_TRADEABLE_SCENARIO_KEY = "open_15m"
 SUCCESS_NET_RETURN_THRESHOLD_PCT = 0.2
@@ -116,7 +119,22 @@ BASELINE_MARKET_SAMPLE_LIMIT = 60
 RANDOM_BASELINE_ITERATIONS = 30
 AI_EVIDENCE_VALIDATION_VERSION = "v5_formal_evidence_selection_slip"
 T1_EVIDENCE_VERSION = "v4_layered_sector_state_shadow"
-T1_TRADE_DATE_GUARD_VERSION = "v1_t1_trade_date_guard"
+T1_TRADE_DATE_GUARD_VERSION = "v2_exchange_calendar_quote_date_guard"
+# Runtime does not always have a Tushare token. Keep the current SSE annual
+# closure notice as an offline fail-safe; the cached exchange calendar remains
+# authoritative when it covers the requested date.
+# https://www.sse.com.cn/disclosure/dealinstruc/closed/
+T1_SSE_OFFICIAL_CLOSURES = {
+    "2026": (
+        ("2026-01-01", "2026-01-03", "元旦"),
+        ("2026-02-15", "2026-02-23", "春节"),
+        ("2026-04-04", "2026-04-06", "清明节"),
+        ("2026-05-01", "2026-05-05", "劳动节"),
+        ("2026-06-19", "2026-06-21", "端午节"),
+        ("2026-09-25", "2026-09-27", "中秋节"),
+        ("2026-10-01", "2026-10-07", "国庆节"),
+    ),
+}
 T1_SECTOR_STATE_SHADOW_VERSION = "v1_t1_sector_state_shadow"
 T1_STYLE_REGIME_SHADOW_VERSION = "v1_t1_style_regime_shadow"
 T1_EXECUTION_CONTRACT_VERSION = FORMAL_ENTRY_VERSION
@@ -129,7 +147,7 @@ T1_MARKET_GATE_VERSION = "market_gate_candidate_v1"
 T1_NEGATIVE_GATE_VERSION = "negative_gate_shadow_v2"
 T1_DRIVER_TAXONOMY_VERSION = "t1_driver_taxonomy_v1"
 T1_SHADOW_SCHEMA_VERSION = "t1_shadow_roles_v3"
-T1_SHADOW_AGGREGATION_VERSION = "t1_shadow_analytics_v4"
+T1_SHADOW_AGGREGATION_VERSION = "t1_shadow_analytics_v5"
 T1_EXECUTION_PROFILE_VERSION = REPLAY_EXECUTION_PROFILE_VERSION
 T1_TAIL_MINUTE_PERIOD = "1m"
 T1_TAIL_SUPPORT_CLASSIFIER_CONFIG = {
@@ -349,6 +367,7 @@ class T1OvernightSelectionService:
         self.database = database
         self.candidate_store = CandidateStore(database)
         self.candidate_tracking = CandidateTrackingService(database, token=settings.tushare_token)
+        self.strategy_deployment = T1StrategyDeploymentService(database, T1_STRATEGY_POLICY_VERSION)
         self.event_risk_provider = T1EventRiskProvider(database)
         self._lock = threading.Lock()
         self._threads: Dict[int, threading.Thread] = {}
@@ -591,10 +610,22 @@ class T1OvernightSelectionService:
         final_limit = _clamp_int(final_limit, 1, 5, DEFAULT_FINAL_LIMIT)
         run_profile = _run_profile_for_pool(pool_size)
         recommendation_date = date.today().isoformat()
+        deployment_snapshot = self.strategy_deployment.freeze_for_run(recommendation_date)
         stage_config = self.stage_config()
         stage_status = self.stage_status(stage_config)
         risk_policy_state = self.risk_policy_state()
-        trade_date_status = _t1_trade_date_status(recommendation_date, scan_time, actual_source=source)
+        exchange_calendar = _t1_exchange_calendar_snapshot(
+            self.database,
+            recommendation_date,
+            calendar_provider=self.candidate_tracking.calendar,
+            refresh=True,
+        )
+        trade_date_status = _t1_trade_date_status(
+            recommendation_date,
+            scan_time,
+            actual_source=source,
+            exchange_calendar=exchange_calendar,
+        )
         run_role = _initial_run_role(scan_time, force, pool_size)
         if _t1_trade_date_blocks_official(trade_date_status):
             run_role = "invalid"
@@ -659,6 +690,7 @@ class T1OvernightSelectionService:
                     "strategyPolicyVersion": T1_STRATEGY_POLICY_VERSION,
                     "riskPolicyConfigSnapshot": _risk_policy_config_snapshot(stage_config),
                     "strategyRiskStateSnapshot": risk_policy_state,
+                    "strategyDeploymentSnapshot": deployment_snapshot,
                 },
                 "workerId": self.worker_id,
                 "leaseExpiresAt": (datetime.now() + timedelta(seconds=T1_RUN_LEASE_SECONDS)).isoformat(timespec="seconds"),
@@ -678,10 +710,26 @@ class T1OvernightSelectionService:
                     "strategyPolicyVersion": T1_STRATEGY_POLICY_VERSION,
                     "riskPolicyConfigSnapshot": _risk_policy_config_snapshot(stage_config),
                     "strategyRiskStateSnapshot": risk_policy_state,
+                    "strategyDeploymentSnapshot": deployment_snapshot,
                 },
             },
             [],
         )
+        if bool(deployment_snapshot.get("effectiveForThisRun")) and not _t1_trade_date_blocks_official(trade_date_status):
+            activated = self.strategy_deployment.activate_for_run(run_id, recommendation_date)
+            current = self.database.load_t1_overnight_selection_run(run_id) or {}
+            frozen_request = dict(current.get("request") or {})
+            frozen_market = dict(current.get("market") or {})
+            frozen_request["strategyDeploymentActivation"] = {
+                "deploymentId": activated.get("deploymentId"),
+                "deploymentRevision": activated.get("deploymentRevision"),
+                "activatedAt": activated.get("activatedAt") or "",
+            }
+            frozen_market["strategyDeploymentActivation"] = dict(frozen_request["strategyDeploymentActivation"])
+            self.database.update_t1_overnight_selection_run(
+                run_id,
+                {"request": frozen_request, "market": frozen_market},
+            )
         if _t1_trade_date_blocks_official(trade_date_status):
             reason = _t1_trade_date_block_reason(trade_date_status)
             self.database.update_t1_overnight_selection_run(
@@ -1190,11 +1238,17 @@ class T1OvernightSelectionService:
         stats_limit = max(500, int(limit or 60))
         stats_runs = self.database.list_t1_overnight_selection_runs(limit=stats_limit, status=status)
         stats_summaries = [self._review_run_summary(run) for run in stats_runs]
-        runs = stats_runs[: max(1, int(limit or 60))]
-        summaries = stats_summaries[: len(runs)]
         normalized_review_status = str(review_status or "").strip()
+        matching_summaries = stats_summaries
         if normalized_review_status:
-            summaries = [run for run in summaries if run.get("reviewStatus") == normalized_review_status]
+            matching_summaries = [
+                run for run in stats_summaries
+                if run.get("reviewStatus") == normalized_review_status
+            ]
+        # Filtering must precede pagination.  Otherwise a user can see a
+        # non-zero status card while the list incorrectly says there are no
+        # matching runs merely because the newest page contains other states.
+        summaries = matching_summaries[: max(1, int(limit or 60))]
         selected_run_id = int(run_id or 0)
         if selected_run_id <= 0:
             selected_run_id = _default_review_run_id(summaries)
@@ -1210,6 +1264,7 @@ class T1OvernightSelectionService:
             "selectedRun": selected,
             "selectedRunId": selected_run_id,
             "count": len(summaries),
+            "matchingCount": len(matching_summaries),
             "reviewStats": _review_stats(stats_summaries),
             "optimizationStats": _optimization_review_stats(stats_summaries),
             "validationAutoFreeze": self.validation_auto_freeze_status(),
@@ -1224,7 +1279,15 @@ class T1OvernightSelectionService:
         tradeable_summary = _tradeable_summary(outcomes)
         outcome_status = _outcome_status(run, outcomes)
         run_role = _run_role(run)
-        learning_eligible_count = len([item for item in outcomes if bool(_outcome_payload(item).get("learningEligible"))])
+        learning_outcomes = [item for item in outcomes if _is_learning_eligible_outcome(item)]
+        historical_learning_outcomes = [item for item in outcomes if _is_historical_learning_outcome(item)]
+        learning_eligible_count = len(learning_outcomes)
+        historical_learning_eligible_count = len(historical_learning_outcomes)
+        learning_primary_returns = [
+            _safe_number(((_outcome_payload(item).get("tradeable") or {}).get("primaryScenario") or {}).get("netReturnPct"))
+            for item in learning_outcomes
+        ]
+        learning_primary_returns = [float(value) for value in learning_primary_returns if value is not None]
         sample = _review_sample_meta(
             run=run,
             outcome_status=outcome_status,
@@ -1232,13 +1295,21 @@ class T1OvernightSelectionService:
             tradeable_count=int(tradeable_summary.get("tradeableCount") or 0),
             outcome_count=int(run.get("outcomeCount") or len(outcomes) or 0),
             learning_eligible_count=learning_eligible_count,
+            historical_learning_eligible_count=historical_learning_eligible_count,
             primary_entry_not_executable_count=int(tradeable_summary.get("primaryEntryNotExecutableCount") or 0),
             primary_minute_missing_count=int(tradeable_summary.get("primaryMinuteMissingCount") or 0),
             primary_partial_execution_count=int(tradeable_summary.get("primaryPartialExecutionCount") or 0),
         )
         display = _review_display_meta(run, sample, outcome_status, run_role)
         ai_decision = _review_ai_decision_meta(run)
-        learning_scope = _review_learning_scope_meta(display, ai_decision, learning_eligible_count)
+        learning_scope = _review_learning_scope_meta(
+            display,
+            ai_decision,
+            learning_eligible_count,
+            historical_learning_eligible_count,
+        )
+        effective_selection_mode = _effective_selection_mode(run)
+        stored_selection_mode = str(run.get("selectionMode") or "")
         return {
             "id": int(run.get("id") or 0),
             "recommendationDate": run.get("recommendationDate") or "",
@@ -1261,7 +1332,9 @@ class T1OvernightSelectionService:
             "learningScope": learning_scope["scope"],
             "learningScopeLabel": learning_scope["label"],
             "learningScopeReason": learning_scope["reason"],
-            "selectionMode": run.get("selectionMode") or "",
+            "selectionMode": effective_selection_mode,
+            "storedSelectionMode": stored_selection_mode,
+            "selectionModeCorrected": effective_selection_mode != stored_selection_mode,
             "selectionPolicyVersion": (run.get("market") or {}).get("selectionPolicyVersion") or "legacy",
             "selectionScoreVersion": (run.get("market") or {}).get("selectionScoreVersion") or "legacy",
             "actualSource": run.get("actualSource") or "",
@@ -1270,15 +1343,17 @@ class T1OvernightSelectionService:
             "finalCount": int(run.get("finalCount") or 0),
             "outcomeCount": int(run.get("outcomeCount") or len(outcomes) or 0),
             "verifiedOutcomeCount": int(run.get("verifiedOutcomeCount") or summary.get("verifiedCount") or 0),
-            "successCount": int(summary.get("successCount") or run.get("successCount") or 0),
-            "strongSuccessCount": int(run.get("strongSuccessCount") or 0),
+            "successCount": len([value for value in learning_primary_returns if value > 0]),
+            "strongSuccessCount": len([value for value in learning_primary_returns if value >= STRONG_SUCCESS_NET_RETURN_THRESHOLD_PCT]),
             "avgPrimaryNetReturnPct": tradeable_summary.get("avgNetReturnPct", run.get("avgPrimaryNetReturnPct")),
             "tradeableCount": int(tradeable_summary.get("tradeableCount") or 0),
             "learningEligibleCount": learning_eligible_count,
-            "exitTimingStats": _exit_timing_stats(outcomes),
+            "historicalLearningEligibleCount": historical_learning_eligible_count,
+            "exitTimingStats": _exit_timing_stats(learning_outcomes),
             "minuteMissingCount": int(tradeable_summary.get("minuteMissingCount") or 0),
             "finalPicks": _review_pick_names(run.get("finalPicks") or []),
             "marketLabel": ((run.get("market") or {}).get("marketContext") or {}).get("label") or "",
+            "zeroPickReason": _zero_pick_reason(run) if _is_zero_pick_run(run) else "",
             "error": run.get("error") or "",
             "latestVerifiedAt": run.get("latestVerifiedAt") or "",
             "finishedAt": run.get("finishedAt") or "",
@@ -1292,7 +1367,8 @@ class T1OvernightSelectionService:
         outcome_status = _outcome_status(run, outcomes)
         run_role = _run_role(run)
         tradeable_summary = _tradeable_summary(outcomes)
-        learning_eligible_count = len([item for item in outcomes if bool(_outcome_payload(item).get("learningEligible"))])
+        learning_eligible_count = len([item for item in outcomes if _is_learning_eligible_outcome(item)])
+        historical_learning_eligible_count = len([item for item in outcomes if _is_historical_learning_outcome(item)])
         sample = _review_sample_meta(
             run=run,
             outcome_status=outcome_status,
@@ -1300,13 +1376,19 @@ class T1OvernightSelectionService:
             tradeable_count=int(tradeable_summary.get("tradeableCount") or 0),
             outcome_count=len(outcomes),
             learning_eligible_count=learning_eligible_count,
+            historical_learning_eligible_count=historical_learning_eligible_count,
             primary_entry_not_executable_count=int(tradeable_summary.get("primaryEntryNotExecutableCount") or 0),
             primary_minute_missing_count=int(tradeable_summary.get("primaryMinuteMissingCount") or 0),
             primary_partial_execution_count=int(tradeable_summary.get("primaryPartialExecutionCount") or 0),
         )
         display = _review_display_meta(run, sample, outcome_status, run_role)
         ai_decision = _review_ai_decision_meta(run)
-        learning_scope = _review_learning_scope_meta(display, ai_decision, learning_eligible_count)
+        learning_scope = _review_learning_scope_meta(
+            display,
+            ai_decision,
+            learning_eligible_count,
+            historical_learning_eligible_count,
+        )
         usage_explanation = _review_usage_explanation(
             run=run,
             outcomes=outcomes,
@@ -1330,6 +1412,9 @@ class T1OvernightSelectionService:
             "cacheStatus": market.get("cacheStatus") or {},
             "marketContext": market.get("marketContext") or {},
             "recommendationPolicy": market.get("recommendationPolicy") or {},
+            "officialDecisionStatus": market.get("officialDecisionStatus") or "",
+            "officialDecisionReason": market.get("officialDecisionReason") or "",
+            "researchAiDecision": market.get("researchAiDecision") or {},
             "baselineComparison": baseline_comparison,
             # The review endpoint intentionally returns a compact run payload, but
             # shadow recommendations are part of the per-run audit record and must
@@ -1337,6 +1422,9 @@ class T1OvernightSelectionService:
             "shadowTop3": _review_shadow_top3(market.get("shadowTop3") or {}),
             "shadowDeepSeekTailTop3": _review_shadow_top3(market.get("shadowDeepSeekTailTop3") or {}),
             "shadowComparison": _review_shadow_comparison(market.get("shadowComparison") or {}),
+            "v3Strategy": market.get("v3Strategy") or {},
+            "legacyShadowArchive": market.get("legacyShadowArchive") or {},
+            "strategyDeploymentRun": market.get("strategyDeploymentRun") or {},
             "strategyPolicy": market.get("strategyPolicy") or {},
             "officialGateSummary": market.get("officialGateSummary") or {},
             "eventRiskAudit": market.get("eventRiskAudit") or {},
@@ -1378,7 +1466,9 @@ class T1OvernightSelectionService:
             "learningScopeLabel": learning_scope["label"],
             "learningScopeReason": learning_scope["reason"],
             "usageExplanation": usage_explanation,
-            "selectionMode": run.get("selectionMode") or "",
+            "selectionMode": _effective_selection_mode(run),
+            "storedSelectionMode": run.get("selectionMode") or "",
+            "selectionModeCorrected": _effective_selection_mode(run) != str(run.get("selectionMode") or ""),
             "actualSource": run.get("actualSource") or "",
             "requestedSource": run.get("requestedSource") or "",
             "poolSize": int(run.get("poolSize") or 0),
@@ -1388,6 +1478,7 @@ class T1OvernightSelectionService:
             "outcomeSummary": _outcome_summary(outcomes),
             "tradeableSummary": tradeable_summary,
             "learningEligibleCount": learning_eligible_count,
+            "historicalLearningEligibleCount": historical_learning_eligible_count,
             "baselineComparison": baseline_comparison,
             "market": compact_market,
             "entryExecutionEvidence": compact_market["entryExecutionEvidence"],
@@ -3150,12 +3241,16 @@ class T1OvernightSelectionService:
         else:
             provider, market, raw_stocks, provider_warning = self._load_market_data_for_t1(source, scan_time=scan_time)
             market = _enrich_market_turnover_context(self.database, market, provider.source)
+        quote_data_as_of_date = _t1_stock_data_as_of_date(raw_stocks)
+        if quote_data_as_of_date:
+            market["dataAsOfDate"] = quote_data_as_of_date
         market_context = _classify_market_context(market)
         trade_date_status = _t1_trade_date_status(
             recommendation_date,
             scan_time,
             actual_source=str(provider.source or ""),
             market=market,
+            exchange_calendar=_t1_exchange_calendar_snapshot(self.database, recommendation_date),
         )
         market_context["tradeDateStatus"] = trade_date_status
         market_context["stageControls"] = stage_controls
@@ -3169,27 +3264,118 @@ class T1OvernightSelectionService:
         filtered = self.analysis_service._apply_scope(raw_stocks, "all")
         hard_filtered: List[RawStock] = []
         hard_filter_counts = {}
+        v3_rejected_facts: List[Dict[str, Any]] = []
+        v3_hard_rejected_codes = set()
         for stock in filtered:
-            allowed, filter_reason = hard_filter_reason(
+            official_allowed, filter_reason = hard_filter_reason(
                 stock,
                 include_bse=self.settings.include_bse,
                 include_star_market=self.settings.include_star_market,
             )
-            if not allowed:
+            if not official_allowed:
                 label = str(filter_reason or "不满足交易范围")
                 hard_filter_counts[label] = hard_filter_counts.get(label, 0) + 1
+                v3_rejected_facts.append(_v3_rejected_quote_fact(stock, label))
+                v3_hard_rejected_codes.add(stock.code)
                 continue
             if stock.limit_status in {"down", "limit_down", "one_word_limit_down"}:
                 hard_filter_counts["跌停或一字跌停"] = hard_filter_counts.get("跌停或一字跌停", 0) + 1
+                v3_rejected_facts.append(_v3_rejected_quote_fact(stock, "跌停或一字跌停"))
+                v3_hard_rejected_codes.add(stock.code)
                 continue
             hard_filtered.append(stock)
+            v3_reason = ""
+            try:
+                if not math.isfinite(float(stock.price or 0)) or float(stock.price or 0) <= 0:
+                    v3_reason = "价格缺失或无效"
+            except (TypeError, ValueError):
+                v3_reason = "价格缺失或无效"
+            if not v3_reason and stock.trade_date and str(stock.trade_date)[:10] != recommendation_date:
+                v3_reason = "报价交易日与推荐日不一致"
+            if v3_reason:
+                v3_rejected_facts.append(_v3_rejected_quote_fact(stock, v3_reason))
+                v3_hard_rejected_codes.add(stock.code)
         market["selectionScopeCoverage"] = {"received": len(raw_stocks), "scoped": len(filtered),
             "hardFiltered": len(hard_filtered), "excludedReasons": hard_filter_counts,
             "meaning": "实际收到行情中适合本策略的数量，不代表全市场采集覆盖率"}
         identities = self.database.load_t1_stock_sector_identity_cache([stock.code for stock in hard_filtered])
-        cheap = [preliminary_candidate(stock, {"industry": (identities.get(stock.code) or {}).get("industrySector")})
-                 for stock in hard_filtered]
+        cheap = []
+        v3_cheap = []
+        for stock in hard_filtered:
+            item = preliminary_candidate(stock, {"industry": (identities.get(stock.code) or {}).get("industrySector")})
+            tradeability_level = str((item.get("tradeability") or {}).get("level") or "tradable")
+            item.update(
+                hardFilterStatus="eligible",
+                hardFilterReasons=[],
+                formalTradeabilityEligible=tradeability_level == "tradable",
+                researchOnly=tradeability_level != "tradable",
+                recallInclusionProbability=1.0,
+            )
+            cheap.append(item)
+            if stock.code not in v3_hard_rejected_codes:
+                v3_cheap.append(dict(item))
+        cheap.sort(key=lambda item: (-float(item.get("preliminaryScore") or 0), -float(item.get("amount") or 0), item["code"]))
+        for index, item in enumerate(cheap, start=1):
+            item["preliminaryScoreRank"] = index
+        v3_cheap.sort(key=lambda item: (-float(item.get("preliminaryScore") or 0), -float(item.get("amount") or 0), item["code"]))
+        for index, item in enumerate(v3_cheap, start=1):
+            item["preliminaryScoreRank"] = index
         preliminary_candidates = build_preliminary_pool(cheap, pool_size)
+        recall_training_samples = self.candidate_store.v3_recall_training_samples(recommendation_date)
+        recall_model = v3_pipeline.build_recall_model(recall_training_samples)
+        v3_scored_facts = v3_pipeline.assign_recall_scores(
+            v3_cheap,
+            recall_model,
+            str(market_context.get("state") or "unknown"),
+        )
+        v3_recall = v3_pipeline.build_recall_pool(
+            v3_scored_facts,
+            recall_model,
+            str(market_context.get("state") or "unknown"),
+            seed=f"{recommendation_date}:{v3_pipeline.PIPELINE_VERSION}:{market.get('snapshotVersion') or ''}",
+            fallback_codes=[item["code"] for item in preliminary_candidates],
+            limit=min(500, len(v3_scored_facts)),
+        )
+        v3_validation = v3_pipeline.allocate_validation(
+            v3_recall.get("pool") or [],
+            seed=f"{recommendation_date}:{v3_pipeline.VALIDATION_ALLOCATION_VERSION}",
+            limit=T1_MINUTE_MAX_CODES,
+        )
+        v3_fact_by_code = {item["code"]: item for item in [*v3_scored_facts, *v3_rejected_facts]}
+        for item in v3_recall.get("pool") or []:
+            v3_fact_by_code[item["code"]].update(
+                v3RecallRank=item.get("v3RecallRank"),
+                v3RecallRole=item.get("v3RecallRole"),
+            )
+        for item in v3_validation.get("candidates") or []:
+            v3_fact_by_code[item["code"]].update(
+                v3ValidationRank=item.get("v3ValidationRank"),
+                v3ValidationRole=item.get("v3ValidationRole"),
+                researchOnly=item.get("researchOnly", False),
+            )
+        # T1-RV-002: every frozen V3 fact gets an auditable stage at source.
+        # Validation candidates continue through the pipeline and are updated later;
+        # facts outside the 120 budget already have their final stage here.
+        for item in v3_fact_by_code.values():
+            if str(item.get("hardFilterStatus") or "eligible") == "rejected":
+                item["terminalStage"] = "hard_filter_rejected"
+                item["terminalReason"] = "；".join(item.get("hardFilterReasons") or ["不满足V3硬过滤要求"])
+            elif not item.get("v3RecallRank"):
+                item["terminalStage"] = "pool_not_recalled"
+                item["terminalReason"] = "硬过滤合格，但未进入当日V3召回500"
+            elif not item.get("v3ValidationRank"):
+                item["terminalStage"] = "validation_not_allocated"
+                item["terminalReason"] = "已进入V3召回500，但未获得120只验证名额"
+            else:
+                item["terminalStage"] = "validation_pending"
+                item["terminalReason"] = "已分配验证，等待真实分钟数据和后续筛选"
+            item["terminalRuleVersion"] = v3_pipeline.PIPELINE_VERSION
+        if selection_run_id:
+            self.candidate_store.freeze_v3_facts(
+                selection_run_id,
+                recommendation_date,
+                list(v3_fact_by_code.values()),
+            )
         stock_by_code = {stock.code: stock for stock in hard_filtered}
         if existing_archive:
             preliminary_candidates = existing_archive
@@ -3204,12 +3390,27 @@ class T1OvernightSelectionService:
                 raw.update(kline_series=[], kline_source="", kline_period="")
                 item["rawStock"] = raw
         preliminary = [(stock_by_code[item["code"]], item) for item in preliminary_candidates]
-        evidence_stocks = [stock for stock, _ in preliminary]
+        v3_validation_plan = {
+            item["code"]: item
+            for item in v3_validation.get("candidates") or []
+            if item.get("code") in stock_by_code
+        }
+        evaluation_codes = list(dict.fromkeys([
+            *[item["code"] for item in preliminary_candidates],
+            *v3_validation_plan.keys(),
+        ]))
+        evaluation_preliminary = [
+            (stock_by_code[code], v3_validation_plan.get(code) or next(item for item in preliminary_candidates if item["code"] == code))
+            for code in evaluation_codes
+        ]
+        evidence_stocks = [stock for stock, _ in evaluation_preliminary]
         seed = f"{recommendation_date}:{T1_ALLOCATION_VERSION}:{market.get('snapshotVersion') or ''}"
         seed = saved_request.get("allocationSeed") or seed
         round_one = ([x for x in existing_archive if x["allocationRound"] == 1] or
                      allocate_round(preliminary_candidates, 1, seed, budget=T1_MINUTE_MAX_CODES))
-        minute_layer_codes = [item["code"] for item in round_one]
+        official_minute_layer_codes = [item["code"] for item in round_one]
+        v3_minute_layer_codes = list(v3_validation_plan)
+        minute_layer_codes = list(dict.fromkeys([*official_minute_layer_codes, *v3_minute_layer_codes]))
         tail_minute_layer_codes: List[str] = []
         allocation_by_code = {item["code"]: item for item in round_one}
         if selection_run_id:
@@ -3222,6 +3423,10 @@ class T1OvernightSelectionService:
                     {"core":10,"single":5,"boundary":10,"coverage":8,"explore":7}],
                     concentrationLimits={"industry":.15,"candidateType":.30,"highRisk":.10},
                     minuteBudgets={"15m":T1_MINUTE_MAX_CODES,"1m":T1_TAIL_MINUTE_MAX_CODES},
+                    v3PipelineVersion=v3_pipeline.PIPELINE_VERSION,
+                    v3RecallModelVersion=v3_pipeline.RECALL_MODEL_VERSION,
+                    v3ValidationAllocationVersion=v3_pipeline.VALIDATION_ALLOCATION_VERSION,
+                    v3ValidationCandidateCodes=v3_minute_layer_codes,
                     selectionPolicyVersion=selection_policy.VERSION, selectionScoreVersion=selection_policy.VERSION,
                     selectionParameters=copy.deepcopy(selection_policy.PARAMETERS))
                 self.database.update_t1_overnight_selection_run(selection_run_id, {"request": saved_request})
@@ -3288,10 +3493,11 @@ class T1OvernightSelectionService:
                 normalized_rows.append(row)
             self.database.upsert_t1_overnight_minute_snapshots(evidence_run_id, self.settings.kline_period, normalized_rows)
             minute_by_code.update({row["code"]: row for row in normalized_rows})
-        minute_layer_codes += round_two_codes
+        official_minute_layer_codes += round_two_codes
+        minute_layer_codes = list(dict.fromkeys([*minute_layer_codes, *round_two_codes]))
         allocation_by_code.update({item["code"]: item for item in round_two})
         attached_kline_count = 0
-        for stock, _ in preliminary:
+        for stock, _ in evaluation_preliminary:
             stock.kline_series = []
             stock.kline_source = ""
             stock.kline_period = ""
@@ -3306,7 +3512,7 @@ class T1OvernightSelectionService:
             attached_kline_count += 1
 
         rescored = []
-        for stock, original in preliminary:
+        for stock, original in evaluation_preliminary:
             base = attach_plan(score_stock(stock, risk_mode=risk_mode), scan_time=scan_time) if len(stock.kline_series) >= 8 else original
             base.update(amount=stock.amount, featureProvenance=selection_policy.provenance(stock, provider.source),
                         quoteAsOfTime=stock.quote_time, quoteTradeDate=stock.trade_date)
@@ -3352,13 +3558,91 @@ class T1OvernightSelectionService:
                 )
             )
             rescored.append(enriched)
-        ranked = _layered_t1_pool(rescored, pool_size)
+        official_codes = {item["code"] for item in preliminary_candidates}
+        official_rescored = [item for item in rescored if item.get("code") in official_codes]
+        ranked = _layered_t1_pool(official_rescored, pool_size)
         for item in ranked:
             item["verifiedRank"] = None
         verified = [item for item in ranked if item.get("minute15mAvailable")]
         for index, item in enumerate(sorted(verified, key=lambda x: (-float(x.get("t1Score") or 0), x.get("code") or "")), 1):
             item["verifiedRank"] = index
         selection_ranked = [item for item in ranked if item.get("dataEligible") and item.get("setupEligible")]
+
+        v3_net_model = fit_conservative_net_expectation(
+            _load_v3_net_expectation_training_samples(self.database, recommendation_date)
+        )
+        rescored_by_code = {item["code"]: item for item in rescored}
+        v3_validation_candidates: List[Dict[str, Any]] = []
+        for code, plan in v3_validation_plan.items():
+            raw_candidate = rescored_by_code.get(code)
+            if not raw_candidate:
+                continue
+            candidate = dict(raw_candidate)
+            candidate.update(
+                v3RecallRank=plan.get("v3RecallRank"),
+                v3RecallRole=plan.get("v3RecallRole"),
+                v3ValidationRank=plan.get("v3ValidationRank"),
+                v3ValidationRole=plan.get("v3ValidationRole"),
+                researchOnly=plan.get("researchOnly", False),
+                formalTradeabilityEligible=plan.get("formalTradeabilityEligible", True),
+                recallConservativeScore=plan.get("recallConservativeScore"),
+                recallEstimate=plan.get("recallEstimate") or {},
+            )
+            minute = minute_by_code.get(code) or {}
+            v3_quality = v3_pipeline.validate_15m_data(
+                candidate,
+                minute.get("series") or [],
+                recommendation_date=recommendation_date,
+                decision_cutoff=f"{recommendation_date}T{scan_time}",
+                source=str(minute.get("source") or ""),
+                quality_status=str(minute.get("qualityStatus") or ("available" if minute.get("series") else "unavailable")),
+            )
+            structure = v3_pipeline.calculate_structure_features(
+                v3_quality.get("series") or [],
+                relative_strength=_safe_number(candidate.get("relStrength")),
+                change=_safe_number(candidate.get("change")),
+            )
+            primary_driver, driver_group = _t1_primary_driver(candidate)
+            industry_group, identity_status = _stable_industry_identity(candidate)
+            candidate.update(
+                primaryDriver=primary_driver,
+                driverGroup=driver_group,
+                industryGroup=industry_group,
+                industryIdentityStatus=identity_status,
+                dataEligible=bool(v3_quality.get("dataEligible")),
+                v3DataQuality={key: value for key, value in v3_quality.items() if key != "series"},
+                v3StructureFeatures=structure,
+                minute15mStatus=("available" if v3_quality.get("dataEligible") else "quality_rejected" if minute.get("series") else "failed"),
+                minute15mSource=str(minute.get("source") or ""),
+                minute15mPointCount=len(v3_quality.get("series") or []),
+            )
+            candidate["netExpectationEstimate"] = score_net_expectation_candidate(
+                candidate,
+                v3_net_model,
+                str(market_context.get("state") or "unknown"),
+            )
+            v3_validation_candidates.append(candidate)
+        v3_tail = v3_pipeline.allocate_tail_pool(
+            v3_validation_candidates,
+            seed=f"{recommendation_date}:{v3_pipeline.TAIL_GATE_VERSION}",
+            limit=T1_TAIL_MINUTE_MAX_CODES,
+        )
+        v3_tail_by_code = {item["code"]: item for item in v3_tail.get("candidates") or []}
+        for candidate in v3_validation_candidates:
+            tail_plan = v3_tail_by_code.get(candidate["code"])
+            if tail_plan:
+                candidate.update(
+                    v3TailRank=tail_plan.get("v3TailRank"),
+                    v3TailRole=tail_plan.get("v3TailRole"),
+                    v3CalibrationInclusionProbability=tail_plan.get("v3CalibrationInclusionProbability"),
+                    v3CalibrationSample=bool(tail_plan.get("v3CalibrationSample")),
+                )
+        if selection_run_id:
+            self.candidate_store.update_v3_facts(
+                selection_run_id,
+                [_v3_candidate_state_update(item) for item in v3_validation_candidates],
+                "v3_15m_and_net_expectation",
+            )
         if selection_run_id:
             self.candidate_store.update(selection_run_id, [dict(code=item["code"],
                 minute15mStatus=item["minute15mStatus"], minute15mRequested=item["minute15mRequested"],
@@ -3407,8 +3691,49 @@ class T1OvernightSelectionService:
                 "eligible": sum(x.get("allocationRound") == n and bool(x.get("dataEligible")) for x in ranked),
                 "setupEligible": sum(x.get("allocationRound") == n for x in selection_ranked)}
                 for n, rows in ((1, round_one), (2, round_two))],
-            "distinctPlanned": len(set(minute_layer_codes)), "budget": T1_MINUTE_MAX_CODES,
+            "officialDistinctPlanned": len(set(official_minute_layer_codes)),
+            "v3ShadowPlanned": len(set(v3_minute_layer_codes)),
+            "distinctRequested": len(set(minute_layer_codes)),
+            "distinctPlanned": len(set(official_minute_layer_codes)),
+            "budget": T1_MINUTE_MAX_CODES,
+            "officialBudget": T1_MINUTE_MAX_CODES,
+            "v3ShadowBudget": T1_MINUTE_MAX_CODES,
             "tail1m": {"planned": 0, "status": "waiting_for_ai_batch"}}
+        market["v3Strategy"] = {
+            "version": v3_pipeline.PIPELINE_VERSION,
+            "pipelineVersion": v3_pipeline.PIPELINE_VERSION,
+            "versionBundle": {
+                "pipelineVersion": v3_pipeline.PIPELINE_VERSION,
+                "recallModelVersion": v3_pipeline.RECALL_MODEL_VERSION,
+                "validationAllocationVersion": v3_pipeline.VALIDATION_ALLOCATION_VERSION,
+                "structureFeatureVersion": v3_pipeline.STRUCTURE_FEATURE_VERSION,
+                "tailGateVersion": v3_pipeline.TAIL_GATE_VERSION,
+                "portfolioPolicyVersion": v3_pipeline.PORTFOLIO_POLICY_VERSION,
+                "executionProfileVersion": T1_EXECUTION_PROFILE_VERSION,
+            },
+            "executionProfileVersion": T1_EXECUTION_PROFILE_VERSION,
+            "stage": "shadow",
+            "affectsOfficialRecommendation": False,
+            "implementationStatus": "forward_shadow",
+            "recallModel": {key: value for key, value in recall_model.items() if key != "bins"},
+            "recallAllocation": {
+                key: value for key, value in v3_recall.items() if key != "pool"
+            },
+            "validationAllocation": {
+                key: value for key, value in v3_validation.items() if key != "candidates"
+            },
+            "netExpectationModel": {
+                key: value for key, value in v3_net_model.items() if key != "bins"
+            },
+            "tailAllocation": {
+                key: value for key, value in v3_tail.items() if key != "candidates"
+            },
+            "validationCandidateCount": len(v3_validation_candidates),
+            "validationCandidates": [_v3_candidate_snapshot(item) for item in v3_validation_candidates],
+            "tailCandidateCodes": [item["code"] for item in v3_tail.get("candidates") or []],
+            "shortlist": [],
+            "picks": [],
+        }
         market["marketContext"] = market_context
         market["tradeDateStatus"] = trade_date_status
         market["aiParticipation"] = _ai_participation_mode(
@@ -4209,10 +4534,44 @@ class T1OvernightSelectionService:
             if not pool:
                 raise ValueError(batch.get("error") or "没有可供 T+1 超短线筛选的候选池。")
             market = batch.get("market") or {}
+            trade_date_status = market.get("tradeDateStatus") or {}
+            if _t1_trade_date_blocks_official(trade_date_status):
+                reason = _t1_trade_date_block_reason(trade_date_status)
+                request = dict(request)
+                request["runRole"] = "invalid"
+                request["tradeDateStatus"] = trade_date_status
+                market["runRole"] = "invalid"
+                market["tradeDateStatus"] = trade_date_status
+                market["recommendationPolicy"] = _trade_date_block_policy(trade_date_status)
+                market["aiDecisionStatus"] = "not_run_non_trading_day"
+                market["zeroPickReasonCode"] = "non_trading_day"
+                self.database.update_t1_overnight_selection_run(
+                    run_id,
+                    {
+                        "status": "done",
+                        "selectionMode": "invalid_non_trading_day",
+                        "currentStage": "done",
+                        "actualSource": batch.get("actualSource", ""),
+                        "evidenceRunId": int(batch.get("evidenceRunId") or 0),
+                        "totalCount": batch.get("totalCount", 0),
+                        "hardFilteredCount": batch.get("hardFilteredCount", 0),
+                        "poolSize": len(pool),
+                        "finalPicks": [],
+                        "finalCount": 0,
+                        "request": request,
+                        "market": market,
+                        "error": reason,
+                        "finishedAt": datetime.now().isoformat(timespec="seconds"),
+                    },
+                )
+                return
+            v3_event_candidates = list((market.get("v3Strategy") or {}).get("validationCandidates") or [])
+            event_candidates = _unique_by_code([*selection_pool, *v3_event_candidates])
+            event_archive_candidates = _unique_by_code([*pool, *v3_event_candidates])
             self._attach_event_risk_evidence(
                 run_id=run_id,
-                candidates=selection_pool,
-                archive_candidates=pool,
+                candidates=event_candidates,
+                archive_candidates=event_archive_candidates,
                 market=market,
                 recommendation_date=recommendation_date,
                 scan_time=scan_time,
@@ -4233,20 +4592,17 @@ class T1OvernightSelectionService:
                 # after that ranking is frozen.
                 effective_final_limit = min(3, max(1, final_limit))
             market["baselineGroups"] = {
-                "rules": _baseline_rule_picks(selection_pool, effective_final_limit),
-                "momentum": _baseline_simple_change_picks(selection_pool, effective_final_limit),
                 "random": _baseline_deterministic_random_picks(selection_pool, effective_final_limit, str(run.get("recommendationDate") or "")),
-                "market": _baseline_market_pool_picks(selection_pool, BASELINE_MARKET_SAMPLE_LIMIT),
-                "tailSupportShadow": _tail_support_shadow_top_picks(selection_pool, effective_final_limit),
                 "aiPreCritic": [],
                 "final": [],
             }
             market["shadowTop3"] = {
                 "version": T1_RULE_TAIL_SHADOW_VERSION,
-                "stage": "shadow",
-                "label": "规则尾盘影子Top3",
-                "description": "系统假设更重视尾盘承接时的规则对照，不影响正式 Top3。",
-                "picks": [dict(item) for item in market["baselineGroups"].get("tailSupportShadow", [])],
+                "stage": "historical_archive",
+                "label": "规则尾盘影子（已停止新增）",
+                "description": "该独立影子已合并进 V3 尾盘负面守门；新 Run 不再生成重复 Top3。",
+                "reason": "影子体系已收敛为当前正式、V3 主实验和轻量基准。",
+                "picks": [],
             }
             batch_count = math.ceil(len(selection_pool) / batch_size) if selection_pool else 0
             saved_decisions = {x["code"] for x in self.database.load_t1_overnight_selection_items(run_id) if x.get("stage") != "pool"}
@@ -4277,23 +4633,45 @@ class T1OvernightSelectionService:
             )
             if not selection_pool:
                 reason = "没有达到真实可交易标准的分时数据候选，当前只保留研究候选，不生成真实 Top3。"
+                self._attach_dynamic_tail(run_id, [], [], market, batch)
                 market["aiDecisionStatus"] = "not_run_data_quality"
                 market["zeroPickReasonCode"] = "data_quality"
                 market["aiFinalRanking"] = []
                 market["frozenDecisionRanking"] = []
                 _attach_strategy_policy_shadow(market, [], stage_config)
                 _attach_risk_policy_state_snapshot(market, risk_policy_state, stage_config)
+                deployed_picks, deployed_mode, deployed_error = self._apply_deployed_v3_result(
+                    request=request,
+                    market=market,
+                    legacy_picks=[],
+                    legacy_selection_mode="data_quality_zero_pick",
+                    legacy_error=reason,
+                )
+                if official_policy_zero:
+                    deployed_picks = []
+                    deployed_mode = "market_risk_zero_pick"
+                    deployed_error = str(policy.get("reason") or "市场环境或数据质量不适合隔夜，当前推荐 0 只。")
+                    market["officialDecisionStatus"] = "active_cash"
+                    market["officialDecisionReason"] = "market_policy"
+                    market["zeroPickReasonCode"] = "existing_market_policy"
+                if not official_policy_zero and bool((((market.get("strategyPolicy") or {}).get("strategyRiskStateEffect") or {}).get("blocksOfficialRecommendation"))):
+                    deployed_picks = []
+                    deployed_mode = "strategy_risk_zero_pick"
+                    deployed_error = str(((market.get("strategyPolicy") or {}).get("strategyRiskStateEffect") or {}).get("reason") or "策略风险状态要求暂停正式推荐。")
+                market["baselineGroups"]["final"] = [dict(item) for item in deployed_picks]
+                _converge_legacy_shadow_payload(market)
                 _stamp_decision_timing(market)
+                self.database.upsert_t1_overnight_selection_items(run_id, deployed_picks, stage="final")
                 self.database.update_t1_overnight_selection_run(
                     run_id,
                     {
                         "status": "done",
-                        "selectionMode": "data_quality_zero_pick",
+                        "selectionMode": deployed_mode,
                         "currentStage": "done",
-                        "finalPicks": [],
-                        "finalCount": 0,
+                        "finalPicks": deployed_picks,
+                        "finalCount": len(deployed_picks),
                         "market": market,
-                        "error": reason,
+                        "error": deployed_error,
                         "finishedAt": datetime.now().isoformat(timespec="seconds"),
                     },
                 )
@@ -4309,25 +4687,55 @@ class T1OvernightSelectionService:
                 }
                 market["baselineGroups"]["researchFallback"] = [dict(item) for item in fallback]
                 market["aiDecisionStatus"] = "unavailable"
+                market["researchAiDecision"] = {
+                    "selectionMode": "ai_unavailable_zero_pick",
+                    "status": "unavailable",
+                    "reason": "AI 未配置，研究链路没有形成结果。",
+                    "pickCount": 0,
+                    "allBatchesValidZeroPick": False,
+                }
                 market["zeroPickReasonCode"] = "ai_unavailable"
                 market["fallbackRole"] = "research"
                 market["aiFinalRanking"] = []
                 market["frozenDecisionRanking"] = []
                 _attach_strategy_policy_shadow(market, [], stage_config)
                 _attach_risk_policy_state_snapshot(market, risk_policy_state, stage_config)
-                market["baselineGroups"]["final"] = []
-                market["shadowComparison"] = _shadow_top3_comparison([], market["baselineGroups"].get("tailSupportShadow") or [])
+                deployed_picks, deployed_mode, deployed_error = self._apply_deployed_v3_result(
+                    request=request,
+                    market=market,
+                    legacy_picks=[],
+                    legacy_selection_mode="ai_unavailable_zero_pick",
+                    legacy_error="AI 未配置，旧正式策略无法形成结果。",
+                )
+                if official_policy_zero:
+                    deployed_picks = []
+                    deployed_mode = "market_risk_zero_pick"
+                    deployed_error = str(policy.get("reason") or "市场环境或数据质量不适合隔夜，当前推荐 0 只。")
+                    market["officialDecisionStatus"] = "active_cash"
+                    market["officialDecisionReason"] = "market_policy"
+                    market["zeroPickReasonCode"] = "existing_market_policy"
+                if not official_policy_zero and bool((((market.get("strategyPolicy") or {}).get("strategyRiskStateEffect") or {}).get("blocksOfficialRecommendation"))):
+                    deployed_picks = []
+                    deployed_mode = "strategy_risk_zero_pick"
+                    deployed_error = str(((market.get("strategyPolicy") or {}).get("strategyRiskStateEffect") or {}).get("reason") or "策略风险状态要求暂停正式推荐。")
+                market["baselineGroups"]["final"] = [dict(item) for item in deployed_picks]
+                market["shadowComparison"] = {
+                    "status": "historical_archive",
+                    "reason": "旧尾盘独立影子已停止新增，改由 V3 统一评估。",
+                }
+                _converge_legacy_shadow_payload(market)
                 _stamp_decision_timing(market)
+                self.database.upsert_t1_overnight_selection_items(run_id, deployed_picks, stage="final")
                 self.database.update_t1_overnight_selection_run(
                     run_id,
                     {
                         "status": "done",
-                        "selectionMode": "ai_unavailable_zero_pick",
+                        "selectionMode": deployed_mode,
                         "currentStage": "done",
-                        "finalPicks": [],
-                        "finalCount": 0,
+                        "finalPicks": deployed_picks,
+                        "finalCount": len(deployed_picks),
                         "market": market,
-                        "error": "AI 未配置，正式结果为 Top0；规则候选已单独保存为 research 对照。",
+                        "error": deployed_error,
                         "finishedAt": datetime.now().isoformat(timespec="seconds"),
                     },
                 )
@@ -4382,7 +4790,15 @@ class T1OvernightSelectionService:
             self._attach_dynamic_tail(run_id, selection_pool, semifinal, market, batch)
             self.database.update_t1_overnight_selection_run(run_id, {"currentStage": "final", "semifinalCount": len(semifinal)})
             final_picks, final_error = self._select_with_ai(semifinal, market, effective_final_limit, stage="final", batch_index=0)
-            final_ai_zero_pick = bool(not final_picks and not final_error and ((market.get("lastAiZeroPick") or {}).get("stage") == "final"))
+            all_batches_zero_pick = _all_batches_valid_zero_pick(batch_summary)
+            final_ai_zero_pick = bool(
+                not final_picks
+                and not final_error
+                and (
+                    ((market.get("lastAiZeroPick") or {}).get("stage") == "final")
+                    or (not semifinal and all_batches_zero_pick)
+                )
+            )
             final_selected = _apply_picks(semifinal, final_picks, limit=effective_final_limit, batch_index=0)
             selection_mode = "ai_t1_overnight"
             error = final_error
@@ -4443,32 +4859,53 @@ class T1OvernightSelectionService:
                 run_id=run_id,
                 recommendation_date=recommendation_date,
             )
-            if official_policy_zero and selection_mode == "ai_t1_overnight":
+            market["researchAiDecision"] = {
+                "selectionMode": selection_mode,
+                "status": str(market.get("aiDecisionStatus") or ""),
+                "reason": error or "AI 研究链路已完成。",
+                "pickCount": len(final_selected),
+                "allBatchesValidZeroPick": all_batches_zero_pick,
+            }
+            final_selected, selection_mode, error = self._apply_deployed_v3_result(
+                request=request,
+                market=market,
+                legacy_picks=final_selected,
+                legacy_selection_mode=selection_mode,
+                legacy_error=error or "",
+            )
+            if official_policy_zero:
                 final_selected = []
                 selection_mode = "market_risk_zero_pick"
                 error = str(policy.get("reason") or "市场环境或数据质量不适合隔夜，当前推荐 0 只。")
                 market["zeroPickReasonCode"] = "existing_market_policy"
+                market["officialDecisionStatus"] = "active_cash"
+                market["officialDecisionReason"] = "market_policy"
             risk_state_effect = ((market.get("strategyPolicy") or {}).get("strategyRiskStateEffect") or {})
-            if bool(risk_state_effect.get("blocksOfficialRecommendation")):
+            if not official_policy_zero and bool(risk_state_effect.get("blocksOfficialRecommendation")):
                 final_selected = []
                 selection_mode = "strategy_risk_zero_pick"
                 error = str(risk_state_effect.get("reason") or "策略风险状态要求暂停正式推荐，当前只保留恢复影子组合。")
                 market["zeroPickReasonCode"] = "strategy_risk_state"
-            tail_shadow_ai = self._select_tail_shadow_with_ai(semifinal or selection_pool, market, effective_final_limit)
+            tail_shadow_ai = {
+                "stage": "historical_archive",
+                "version": T1_DEEPSEEK_TAIL_SHADOW_VERSION,
+                "label": "AI 尾盘影子（已停止新增）",
+                "reason": "V3 上线后 AI 只做解释和反证，不再每天生成独立尾盘 Top3。",
+                "picks": [],
+            }
             market["shadowDeepSeekTailTop3"] = tail_shadow_ai
-            market["baselineGroups"]["sector"] = _baseline_sector_peer_picks(selection_pool, final_selected, effective_final_limit)
             market["baselineGroups"]["final"] = [dict(item) for item in final_selected]
-            market["shadowComparison"] = _shadow_top3_comparison(
-                final_selected,
-                market["baselineGroups"].get("tailSupportShadow") or [],
-                deepseek_tail_picks=tail_shadow_ai.get("picks") or [],
-            )
+            market["shadowComparison"] = {
+                "status": "historical_archive",
+                "reason": "旧规则尾盘和 AI 尾盘独立 Top3 已停止新增，改由 V3 统一评估。",
+            }
             market["criticStatus"] = critic_result.get("status") or self.critic_status()
             critic_meta = {key: value for key, value in critic_result.items() if key != "picks"}
             critic_meta["prePicks"] = [dict(item) for item in market["baselineGroups"].get("aiPreCritic", [])]
             critic_meta["postPicks"] = [dict(item) for item in final_selected]
             critic_meta["changedPicks"] = _pick_codes(critic_meta.get("prePicks") or []) != _pick_codes(final_selected)
             market["critic"] = critic_meta
+            _converge_legacy_shadow_payload(market)
             _stamp_decision_timing(market)
             self.database.upsert_t1_overnight_selection_items(run_id, final_selected, stage="final")
             self.database.update_t1_overnight_selection_run(
@@ -4511,7 +4948,9 @@ class T1OvernightSelectionService:
 
     def _attach_dynamic_tail(self, run_id, pool, semifinal, market, batch):
         frozen = [x["code"] for x in self.candidate_store.all(run_id) if x["minute1mStatus"] != "not_planned"]
-        codes = frozen or select_tail_codes(pool, semifinal, T1_TAIL_MINUTE_MAX_CODES)
+        official_codes = frozen or select_tail_codes(pool, semifinal, T1_TAIL_MINUTE_MAX_CODES)
+        v3_codes = list((market.get("v3Strategy") or {}).get("tailCandidateCodes") or [])
+        codes = list(dict.fromkeys([*official_codes, *v3_codes]))
         self.candidate_store.update(run_id, [dict(code=c, minute1mStatus="planned") for c in codes], "1m_planned")
         self.candidate_store.update(run_id, [dict(code=c, minute1mStatus="requested") for c in codes], "1m_requested")
         run = self.database.load_t1_overnight_selection_run(run_id) or {}
@@ -4572,10 +5011,193 @@ class T1OvernightSelectionService:
                 "semifinalCount": len(semifinal), "eligibleCount": sum(bool(c.get("formalEligible")) for c in semifinal),
                 "rejected": [{"code": c["code"], "reasons": c.get("formalExclusionReasons") or []}
                              for c in semifinal if not c.get("formalEligible")]}
-        market["baselineGroups"]["tailSupportShadow"] = _tail_support_shadow_top_picks(pool, DEFAULT_FINAL_LIMIT)
-        market["shadowTop3"]["picks"] = [dict(x) for x in market["baselineGroups"]["tailSupportShadow"]]
-        market["shadowTop3"].update(candidateScope="dynamic_1m_after_batch", candidateCount=len(codes))
-        market.setdefault("validationAllocation", {})["tail1m"] = {"planned": len(codes), "requested": len(codes), "available": sum(bool(x["series"]) for x in snapshots), "status": "done"}
+        market.setdefault("shadowTop3", {}).update(
+            stage="historical_archive",
+            picks=[],
+            candidateScope="merged_into_v3_tail_gate",
+            candidateCount=0,
+        )
+        market.setdefault("validationAllocation", {})["tail1m"] = {
+            "officialPlanned": len(official_codes),
+            "v3ShadowPlanned": len(v3_codes),
+            "distinctPlanned": len(codes),
+            "requested": len(codes),
+            "available": sum(bool(x["series"]) for x in snapshots),
+            "status": "done",
+        }
+        self._finalize_v3_shadow(
+            run_id=run_id,
+            market=market,
+            snapshots={row["code"]: row for row in snapshots},
+            recommendation_date=str(run.get("recommendationDate") or date.today().isoformat()),
+            scan_time=scan,
+        )
+
+    def _finalize_v3_shadow(
+        self,
+        *,
+        run_id: int,
+        market: Dict[str, Any],
+        snapshots: Dict[str, Dict[str, Any]],
+        recommendation_date: str,
+        scan_time: str,
+    ) -> None:
+        strategy = market.get("v3Strategy") or {}
+        candidates = [dict(item) for item in strategy.get("validationCandidates") or []]
+        if not candidates:
+            return
+        planned_codes = set(strategy.get("tailCandidateCodes") or [])
+        available_tail_count = 0
+        for candidate in candidates:
+            code = str(candidate.get("code") or "").zfill(6)
+            if code not in planned_codes:
+                candidate["minute1mStatus"] = "not_planned"
+                continue
+            row = snapshots.get(code) or {}
+            series = row.get("series") or []
+            if series:
+                available_tail_count += 1
+            candidate["minute1mStatus"] = "available" if series else "failed"
+            event_evidence = candidate.get("eventRiskEvidence") or {}
+            candidate["eventRiskHardBlocked"] = bool(
+                event_evidence.get("triggered")
+                and event_evidence.get("eventGateReady")
+                and str(event_evidence.get("eventRiskStatus") or "") in {"risk", "blocked", "high_risk"}
+            )
+            candidate["v3TailGate"] = v3_pipeline.evaluate_tail_gate(
+                series,
+                recommendation_date=recommendation_date,
+                decision_cutoff=f"{recommendation_date}T{scan_time}",
+                source=str(row.get("source") or ""),
+                tradeability_eligible=bool(candidate.get("formalTradeabilityEligible", True)),
+            )
+        result = v3_pipeline.finalize_shadow_portfolio(
+            candidates,
+            str((market.get("marketContext") or {}).get("state") or "unknown"),
+        )
+        shortlist_codes = {item.get("code") for item in result.get("shortlist") or []}
+        portfolio_codes = {item.get("code") for item in result.get("picks") or []}
+        for candidate in candidates:
+            stage = v3_pipeline.terminal_stage(candidate)
+            if candidate.get("code") in portfolio_codes:
+                stage = "v3_shadow_selected"
+            elif candidate.get("code") in shortlist_codes:
+                stage = "shortlist_not_portfolio"
+            candidate["terminalStage"] = stage
+            review_stage = v3_candidate_review(candidate)
+            candidate["terminalReason"] = review_stage.get("terminalReason")
+            candidate["terminalRuleVersion"] = v3_pipeline.PIPELINE_VERSION
+        terminal_stage_counts = dict(Counter(str(item.get("terminalStage") or "unknown") for item in candidates))
+        planned_count = len(planned_codes)
+        model_ready = bool((strategy.get("netExpectationModel") or {}).get("rankingReady"))
+        if not model_ready:
+            decision_status = "not_ready"
+            zero_pick_reason = "v3_net_expectation_model_collecting"
+        elif planned_count and available_tail_count == 0:
+            decision_status = "technical_failure"
+            zero_pick_reason = "v3_tail_data_technical_failure"
+        elif not result.get("picks"):
+            decision_status = "active_top0"
+            zero_pick_reason = "v3_no_candidate_passed_thresholds"
+        else:
+            decision_status = "selected"
+            zero_pick_reason = ""
+        strategy.update(
+            {
+                "tailGateVersion": v3_pipeline.TAIL_GATE_VERSION,
+                "portfolioPolicyVersion": v3_pipeline.PORTFOLIO_POLICY_VERSION,
+                "tailEvidence": {
+                    "planned": planned_count,
+                    "available": available_tail_count,
+                    "failed": max(0, planned_count - available_tail_count),
+                },
+                "decisionStatus": decision_status,
+                "zeroPickReasonCode": zero_pick_reason,
+                "shortlist": [_v3_candidate_snapshot(item) for item in result.get("shortlist") or []],
+                "picks": [_v3_candidate_snapshot(item) for item in result.get("picks") or []],
+                "shortlistCount": result.get("shortlistCount"),
+                "holdingCount": result.get("holdingCount"),
+                "cashSlotCount": result.get("cashSlotCount"),
+                "slotLimit": result.get("slotLimit"),
+                "terminalStageCounts": terminal_stage_counts,
+                "validationCandidates": [_v3_candidate_snapshot(item) for item in candidates],
+            }
+        )
+        market["v3Strategy"] = strategy
+        market.setdefault("baselineGroups", {})["v3Main"] = [dict(item) for item in strategy.get("picks") or []]
+        market["baselineGroups"]["v3ExecutionCalibration"] = [
+            _v3_candidate_snapshot(item)
+            for item in candidates
+            if str(item.get("code") or "").zfill(6) in planned_codes
+        ]
+        self.candidate_store.update_v3_facts(
+            run_id,
+            [_v3_candidate_state_update(item) for item in candidates],
+            "v3_tail_and_portfolio",
+        )
+
+    def _apply_deployed_v3_result(
+        self,
+        *,
+        request: Dict[str, Any],
+        market: Dict[str, Any],
+        legacy_picks: List[Dict[str, Any]],
+        legacy_selection_mode: str,
+        legacy_error: str,
+    ) -> tuple[List[Dict[str, Any]], str, str]:
+        deployment = request.get("strategyDeploymentSnapshot") or {}
+        if str(deployment.get("officialVersionForThisRun") or "") != v3_pipeline.PIPELINE_VERSION:
+            return legacy_picks, legacy_selection_mode, legacy_error
+        strategy = market.get("v3Strategy") or {}
+        decision_status = str(strategy.get("decisionStatus") or "technical_failure")
+        market.setdefault("baselineGroups", {})["legacyOfficialControl"] = [dict(item) for item in legacy_picks]
+        deployment_run = {
+            "deploymentId": deployment.get("deploymentId"),
+            "deploymentRevision": deployment.get("deploymentRevision"),
+            "officialVersionForThisRun": v3_pipeline.PIPELINE_VERSION,
+            "fallbackStrategyVersion": deployment.get("fallbackStrategyVersion") or T1_STRATEGY_POLICY_VERSION,
+            "v3DecisionStatus": decision_status,
+            "technicalDegraded": False,
+            "actualProducerVersion": v3_pipeline.PIPELINE_VERSION,
+        }
+        strategy["stage"] = "official"
+        strategy["affectsOfficialRecommendation"] = True
+        if decision_status not in {"selected", "active_top0"}:
+            deployment_run.update(
+                technicalDegraded=decision_status == "technical_failure",
+                actualProducerVersion=T1_STRATEGY_POLICY_VERSION,
+                reason=(
+                    "V3 本次运行发生技术失败，按已批准安全降级策略使用旧正式结果；该日不记为主动空仓。"
+                    if decision_status == "technical_failure"
+                    else "V3 本次运行尚未满足模型可用条件，继续使用旧正式结果；该日不记为主动空仓。"
+                ),
+            )
+            market["strategyDeploymentRun"] = deployment_run
+            market["v3Strategy"] = strategy
+            return legacy_picks, legacy_selection_mode, legacy_error
+        if decision_status == "active_top0":
+            deployment_run["reason"] = "V3 链路完整运行，但没有股票通过正净期望、尾盘负面门禁和组合阈值，主动空仓。"
+            market["strategyDeploymentRun"] = deployment_run
+            market["v3Strategy"] = strategy
+            return [], "v3_active_top0", deployment_run["reason"]
+        picks = []
+        for rank, raw in enumerate(strategy.get("picks") or [], start=1):
+            pick = dict(raw)
+            pick.update(
+                rank=rank,
+                aiRank=rank,
+                selected=True,
+                selectionSource="t1-v3-deterministic-official",
+                reason="通过 V3 真实数据、保守净期望、尾盘负面门禁和组合约束。",
+            )
+            pick.setdefault("buyPlan", "仅在推荐日尾盘仍满足冻结交易条件时执行，不追高。")
+            pick.setdefault("sellPlan", "下一交易日按开盘后15分钟固定执行口径卖出。")
+            pick.setdefault("risk", "若尾盘结构、事件风险或可交易状态变化，则不执行。")
+            picks.append(pick)
+        deployment_run["reason"] = "V3 固定版本产生本次正式推荐；旧正式策略结果只作为同日控制组保留。"
+        market["strategyDeploymentRun"] = deployment_run
+        market["v3Strategy"] = strategy
+        return picks, "v3_t1_official", ""
 
     def _ai_available(self) -> bool:
         return bool(self.settings.enable_ai and self.settings.ai_api_key and self.settings.ai_base_url)
@@ -10267,6 +10889,64 @@ def _apply_picks(candidates: List[Dict[str, Any]], picks: List[Dict[str, Any]], 
     return selected
 
 
+def _v3_rejected_quote_fact(stock: RawStock, reason: str) -> Dict[str, Any]:
+    return {
+        "code": _normalize_code(stock.code),
+        "name": stock.name,
+        "price": _safe_number(stock.price),
+        "frozenScanPrice": _safe_number(stock.price),
+        "amount": _safe_number(stock.amount),
+        "change": _safe_number(stock.change),
+        "turnover": _safe_number(stock.turnover),
+        "volumeRatio": _safe_number(stock.volume_ratio),
+        "amountFactor": _safe_number(stock.amount_factor),
+        "relStrength": _safe_number(stock.rel_strength),
+        "limitStatus": stock.limit_status,
+        "quoteAsOfTime": stock.quote_time,
+        "quoteTradeDate": stock.trade_date,
+        "priceBasis": "unadjusted",
+        "hardFilterStatus": "rejected",
+        "hardFilterReasons": [str(reason or "不满足V3硬过滤")],
+        "formalTradeabilityEligible": False,
+        "researchOnly": True,
+        "terminalStage": "hard_filter_rejected",
+    }
+
+
+def _v3_candidate_state_update(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    keys = (
+        "v3RecallRank", "v3RecallRole", "recallStratum", "recallEstimate",
+        "recallConservativeScore", "recallRankingEligible",
+        "v3ValidationRank", "v3ValidationRole", "researchOnly",
+        "formalTradeabilityEligible", "dataEligible", "v3DataQuality",
+        "v3StructureFeatures", "minute15mStatus", "minute15mSource",
+        "minute15mPointCount", "primaryDriver", "driverGroup", "industryGroup",
+        "industryIdentityStatus", "netExpectationEstimate", "v3TailRank",
+        "v3TailRole", "minute1mStatus", "v3TailGate", "terminalStage",
+        "terminalReason", "terminalRuleVersion",
+        "eventRiskHardBlocked",
+        "v3CalibrationInclusionProbability", "v3CalibrationSample",
+    )
+    return {"code": candidate.get("code"), **{key: copy.deepcopy(candidate.get(key)) for key in keys if key in candidate}}
+
+
+def _v3_candidate_snapshot(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    keys = (
+        "code", "name", "price", "change", "amount", "relStrength",
+        "tradeability", "formalTradeabilityEligible", "researchOnly",
+        "v3RecallRank", "v3RecallRole", "recallStratum", "recallEstimate",
+        "recallConservativeScore", "v3ValidationRank", "v3ValidationRole",
+        "dataEligible", "v3DataQuality", "v3StructureFeatures",
+        "minute15mStatus", "minute15mSource", "minute15mPointCount",
+        "primaryDriver", "driverGroup", "industryGroup", "industryIdentityStatus",
+        "t1Score", "t1Dimensions", "netExpectationEstimate", "v3TailRank",
+        "v3TailRole", "minute1mStatus", "v3TailGate", "terminalStage",
+        "eventRiskHardBlocked",
+        "v3CalibrationInclusionProbability", "v3CalibrationSample",
+    )
+    return {key: copy.deepcopy(candidate.get(key)) for key in keys if key in candidate}
+
+
 def _risk_policy_config_snapshot(stage_config: Dict[str, Any]) -> Dict[str, Any]:
     config = _normalize_stage_config(stage_config or {})
     return {
@@ -10437,6 +11117,80 @@ def _portfolio_diversity_sequence(risk_sequence: List[Dict[str, Any]], limit: in
         "secondSlotCode": treatment_codes[1] if len(treatment_codes) >= 2 else "",
     }
     return selected, blocked, audit
+
+
+def _converge_legacy_shadow_payload(market: Dict[str, Any]) -> None:
+    """Stop future legacy shadow portfolios after their diagnostics have been computed."""
+    groups = market.get("baselineGroups") or {}
+    preserved_roles = {
+        "final",
+        "v3Main",
+        "v3ExecutionCalibration",
+        "legacyOfficialControl",
+        "random",
+    }
+    risk_effect = ((market.get("strategyPolicy") or {}).get("strategyRiskStateEffect") or {})
+    if str(risk_effect.get("state") or "active") != "active":
+        preserved_roles.add("recoveryShadow")
+    compact_groups: Dict[str, Any] = {}
+    for role in preserved_roles:
+        value = groups.get(role)
+        if not isinstance(value, list):
+            continue
+        if role == "random":
+            compact_groups[role] = [
+                {
+                    "code": str(item.get("code") or "").zfill(6),
+                    "name": item.get("name") or "",
+                    "rank": item.get("rank") or item.get("aiRank") or index,
+                    "role": "lightweight_random_benchmark",
+                }
+                for index, item in enumerate(value, start=1)
+                if isinstance(item, dict) and str(item.get("code") or "").strip()
+            ]
+        else:
+            compact_groups[role] = value
+    market["baselineGroups"] = compact_groups
+
+    policy = market.get("strategyPolicy") or {}
+    market["strategyPolicy"] = {
+        "strategyPolicyVersion": policy.get("strategyPolicyVersion") or T1_STRATEGY_POLICY_VERSION,
+        "stage": "component_audit_only",
+        "affectsOfficialRecommendation": False,
+        "reason": "旧市场门禁、风险门禁、组合分散和第三槽影子不再各自生成组合；新 Run 只保留组件命中审计。",
+        "negativeGateAudit": policy.get("negativeGateAudit") or {},
+        "portfolioDiversityAudit": policy.get("portfolioDiversityAudit") or {},
+        "strategyRiskStateSnapshot": policy.get("strategyRiskStateSnapshot") or {},
+        "strategyRiskStateEffect": policy.get("strategyRiskStateEffect") or {},
+        "shadowSchemaVersion": policy.get("shadowSchemaVersion") or T1_SHADOW_SCHEMA_VERSION,
+        "shadowAggregationVersion": policy.get("shadowAggregationVersion") or T1_SHADOW_AGGREGATION_VERSION,
+    }
+    research = market.get("researchFallback") or {}
+    if research:
+        market["researchFallback"] = {
+            "fallbackRole": "research",
+            "reason": research.get("reason") or "技术失败研究对照",
+            "codes": _pick_codes(research.get("picks") or []),
+        }
+    market["legacyShadowArchive"] = {
+        "status": "future_generation_stopped",
+        "effectiveVersion": v3_pipeline.PIPELINE_VERSION,
+        "archivedRoles": [
+            "rules",
+            "momentum",
+            "market",
+            "sector",
+            "tailSupportShadow",
+            "tail_ai",
+            "policy_market_gate",
+            "policy_risk_gate",
+            "policy_diversity",
+            "policy_rank3",
+            "policy_adaptive_exit",
+            "aiPreCritic_portfolio",
+        ],
+        "businessMeaning": "历史记录继续只读展示；新 Run 不再重复保存这些完整影子名单。",
+    }
 
 
 def _attach_strategy_policy_shadow(
@@ -11142,6 +11896,61 @@ def _load_net_expectation_training_samples(database: Database, before_date: str)
                     "netReturnPct": net_return,
                     "populationInclusionProbability": probability,
                     "certaintyUnit": bool(pick.get("certaintyUnit")),
+                }
+            )
+    return samples
+
+
+def _load_v3_net_expectation_training_samples(database: Database, before_date: str) -> List[Dict[str, Any]]:
+    """Read only prior-date V3 calibration outcomes from exact open_15m replay."""
+    runs = database.list_t1_overnight_selection_runs(limit=5000, status="done")
+    by_date: Dict[str, Dict[str, Any]] = {}
+    for run in runs:
+        recommendation_date = str(run.get("recommendationDate") or "")
+        request = run.get("request") or {}
+        market = run.get("market") or {}
+        role = str(market.get("runRole") or request.get("runRole") or "")
+        if not recommendation_date or recommendation_date >= before_date or bool(request.get("force")):
+            continue
+        if role in {"research", "legacy", "invalid"}:
+            continue
+        strategy = market.get("v3Strategy") or {}
+        if str(strategy.get("pipelineVersion") or strategy.get("version") or "") != v3_pipeline.PIPELINE_VERSION:
+            continue
+        current = by_date.get(recommendation_date)
+        rank = (str(run.get("scanTime") or "") == "14:40", int(run.get("id") or 0))
+        current_rank = (
+            str(current.get("scanTime") or "") == "14:40",
+            int(current.get("id") or 0),
+        ) if current else (False, -1)
+        if current is None or rank > current_rank:
+            by_date[recommendation_date] = run
+
+    samples: List[Dict[str, Any]] = []
+    for recommendation_date, run in sorted(by_date.items()):
+        market = run.get("market") or {}
+        calibration = {
+            str(item.get("code") or "").zfill(6): item
+            for item in (market.get("baselineGroups") or {}).get("v3ExecutionCalibration") or []
+            if item.get("v3CalibrationSample") is True
+        }
+        rows = ((market.get("baselineComparison") or {}).get("v3ExecutionCalibration") or {}).get("componentRows") or []
+        for row in rows:
+            code = str(row.get("code") or "").zfill(6)
+            pick = calibration.get(code) or {}
+            net_return = _safe_number(row.get("netReturnPct"))
+            probability = _safe_number(pick.get("v3CalibrationInclusionProbability"))
+            estimate = pick.get("netExpectationEstimate") or {}
+            if net_return is None or probability is None or probability <= 0:
+                continue
+            samples.append(
+                {
+                    "recommendationDate": recommendation_date,
+                    "code": code,
+                    "stratum": estimate.get("stratum") or "unknown",
+                    "netReturnPct": net_return,
+                    "populationInclusionProbability": probability,
+                    "certaintyUnit": False,
                 }
             )
     return samples
@@ -12682,6 +13491,78 @@ def _simulated_entry_execution(
     )
 
 
+def _stress_reference_entry_execution(
+    run: Dict[str, Any],
+    buy_reference: Optional[float],
+    execution_profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Create an explicitly approximate stress entry when a shadow lacks entry evidence.
+
+    This is intentionally not valid for formal learning. It keeps historical shadow
+    comparisons measurable without pretending that a frozen price is formal fill evidence.
+    """
+    market = run.get("market") or {}
+    timing = market.get("decisionTiming") or {}
+    signal_published_at = str(timing.get("signalPublishedAt") or "")
+    signal_time = _time_from_iso_text(signal_published_at) or str(run.get("scanTime") or DEFAULT_SCAN_TIME)
+    reference = _safe_number(buy_reference)
+    profile = _normalize_execution_config(execution_profile or DEFAULT_EXECUTION_PROFILE)
+    lot = max(1, int(profile.get("boardLot") or 100))
+    if signal_time > "14:50" or not reference or reference <= 0:
+        return {
+            "version": REPLAY_EXECUTION_PROFILE_VERSION,
+            "executable": False,
+            "status": "entry_not_executable",
+            "signalPublishedAt": signal_published_at,
+            "signalTime": signal_time,
+            "price": None,
+            "buyReferencePrice": reference,
+            "source": "",
+            "reason": "影子压力测试缺少有效冻结价或已超过尾盘执行窗口。",
+        }
+    slot_notional = float(profile.get("slotNotionalCny") or 0)
+    target_quantity = math.floor(slot_notional / reference / lot) * lot if slot_notional > 0 else 0
+    if target_quantity <= 0:
+        return {
+            "version": REPLAY_EXECUTION_PROFILE_VERSION,
+            "executable": False,
+            "status": "entry_not_executable",
+            "signalPublishedAt": signal_published_at,
+            "signalTime": signal_time,
+            "price": None,
+            "buyReferencePrice": reference,
+            "source": "",
+            "reason": "影子压力测试名义槽位不足以形成整手目标数量。",
+        }
+    notional = target_quantity * reference
+    commission = max(float(profile.get("minimumCommissionCny") or 5), notional * float(profile.get("commissionPct") or 0) / 100)
+    transfer = notional * float(profile.get("transferFeePct") or 0) / 100
+    return {
+        "version": REPLAY_EXECUTION_PROFILE_VERSION,
+        "executable": True,
+        "status": "stress_reference_price",
+        "label": "影子压力测试使用冻结价近似",
+        "signalPublishedAt": signal_published_at,
+        "signalTime": signal_time,
+        "orderSubmittedAt": signal_published_at,
+        "entryTime": signal_time,
+        "price": reference,
+        "rawPrice": reference,
+        "buyReferencePrice": reference,
+        "targetQuantity": target_quantity,
+        "filledQuantity": target_quantity,
+        "remainingQuantity": 0,
+        "boardLot": lot,
+        "grossNotionalCny": round(notional, 4),
+        "commissionCny": round(commission, 4),
+        "transferFeeCny": round(transfer, 4),
+        "totalCostCny": round(notional + commission + transfer, 4),
+        "fills": [],
+        "source": "buy_reference_stress_fallback",
+        "qualityWarning": "影子没有独立发布后买入分钟证据，本结果仅用于资金容量压力测试，不进入正式策略学习。",
+    }
+
+
 def _mark_entry_not_executable_scenarios(scenarios: List[Dict[str, Any]], entry_execution: Dict[str, Any]) -> List[Dict[str, Any]]:
     result = []
     reason = str(entry_execution.get("reason") or "买入不可执行，不能计算真实交易收益。")
@@ -12789,6 +13670,13 @@ def _build_outcome(
             str(entry_execution.get("status") or "") in {"executed_from_minute", "partial_execution"}
             and int(entry_execution.get("filledQuantity") or 0) > 0
         )
+        if not entry_priced:
+            entry_execution = _stress_reference_entry_execution(
+                run=run,
+                buy_reference=buy_reference,
+                execution_profile=execution_profile,
+            )
+            entry_priced = str(entry_execution.get("status") or "") == "stress_reference_price"
     simulated_entry_price = _safe_number(entry_execution.get("price")) if entry_priced else None
     trade_base_price = simulated_entry_price or buy_reference
     effective_data_source = (
@@ -14344,6 +15232,52 @@ def _is_zero_pick_run(run: Dict[str, Any]) -> bool:
     return int(run.get("finalCount") or 0) <= 0 and not final_picks
 
 
+def _all_batches_valid_zero_pick(batch_summary: Any) -> bool:
+    """True only when every attempted AI batch completed normally with Top0."""
+    rows = [row for row in (batch_summary or []) if isinstance(row, dict)]
+    return bool(rows) and all(
+        int(row.get("pickCount") or 0) == 0
+        and not str(row.get("error") or "").strip()
+        and row.get("aiZeroPick") is True
+        for row in rows
+    )
+
+
+def _market_policy_requires_cash(run: Dict[str, Any]) -> bool:
+    market = run.get("market") or {}
+    policy = market.get("recommendationPolicy") or {}
+    context = market.get("marketContext") or {}
+    try:
+        policy_limit = int(policy.get("maxPickCount"))
+        context_limit = int(context.get("maxPickCount"))
+    except (TypeError, ValueError):
+        return False
+    return policy_limit <= 0 and context_limit <= 0
+
+
+def _historical_market_cash_correction(run: Dict[str, Any]) -> bool:
+    """Recognize old rows where valid AI research Top0 hid an official market-risk cash decision."""
+    if str(run.get("selectionMode") or "") != "ai_technical_failure_zero_pick":
+        return False
+    if run.get("status") != "done" or int(run.get("finalCount") or 0) > 0 or (run.get("finalPicks") or []):
+        return False
+    return _market_policy_requires_cash(run) and _all_batches_valid_zero_pick(run.get("batchSummary") or [])
+
+
+def _effective_selection_mode(run: Dict[str, Any]) -> str:
+    if _historical_market_cash_correction(run):
+        return "market_risk_zero_pick"
+    return str(run.get("selectionMode") or "")
+
+
+def _is_technical_failure_run(run: Dict[str, Any]) -> bool:
+    return _effective_selection_mode(run) in {
+        "ai_technical_failure_zero_pick",
+        "ai_unavailable_zero_pick",
+        "ai_failed",
+    }
+
+
 def _semantic_polluted_run(run: Dict[str, Any]) -> bool:
     picks = run.get("finalPicks") or []
     if not isinstance(picks, list) or not picks:
@@ -14382,7 +15316,7 @@ def _requires_legacy_isolation(run: Dict[str, Any]) -> bool:
 def _run_role(run: Dict[str, Any]) -> str:
     market = run.get("market") or {}
     request = run.get("request") or {}
-    if str(run.get("selectionMode") or "") in {"rules_fallback", "ai_technical_failure_zero_pick", "ai_unavailable_zero_pick", "ai_failed"}:
+    if _effective_selection_mode(run) in {"rules_fallback", "ai_technical_failure_zero_pick", "ai_unavailable_zero_pick", "ai_failed"}:
         return "research"
     if _historical_treatment_applied(market, request):
         return "legacy"
@@ -14534,6 +15468,7 @@ def _review_sample_meta(
     tradeable_count: int,
     outcome_count: int,
     learning_eligible_count: int,
+    historical_learning_eligible_count: int = 0,
     primary_entry_not_executable_count: int = 0,
     primary_minute_missing_count: int = 0,
     primary_partial_execution_count: int = 0,
@@ -14557,10 +15492,27 @@ def _review_sample_meta(
             "sampleLabel": "买入不可执行",
             "sampleReason": str(signal_guard.get("reason") or "信号发布时间超过尾盘可执行窗口，不能作为真实交易样本。"),
         }
+    if _is_technical_failure_run(run):
+        return {
+            "sampleClass": "technical_failure",
+            "sampleLabel": "技术失败",
+            "sampleReason": "AI 调用、配置或输出发生技术失败；本日不属于策略主动空仓，不计入收益，但计入系统可靠性。",
+        }
     if outcome_status == "pending_next_trade_day":
         return {"sampleClass": "waiting", "sampleLabel": "等待数据", "sampleReason": "还没到次日开盘后 15 分钟，暂时不能验证。"}
     if outcome_status == "zero_pick":
         return {"sampleClass": "zero_pick", "sampleLabel": "空仓", "sampleReason": "当天系统选择不推荐股票，只看组合里的空仓表现，不算个股成功率。"}
+    if historical_learning_eligible_count > 0:
+        qualifier = (
+            f"其中 {historical_learning_eligible_count}/{outcome_count} 只股票满足历史旧口径完整条件；"
+            if outcome_count > historical_learning_eligible_count else
+            "该 Run 的股票满足历史旧口径完整条件；"
+        )
+        return {
+            "sampleClass": "historical_learning",
+            "sampleLabel": "历史口径可分析",
+            "sampleReason": f"{qualifier}可回看当时策略表现，但无论当时是正式或研究重跑，均不与当前严格样本混算收益。",
+        }
     if run_role == "invalid" or outcome_status == "invalid":
         return {"sampleClass": "invalid", "sampleLabel": "仅排查", "sampleReason": "价格、行情源或数据口径有异常，只能排查问题，不能拿来复盘或优化。"}
     if run_role == "legacy" or outcome_status == "legacy":
@@ -14610,6 +15562,13 @@ def _review_display_meta(run: Dict[str, Any], sample: Dict[str, str], outcome_st
             "reviewStatusReason": sample_reason or "结果完整，可以用于后续优化策略。",
             "reviewStatusTone": "good",
         }
+    if sample_class == "historical_learning":
+        return {
+            "reviewStatus": "historical",
+            "reviewStatusLabel": "历史口径可分析",
+            "reviewStatusReason": sample_reason or "历史数据完整，但计算口径与当前严格样本不同，单独分析、不混算收益。",
+            "reviewStatusTone": "neutral",
+        }
     if sample_class == "partial":
         return {
             "reviewStatus": "partial",
@@ -14630,6 +15589,13 @@ def _review_display_meta(run: Dict[str, Any], sample: Dict[str, str], outcome_st
             "reviewStatusLabel": "缺少卖出价" if sample.get("sampleLabel") == "缺少卖出价" else "部分缺数据",
             "reviewStatusReason": sample_reason or "没有拿到次日 15 分钟价格，不能判断这次推荐是否成功。",
             "reviewStatusTone": "warn",
+        }
+    if sample_class == "technical_failure":
+        return {
+            "reviewStatus": "diagnostic",
+            "reviewStatusLabel": "技术失败",
+            "reviewStatusReason": sample_reason or "系统或模型执行失败，不能解释为主动空仓，也不能用于策略收益。",
+            "reviewStatusTone": "bad",
         }
     if sample_class == "usable":
         if run_role == "official":
@@ -14684,6 +15650,36 @@ def _compact_review_error(error: str, limit: int = 3) -> str:
 
 
 def _review_ai_decision_meta(run: Dict[str, Any]) -> Dict[str, str]:
+    market = run.get("market") or {}
+    research = market.get("researchAiDecision") or {}
+    if isinstance(research, dict) and research:
+        research_status = str(research.get("status") or research.get("aiDecisionStatus") or "")
+        research_mode = str(research.get("selectionMode") or "")
+        research_reason = str(research.get("reason") or "").strip()
+        if research_status == "valid_zero_pick" or research_mode == "ai_zero_pick":
+            return {
+                "status": "research_ai_valid_zero_pick",
+                "label": "AI研究正常 Top0",
+                "reason": research_reason or "AI 研究链路正常完成并返回 Top0；正式空仓原因仍以市场风险策略为准。",
+                "detail": "",
+                "tone": "neutral",
+            }
+        if research_status == "technical_failure":
+            return {
+                "status": "research_ai_technical_failure",
+                "label": "AI研究技术失败",
+                "reason": research_reason or "AI 研究链路发生技术失败，但不会覆盖正式推荐的主动空仓原因。",
+                "detail": research_reason,
+                "tone": "bad",
+            }
+    if _historical_market_cash_correction(run):
+        return {
+            "status": "research_ai_valid_zero_pick",
+            "label": "AI研究正常 Top0",
+            "reason": "历史审计显示每个 AI 研究批次都合法返回 Top0；正式结果按当日市场风险策略主动空仓。原始记录未改写。",
+            "detail": "原记录曾把批次 Top0 误记为 AI 技术失败，复盘读取时已纠正业务展示。",
+            "tone": "neutral",
+        }
     selection_mode = str(run.get("selectionMode") or "")
     error = str(run.get("error") or "").strip()
     compact_error = _compact_review_error(error)
@@ -14734,15 +15730,20 @@ def _review_ai_decision_meta(run: Dict[str, Any]) -> Dict[str, str]:
             "data_quality_zero_pick": "数据空仓",
             "guardrail_zero_pick": "守门空仓",
             "ai_zero_pick": "AI 主动空仓",
-            "ai_technical_failure_zero_pick": "AI 异常，正式空仓",
-            "ai_unavailable_zero_pick": "AI 未配置，正式空仓",
+            "ai_technical_failure_zero_pick": "AI 技术失败",
+            "ai_unavailable_zero_pick": "AI 不可用",
+            "v3_active_top0": "V3 主动空仓",
         }
+        technical = _is_technical_failure_run(run)
         return {
             "status": selection_mode,
             "label": labels.get(selection_mode, "系统空仓"),
-            "reason": error or "系统按市场风险、数据质量或守门规则选择 Top0。",
+            "reason": error or (
+                "系统或模型未正常完成，本日不计为主动空仓。"
+                if technical else "系统按市场风险、数据质量或守门规则选择 Top0。"
+            ),
             "detail": error,
-            "tone": "neutral",
+            "tone": "bad" if technical else "neutral",
         }
     if selection_mode == "invalid_non_trading_day":
         return {
@@ -14765,7 +15766,14 @@ def _review_learning_scope_meta(
     display: Dict[str, str],
     ai_decision: Dict[str, str],
     learning_eligible_count: int,
+    historical_learning_eligible_count: int = 0,
 ) -> Dict[str, str]:
+    if str(display.get("reviewStatus") or "") == "historical" and historical_learning_eligible_count > 0:
+        return {
+            "scope": "historical_analysis",
+            "label": "历史旧口径分析",
+            "reason": "保留用于复盘历史策略，但不进入当前严格收益统计，也不直接驱动正式策略参数。",
+        }
     can_optimize = str(display.get("reviewStatus") or "") == "learnable" and learning_eligible_count > 0
     if not can_optimize:
         return {
@@ -14833,6 +15841,8 @@ def _review_usage_explanation(
         )
         next_steps.append("无需补数据，后续策略统计会自动使用这条记录。")
     else:
+        if str(sample.get("sampleClass") or "") == "historical_learning":
+            reasons.append("这是历史旧口径的完整样本；买入价近似和费用版本与当前严格口径不同，所以保留分析但不混入当前收益。")
         if str(trade_date_status.get("status") or "").startswith("non_trading"):
             reasons.append(f"推荐日 {recommendation_date} 不是交易日，A股不开盘。")
         if run_role == "research":
@@ -14879,6 +15889,8 @@ def _review_usage_explanation(
             next_steps.append("可以点击“刷新该 run 验证”，或等次日 15 分钟数据回来。")
         elif str(display.get("reviewStatus") or "") == "reviewable":
             next_steps.append("可以看这次表现，但不要把它当成策略优化样本。")
+        elif str(sample.get("sampleClass") or "") == "historical_learning":
+            next_steps.append("可在“历史口径可分析”中回看；如需比较，只能按历史口径单独成组，不能与当前严格收益合并。")
         else:
             next_steps.append("无需反复刷新，这条记录主要用于排查系统问题。")
 
@@ -14947,11 +15959,24 @@ def _exit_timing_stats(outcomes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 missing += 1
                 continue
             values.append(float(net))
-            excess = _safe_number(item.get("excessReturnPct"))
-            if excess is not None:
-                benchmark_ready += 1
-                if excess > 0:
-                    benchmark_win += 1
+            # The stored benchmark is an open_15m benchmark.  Reusing it for
+            # open/5m/30m/close makes every exit row show the same invalid win
+            # rate.  Until scenario-matched benchmark prices are stored, expose
+            # benchmark comparison only for the primary open_15m scenario.
+            if key == PRIMARY_TRADEABLE_SCENARIO_KEY:
+                payload = _outcome_payload(item)
+                excess = _safe_number(item.get("excessReturnPct"))
+                if excess is None:
+                    excess = _safe_number(payload.get("excessReturnPct"))
+                benchmark_return = _safe_number(item.get("benchmarkReturnPct"))
+                if benchmark_return is None:
+                    benchmark_return = _safe_number(payload.get("benchmarkReturnPct"))
+                if excess is None and benchmark_return is not None:
+                    excess = float(net) - float(benchmark_return)
+                if excess is not None:
+                    benchmark_ready += 1
+                    if excess > 0:
+                        benchmark_win += 1
         rows.append(
             {
                 "scenarioKey": key,
@@ -14962,8 +15987,10 @@ def _exit_timing_stats(outcomes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "avgNetReturnPct": _avg(values),
                 "medianNetReturnPct": round(float(median(values)), 2) if values else None,
                 "successRate": _rate([value > 0 for value in values]) if values else None,
-                "strongSuccessRate": _rate([value >= 2 for value in values]) if values else None,
+                "strongSuccessRate": _rate([value >= STRONG_SUCCESS_NET_RETURN_THRESHOLD_PCT for value in values]) if values else None,
                 "benchmarkWinRate": round(benchmark_win * 100 / benchmark_ready, 1) if benchmark_ready else None,
+                "benchmarkReadyCount": benchmark_ready,
+                "benchmarkWinCount": benchmark_win,
                 "netReturnsPct": [round(value, 2) for value in values],
                 "isPrimary": key == PRIMARY_TRADEABLE_SCENARIO_KEY,
             }
@@ -14973,11 +16000,13 @@ def _exit_timing_stats(outcomes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _outcome_scenario_by_key(item: Dict[str, Any], key: str) -> Dict[str, Any]:
     tradeable = (_outcome_payload(item).get("tradeable") or {})
+    primary = tradeable.get("primaryScenario") or {}
+    if key == PRIMARY_TRADEABLE_SCENARIO_KEY and primary.get("scenarioKey") == key:
+        return primary
     scenarios = tradeable.get("scenarios") or []
     for scenario in scenarios:
         if scenario.get("scenarioKey") == key:
             return scenario
-    primary = tradeable.get("primaryScenario") or {}
     if primary.get("scenarioKey") == key:
         return primary
     return {}
@@ -14990,21 +16019,25 @@ def _optimization_review_stats(runs: List[Dict[str, Any]], _version_group=False)
     active_version = selection_policy.VERSION if selection_policy.VERSION in groups else "legacy"
     scoped_runs = runs if _version_group else groups.get(active_version, [])
     learning = [run for run in scoped_runs if run.get("reviewStatus") == "learnable"]
+    all_strict = [run for run in runs if run.get("reviewStatus") == "learnable"]
+    current_strict = [run for run in all_strict if str(run.get("selectionPolicyVersion") or "legacy") == selection_policy.VERSION]
+    historical_strict = [run for run in all_strict if run not in current_strict]
+    historical_legacy = [run for run in runs if run.get("reviewStatus") == "historical"]
     timing_rows: List[Dict[str, Any]] = []
     for definition in TRADEABLE_SCENARIO_DEFINITIONS:
         key = str(definition.get("key") or "")
         values: List[float] = []
         missing = 0
-        benchmark_values: List[float] = []
+        benchmark_ready = 0
+        benchmark_win = 0
         for run in learning:
             timing = {item.get("scenarioKey"): item for item in run.get("exitTimingStats") or []}
             row = timing.get(key) or {}
             missing += int(row.get("missingCount") or 0)
             row_values = [_safe_number(value) for value in row.get("netReturnsPct") or []]
             values.extend([float(value) for value in row_values if value is not None])
-            win_rate = _safe_number(row.get("benchmarkWinRate"))
-            if win_rate is not None:
-                benchmark_values.append(float(win_rate))
+            benchmark_ready += int(row.get("benchmarkReadyCount") or 0)
+            benchmark_win += int(row.get("benchmarkWinCount") or 0)
         timing_rows.append(
             {
                 "scenarioKey": key,
@@ -15015,15 +16048,17 @@ def _optimization_review_stats(runs: List[Dict[str, Any]], _version_group=False)
                 "avgNetReturnPct": _avg(values),
                 "medianNetReturnPct": round(float(median(values)), 2) if values else None,
                 "successRate": _rate([value > 0 for value in values]) if values else None,
-                "strongSuccessRate": _rate([value >= 2 for value in values]) if values else None,
-                "benchmarkWinRate": _avg(benchmark_values),
+                "strongSuccessRate": _rate([value >= STRONG_SUCCESS_NET_RETURN_THRESHOLD_PCT for value in values]) if values else None,
+                "benchmarkWinRate": round(benchmark_win * 100 / benchmark_ready, 1) if benchmark_ready else None,
+                "benchmarkReadyCount": benchmark_ready,
+                "benchmarkWinCount": benchmark_win,
                 "netReturnsPct": [round(value, 2) for value in values],
                 "isPrimary": key == PRIMARY_TRADEABLE_SCENARIO_KEY,
             }
         )
     primary = next((item for item in timing_rows if item.get("scenarioKey") == PRIMARY_TRADEABLE_SCENARIO_KEY), {})
     return {
-        "title": "可用于优化样本统计",
+        "title": "当前严格样本收益统计",
         "selectionPolicyVersion": active_version if not _version_group else next(iter(groups), "legacy"),
         "versionGroups": [] if _version_group else [dict(selectionPolicyVersion=version,
             runCount=len([r for r in rows if r.get("reviewStatus") == "learnable"]),
@@ -15032,17 +16067,23 @@ def _optimization_review_stats(runs: List[Dict[str, Any]], _version_group=False)
         "scopeLabel": "可用于优化",
         "runCount": len(learning),
         "outcomeCount": sum(int(run.get("learningEligibleCount") or 0) for run in learning),
+        "currentStrictRunCount": len(current_strict),
+        "currentStrictOutcomeCount": sum(int(run.get("learningEligibleCount") or 0) for run in current_strict),
+        "historicalStrictRunCount": len(historical_strict),
+        "historicalStrictOutcomeCount": sum(int(run.get("learningEligibleCount") or 0) for run in historical_strict),
+        "historicalLegacyRunCount": len(historical_legacy),
+        "historicalLegacyOutcomeCount": sum(int(run.get("historicalLearningEligibleCount") or 0) for run in historical_legacy),
         "primaryScenarioKey": PRIMARY_TRADEABLE_SCENARIO_KEY,
         "primaryScenarioLabel": _scenario_definition_label(PRIMARY_TRADEABLE_SCENARIO_KEY),
         "primary": _public_timing_stat(primary),
         "exitTimingStats": [_public_timing_stat(row) for row in timing_rows],
-        "note": "顶部统计只使用当前可用版本的可优化样本；各版本分别列出，不混合收益。列表筛选不改变统计。",
+        "note": "收益表只计算当前严格版本；历史严格版本和历史旧口径保留为可分析样本，但绝不与当前收益混算。列表筛选不改变统计。",
         "metricNotes": {
             "avgNetReturnPct": "平均净收益：按该版本冻结的入场与固定卖出证据计算，扣除滑点和交易成本；严格发布后入场与旧版近似买入分版本查看。",
             "medianNetReturnPct": "中位数净收益：把收益从低到高排队后取中间值，能减少单个极端样本的影响。",
             "successRate": "成功率：该卖出时点净收益大于 0 的比例。",
-            "strongSuccessRate": "强成功率：该卖出时点净收益达到 2% 及以上的比例。",
-            "benchmarkWinRate": "跑赢基准比例：有同口径基准时，收益高于市场基准的比例。",
+            "strongSuccessRate": f"强成功率：该卖出时点扣费后净收益达到 {STRONG_SUCCESS_NET_RETURN_THRESHOLD_PCT:g}% 及以上的比例。",
+            "benchmarkWinRate": "跑赢基准比例：只在相同卖出时点存在基准收益时计算；当前仅 open_15m 有同口径基准，其余时点显示暂无数据。",
             "missingCount": "缺数据数：该时点没有拿到可用价格的样本数。",
         },
     }
@@ -15061,25 +16102,34 @@ def _public_review_summary(run: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _review_stats(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    learning = [run for run in runs if run.get("reviewStatus") == "learnable"]
+    all_learning = [run for run in runs if run.get("reviewStatus") == "learnable"]
+    active_version = selection_policy.VERSION
+    learning = [run for run in all_learning if str(run.get("selectionPolicyVersion") or "legacy") == active_version]
     reviewable = [run for run in runs if run.get("reviewStatus") == "reviewable"]
     partial = [run for run in runs if run.get("reviewStatus") == "partial"]
     waiting = [run for run in runs if run.get("reviewStatus") == "waiting"]
     diagnostic = [run for run in runs if run.get("reviewStatus") in {"diagnostic", "unusable"}]
-    tradeable_count = sum(int(run.get("tradeableCount") or 0) for run in learning)
-    success_count = sum(int(run.get("successCount") or 0) for run in learning)
-    strong_success_count = sum(int(run.get("strongSuccessCount") or 0) for run in learning)
-    learning_eligible_count = sum(int(run.get("learningEligibleCount") or 0) for run in learning)
-    weighted_return_sum = 0.0
+    historical_legacy = [run for run in runs if run.get("reviewStatus") == "historical"]
+    historical_strict = [run for run in all_learning if str(run.get("selectionPolicyVersion") or "legacy") != active_version]
+    primary_values = []
     for run in learning:
-        avg_net = _safe_number(run.get("avgPrimaryNetReturnPct"))
-        count = int(run.get("tradeableCount") or 0)
-        if avg_net is not None and count > 0:
-            weighted_return_sum += avg_net * count
+        primary = next(
+            (row for row in run.get("exitTimingStats") or [] if row.get("scenarioKey") == PRIMARY_TRADEABLE_SCENARIO_KEY),
+            {},
+        )
+        primary_values.extend([
+            float(value) for value in (_safe_number(item) for item in primary.get("netReturnsPct") or [])
+            if value is not None
+        ])
+    tradeable_count = len(primary_values)
+    success_count = len([value for value in primary_values if value > 0])
+    strong_success_count = len([value for value in primary_values if value >= STRONG_SUCCESS_NET_RETURN_THRESHOLD_PCT])
+    learning_eligible_count = sum(int(run.get("learningEligibleCount") or 0) for run in learning)
     return {
         "loadedRuns": len(runs),
         "displayReviewableRuns": len(reviewable),
         "displayLearnableRuns": len(learning),
+        "displayHistoricalRuns": len(historical_legacy),
         "displayPartialRuns": len(partial),
         "displayWaitingRuns": len(waiting),
         "displayDiagnosticRuns": len(diagnostic),
@@ -15090,7 +16140,19 @@ def _review_stats(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "learningRuns": len(learning),
         "tradeableOutcomes": tradeable_count,
         "learningEligibleOutcomes": learning_eligible_count,
-        "avgNetReturnPct": round(weighted_return_sum / tradeable_count, 2) if tradeable_count else None,
+        "currentStrictRuns": len(learning),
+        "currentStrictOutcomes": learning_eligible_count,
+        "historicalStrictRuns": len(historical_strict),
+        "historicalStrictOutcomes": sum(int(run.get("learningEligibleCount") or 0) for run in historical_strict),
+        "historicalLegacyRuns": len(historical_legacy),
+        "historicalLegacyOutcomes": sum(int(run.get("historicalLearningEligibleCount") or 0) for run in historical_legacy),
+        "historicalAnalyzableRuns": len(historical_strict) + len(historical_legacy),
+        "historicalAnalyzableOutcomes": sum(int(run.get("learningEligibleCount") or 0) for run in historical_strict)
+        + sum(int(run.get("historicalLearningEligibleCount") or 0) for run in historical_legacy),
+        "totalAnalyzableRuns": len(all_learning) + len(historical_legacy),
+        "totalAnalyzableOutcomes": sum(int(run.get("learningEligibleCount") or 0) for run in all_learning)
+        + sum(int(run.get("historicalLearningEligibleCount") or 0) for run in historical_legacy),
+        "avgNetReturnPct": _avg(primary_values),
         "successRate": round(success_count * 100 / tradeable_count, 1) if tradeable_count else None,
         "strongSuccessRate": round(strong_success_count * 100 / tradeable_count, 1) if tradeable_count else None,
         "successCount": success_count,
@@ -15103,7 +16165,10 @@ def _review_stats(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "partialRuns": len(partial),
         "waitingRuns": len([run for run in runs if run.get("sampleClass") == "waiting"]),
         "zeroPickRuns": len([run for run in runs if run.get("sampleClass") == "zero_pick"]),
-        "note": "页面按能不能使用来分：可用于优化、可看结果、部分缺数据、等待数据、仅排查。周末或异常 run 即使查到部分价格，也只进入仅排查。",
+        "technicalFailureRuns": len([run for run in runs if run.get("sampleClass") == "technical_failure"]),
+        "selectionPolicyVersion": active_version,
+        "excludedOtherVersionLearningRuns": max(0, len(all_learning) - len(learning)),
+        "note": f"当前严格收益只统计版本 {active_version}；历史严格样本与旧口径样本继续保留并单独计数，不与当前收益混算。市场主动空仓和 AI 研究状态分开统计。",
     }
 
 
@@ -15418,7 +16483,11 @@ def _scenario_baseline_comparison(
         )
     complete = [row for row in rows if row.get("netReturnPct") is not None]
     returns = [float(row["netReturnPct"]) for row in complete]
-    portfolio_return = round(sum(returns) / max(1, slot_count), 4) if len(complete) == len(rows) else None
+    portfolio_return = (
+        round(sum(returns) / max(1, slot_count), 4)
+        if rows and len(complete) == len(rows)
+        else None
+    )
     return {
         "scenarioKey": scenario_key,
         "count": len(rows),
@@ -15429,7 +16498,11 @@ def _scenario_baseline_comparison(
         "cashSlots": max(0, slot_count - len(rows)),
         "componentReturnsPct": returns,
         "componentRows": rows,
-        "status": "ok" if portfolio_return is not None else "data_insufficient",
+        "status": (
+            "not_applicable" if not rows
+            else "ok" if portfolio_return is not None
+            else "data_insufficient"
+        ),
         "executionStatusCounts": dict(Counter(str(row.get("executionStatus") or "unknown") for row in rows)),
         "branchCounts": dict(Counter(str(row.get("branch") or "unknown") for row in rows)),
     }
@@ -15817,6 +16890,11 @@ def _is_learning_eligible_outcome(item: Dict[str, Any]) -> bool:
     payload = _outcome_payload(item)
     if payload.get("validationVersion") != TRADEABLE_VALIDATION_VERSION:
         return False
+    if payload.get("entryModel") != "formal_unit":
+        return False
+    execution_profile = payload.get("executionProfile") or {}
+    if not str(execution_profile.get("version") or ""):
+        return False
     if payload.get("validationStatus") != "final":
         return False
     source_text = str(item.get("actualSource") or payload.get("actualSource") or item.get("dataSource") or payload.get("dataSource") or "")
@@ -15836,6 +16914,34 @@ def _is_learning_eligible_outcome(item: Dict[str, Any]) -> bool:
     if item.get("benchmarkReturnPct") is None and payload.get("benchmarkReturnPct") is None:
         return False
     if payload.get("learningEligible") is False and payload.get("exclusionReasons"):
+        return False
+    return True
+
+
+def _is_historical_learning_outcome(item: Dict[str, Any]) -> bool:
+    """Keep the old v2 tradeable cohort visible without mixing it into strict P&L."""
+    payload = _outcome_payload(item)
+    if payload.get("learningEligible") is not True:
+        return False
+    if payload.get("validationVersion") != "v2_tradeable":
+        return False
+    if payload.get("validationStatus") != "final":
+        return False
+    source_text = str(item.get("actualSource") or payload.get("actualSource") or item.get("dataSource") or payload.get("dataSource") or "")
+    if "mock" in source_text or "cache" in source_text:
+        return False
+    quality = payload.get("dataQuality") or {}
+    if quality.get("grade") not in {"A", "B"}:
+        return False
+    price = payload.get("priceConsistency") or {}
+    if price and price.get("ok") is False:
+        return False
+    primary = (payload.get("tradeable") or {}).get("primaryScenario") or {}
+    if primary.get("scenarioKey") != PRIMARY_TRADEABLE_SCENARIO_KEY:
+        return False
+    if primary.get("dataStatus") != "ok" or primary.get("netReturnPct") is None:
+        return False
+    if item.get("benchmarkReturnPct") is None and payload.get("benchmarkReturnPct") is None:
         return False
     return True
 
@@ -15874,6 +16980,10 @@ def _learning_exclusion_reasons_for_loaded_outcome(item: Dict[str, Any]) -> List
     reasons: List[str] = []
     if payload.get("validationVersion") != TRADEABLE_VALIDATION_VERSION:
         reasons.append(f"验证版本不是 {TRADEABLE_VALIDATION_VERSION}")
+    if payload.get("entryModel") != "formal_unit":
+        reasons.append("买入模型不是正式单位成交模型")
+    if not str((payload.get("executionProfile") or {}).get("version") or ""):
+        reasons.append("缺少执行配置版本")
     if payload.get("validationStatus") and payload.get("validationStatus") != "final":
         reasons.append(f"验证状态 {payload.get('validationStatus')}")
     source_text = str(item.get("actualSource") or payload.get("actualSource") or item.get("dataSource") or payload.get("dataSource") or "")
@@ -16390,13 +17500,16 @@ def _t1_trade_date_status(
     scan_time: str,
     actual_source: str = "",
     market: Optional[Dict[str, Any]] = None,
+    exchange_calendar: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     rec_text = str(recommendation_date or "")[:10]
     market = market or {}
+    exchange_calendar = exchange_calendar or {}
     reasons: List[str] = []
     status = "assumed_trading_day"
     eligibility = "official_allowed"
     is_trading_day = True
+    source = "weekday_calendar+snapshot_trade_date"
     try:
         rec_date = date.fromisoformat(rec_text)
     except ValueError:
@@ -16411,6 +17524,34 @@ def _t1_trade_date_status(
         eligibility = "official_blocked"
         is_trading_day = False
         reasons.append("推荐日期是周末，A 股不开市，禁止生成正式 T+1 推荐。")
+
+    calendar_status = _t1_exchange_calendar_day_status(exchange_calendar, rec_text)
+    if rec_date and rec_date.weekday() < 5 and calendar_status.get("covered"):
+        source = "exchange_calendar+snapshot_trade_date"
+        if calendar_status.get("isOpen"):
+            status = "confirmed_trading_day"
+            reasons.append(
+                f"交易所交易日历确认 {rec_text} 开市"
+                f"（{calendar_status.get('source') or 'exchange_calendar'}）。"
+            )
+        else:
+            status = "non_trading_exchange_calendar"
+            eligibility = "official_blocked"
+            is_trading_day = False
+            reasons.append(
+                f"交易所交易日历确认 {rec_text} 休市"
+                f"（{calendar_status.get('source') or 'exchange_calendar'}），禁止生成正式 T+1 推荐。"
+            )
+    elif rec_date and rec_date.weekday() < 5:
+        official_closure = _t1_official_sse_closure(rec_text)
+        if official_closure:
+            source = "sse_official_closure_schedule+snapshot_trade_date"
+            status = "non_trading_official_holiday"
+            eligibility = "official_blocked"
+            is_trading_day = False
+            reasons.append(
+                f"上交所年度休市安排确认 {rec_text} 为{official_closure}休市日，禁止生成正式 T+1 推荐。"
+            )
 
     source_text = str(actual_source or "")
     mock_used = source_text == "mock" or bool((market.get("mockStatus") or {}).get("used"))
@@ -16434,18 +17575,21 @@ def _t1_trade_date_status(
         reasons.append("全市场缓存不是推荐日数据。")
 
     if not reasons and rec_date:
-        reasons.append("按工作日与行情快照时间进行交易日校验；节假日以行情日期不匹配兜底。")
+        reasons.append("交易所日历未覆盖当前日期，暂按工作日校验，并使用真实行情交易日期兜底。")
 
     return {
         "version": T1_TRADE_DATE_GUARD_VERSION,
         "recommendationDate": rec_text,
         "recommendationTradeDate": rec_text,
-        "dataAsOfDate": data_as_of_date or rec_text,
+        "dataAsOfDate": data_as_of_date,
         "asOfTime": scan_time or "",
         "isTradingDay": bool(is_trading_day),
         "status": status,
         "eligibility": eligibility,
-        "source": "weekday_calendar+snapshot_date",
+        "source": source,
+        "calendarSource": calendar_status.get("source") or "",
+        "calendarVersion": calendar_status.get("version") or "",
+        "calendarCovered": bool(calendar_status.get("covered")),
         "guardEnabled": T1_TRADING_DAY_GUARD_ENABLED,
         "reasons": _unique_strings(reasons),
     }
@@ -16455,13 +17599,68 @@ def _t1_market_data_as_of_date(market: Dict[str, Any]) -> str:
     for source in (
         market.get("dataAsOfDate"),
         market.get("tradeDate"),
-        (market.get("marketSnapshotFreeze") or {}).get("generatedAt"),
-        (market.get("cacheStatus") or {}).get("generatedAt"),
-        market.get("contextGeneratedAt"),
+        (market.get("marketSnapshotFreeze") or {}).get("tradeDate"),
+        (market.get("cacheStatus") or {}).get("tradeDate"),
     ):
         text = str(source or "")
         if len(text) >= 10 and re.match(r"\d{4}-\d{2}-\d{2}", text[:10]):
             return text[:10]
+    return ""
+
+
+def _t1_stock_data_as_of_date(stocks: List[RawStock]) -> str:
+    stock_count = len(stocks or [])
+    dates = []
+    for stock in stocks or []:
+        text = str(getattr(stock, "trade_date", "") or "")[:10]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            dates.append(text)
+    if not dates or len(dates) / max(1, stock_count) < 0.8:
+        return ""
+    counts = Counter(dates)
+    dominant, count = counts.most_common(1)[0]
+    if count / len(dates) < 0.8:
+        return ""
+    return dominant
+
+
+def _t1_exchange_calendar_snapshot(
+    database: Database,
+    recommendation_date: str,
+    calendar_provider: Optional[Any] = None,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    if refresh and calendar_provider is not None:
+        try:
+            calendar_provider.next_date(recommendation_date, refresh=True)
+        except Exception as error:  # noqa: BLE001 - quote-date guard remains available.
+            LOGGER.warning("t1 exchange calendar refresh failed date=%s error=%s", recommendation_date, error)
+    calendar = database.get_app_setting("t1_tracking_exchange_calendar", {}) or {}
+    return dict(calendar) if isinstance(calendar, dict) else {}
+
+
+def _t1_exchange_calendar_day_status(calendar: Dict[str, Any], recommendation_date: str) -> Dict[str, Any]:
+    start = str(calendar.get("start") or "")[:10]
+    end = str(calendar.get("end") or "")[:10]
+    covered = bool(start and end and start <= recommendation_date < end)
+    open_dates = {
+        str(item or "")[:10]
+        for item in calendar.get("openDates") or []
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(item or "")[:10])
+    }
+    return {
+        "covered": covered,
+        "isOpen": covered and recommendation_date in open_dates,
+        "source": str(calendar.get("source") or ""),
+        "version": str(calendar.get("version") or ""),
+    }
+
+
+def _t1_official_sse_closure(recommendation_date: str) -> str:
+    year = str(recommendation_date or "")[:4]
+    for start, end, label in T1_SSE_OFFICIAL_CLOSURES.get(year, ()):
+        if start <= recommendation_date <= end:
+            return label
     return ""
 
 

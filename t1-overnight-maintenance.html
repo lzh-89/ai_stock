@@ -414,6 +414,48 @@
         </div>
       </section>
 
+      <section class="panel" data-t1-scope="maintenance">
+        <div class="panel-head">
+          <div>
+            <span>V3 工程验证</span>
+            <h2>历史数据只读重播</h2>
+          </div>
+          <div class="panel-actions">
+            <label>
+              <span>开始日期</span>
+              <input id="v3ReplayDateFrom" type="date" value="2026-10-01" />
+            </label>
+            <label>
+              <span>结束日期</span>
+              <input id="v3ReplayDateTo" type="date" />
+            </label>
+            <button id="v3ReplayButton" class="secondary-button" type="button">
+              生成重播报告
+            </button>
+          </div>
+        </div>
+        <p class="config-help">
+          重播只读取历史 run 并新建独立报告，不修改历史正式推荐、排名、候选事实或收益结果。A级可精确复核；B级只能检查证据缺口；C级无法还原筛选。所有历史重播结果都不能用于 V3 正式晋级。
+        </p>
+        <div id="v3ReplaySummary" class="metric-strip"></div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>推荐日期</th>
+                <th>证据等级</th>
+                <th>可复核状态</th>
+                <th>V3净收益</th>
+                <th>旧策略净收益</th>
+                <th>同日差值</th>
+                <th>限制说明</th>
+              </tr>
+            </thead>
+            <tbody id="v3ReplayRows"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="panel" data-t1-scope="config maintenance">
         <div class="panel-head">
           <div>
