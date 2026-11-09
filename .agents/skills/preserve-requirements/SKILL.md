@@ -71,7 +71,7 @@ Use only these statuses:
 
 Do not skip from `confirmed` to `verified`. Code completion is `implemented_unverified` until automated tests and all applicable acceptance surfaces pass.
 
-Do not archive a source optimization document until all confirmed criteria are `merged`, `archived`, or explicitly `cancelled` with decision evidence.
+Archive a source optimization document immediately after every confirmed criterion has been losslessly mapped into the active primary requirement and implementation documents. A criterion may remain `implementing` after integration, but its pending work, owner/status, acceptance rule, monitoring, and rollback must already exist in the primary documents and traceability manifest before the source is archived. Do not archive while any confirmed criterion lacks that active mapping.
 
 ### 7. Run the deterministic audit
 
@@ -101,4 +101,3 @@ Report counts and IDs for fully covered, partial, pending, and cancelled criteri
 - Do not accept links to files as evidence when the cited behavior is absent.
 - Do not edit a manifest to match incomplete code merely to make the audit pass.
 - Do not describe a designed but unavailable page, API, or operation as implemented.
-
