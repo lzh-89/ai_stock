@@ -24,10 +24,11 @@ const state = {
   criticStatus: null,
   strategyFeedback: null,
   autoRunStatus: null,
+  marketPrefetchStatus: null,
   advancedGovernanceLoaded: false
 };
 
-const ZERO_PICK_SELECTION_MODES = ["market_risk_zero_pick", "data_quality_zero_pick", "guardrail_zero_pick", "invalid_non_trading_day", "v3_active_top0"];
+const ZERO_PICK_SELECTION_MODES = ["market_risk_zero_pick", "market_data_unavailable_zero_pick", "data_quality_zero_pick", "guardrail_zero_pick", "invalid_non_trading_day", "v3_active_top0"];
 
 const els = {
   pageEyebrow: document.querySelector("#pageEyebrow"),
@@ -37,7 +38,15 @@ const els = {
   latestButton: document.querySelector("#latestButton"),
   preheatEvidenceButton: document.querySelector("#preheatEvidenceButton"),
   runButton: document.querySelector("#runButton"),
-  forceCheck: document.querySelector("#forceCheck"),
+  regenerateButton: document.querySelector("#regenerateButton"),
+  regenerationModal: document.querySelector("#regenerationModal"),
+  regenerationModalClose: document.querySelector("#regenerationModalClose"),
+  regenerationCancelButton: document.querySelector("#regenerationCancelButton"),
+  regenerationConfirmButton: document.querySelector("#regenerationConfirmButton"),
+  regenerationBaseRun: document.querySelector("#regenerationBaseRun"),
+  requestedOfficialRole: document.querySelector("#requestedOfficialRole"),
+  officialRoleOption: document.querySelector("#officialRoleOption"),
+  officialRoleHint: document.querySelector("#officialRoleHint"),
   notice: document.querySelector("#notice"),
   statusText: document.querySelector("#statusText"),
   modeText: document.querySelector("#modeText"),
@@ -153,6 +162,7 @@ function init() {
     loadV3Replay();
   }
   loadAutoRunStatus();
+  loadMarketPrefetchStatus();
   if (state.pageMode !== "config") loadLatest();
 }
 
@@ -182,6 +192,13 @@ function bindEvents() {
     if (event.target === els.actionModal) hideActionModal();
   });
   on(els.runButton, "click", startRun);
+  on(els.regenerateButton, "click", showRegenerationModal);
+  on(els.regenerationModalClose, "click", hideRegenerationModal);
+  on(els.regenerationCancelButton, "click", hideRegenerationModal);
+  on(els.regenerationConfirmButton, "click", confirmRegeneration);
+  on(els.regenerationModal, "click", (event) => {
+    if (event.target === els.regenerationModal) hideRegenerationModal();
+  });
   on(els.saveCriticConfigButton, "click", saveCriticConfig);
   on(els.saveStageConfigButton, "click", saveStageConfig);
   on(els.refreshStrategyStateButton, "click", () => {
@@ -315,7 +332,19 @@ async function loadAutoRunStatus() {
   }
 }
 
-async function startRun() {
+async function loadMarketPrefetchStatus() {
+  try {
+    const response = await fetch("/api/t1-overnight-selection/prefetch");
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `API ${response.status}`);
+    state.marketPrefetchStatus = payload;
+    if (state.run) renderNotice(buildNotice(state.run));
+  } catch (error) {
+    state.marketPrefetchStatus = null;
+  }
+}
+
+async function startRun(options = {}) {
   if (!els.runButton) return;
   setLoading(true);
   clearPolling();
@@ -331,7 +360,11 @@ async function startRun() {
         batchSize: DEFAULT_T1_BATCH_SIZE,
         batchPick: DEFAULT_T1_BATCH_PICK,
         finalLimit: 3,
-        force: Boolean(els.forceCheck?.checked)
+        force: Boolean(options.force),
+        baseRunId: Number(options.baseRunId || 0),
+        requestedRunRole: options.requestedRunRole || "",
+        regenerationMode: options.regenerationMode || "",
+        clientRequestId: options.clientRequestId || ""
       })
     });
     const payload = await response.json().catch(() => ({}));
@@ -345,6 +378,67 @@ async function startRun() {
   } finally {
     setLoading(false);
   }
+}
+
+function showRegenerationModal() {
+  if (!els.regenerationModal) return;
+  if (state.loading || state.actionLoading || ["pending", "running"].includes(state.run?.status)) {
+    renderNotice("当前 Run 尚未结束，不能重复创建重新生成任务。请等待本次运行完成。");
+    return;
+  }
+  const current = new Date();
+  const minutes = current.getHours() * 60 + current.getMinutes();
+  const officialBlockReasons = [];
+  if (!(minutes >= 14 * 60 + 30 && minutes <= 14 * 60 + 50)) officialBlockReasons.push("当前不在 14:30—14:50 正式信号窗口");
+  if ([0, 6].includes(current.getDay())) officialBlockReasons.push("今天不是 A 股工作日");
+  const tradeDateStatus = state.run?.market?.tradeDateStatus || state.run?.request?.tradeDateStatus || {};
+  if (tradeDateStatus.eligibility === "official_blocked") officialBlockReasons.push(tradeDateStatus.reason || "交易日校验未通过");
+  if (state.source === "mock") officialBlockReasons.push("Mock 模拟行情只能用于研究");
+  if (Number(state.poolSize || 0) < OFFICIAL_MIN_POOL_SIZE) officialBlockReasons.push(`候选池少于 ${OFFICIAL_MIN_POOL_SIZE} 只`);
+  const controls = state.stageStatus || {};
+  if (["sectorRetreatDowngrade", "styleRegimePrompt"].some((key) => controls[key]?.experimental && controls[key]?.effectiveEnabled)) {
+    officialBlockReasons.push("当前启用了实验阶段配置");
+  }
+  const officialAllowed = officialBlockReasons.length === 0;
+  if (els.requestedOfficialRole) {
+    els.requestedOfficialRole.disabled = !officialAllowed;
+    els.requestedOfficialRole.checked = false;
+  }
+  const research = els.regenerationModal.querySelector('input[name="requestedRunRole"][value="research"]');
+  if (research) research.checked = true;
+  if (els.officialRoleOption) els.officialRoleOption.classList.toggle("option-disabled", !officialAllowed);
+  setText(
+    els.officialRoleHint,
+    officialAllowed
+      ? "当前在正式信号窗口内；新 Run 完成后仍会复核真实行情、候选池、技术状态和风险门禁。"
+      : `${officialBlockReasons.join("；")}。只能生成研究结果；原正式推荐不会变化。`
+  );
+  setText(
+    els.regenerationBaseRun,
+    state.run?.id
+      ? `基于 Run ${state.run.id} 的当前参数创建新 Run。原正式结果在新 Run 安全完成前保持不变。`
+      : "按当前页面参数创建新 Run。没有可替换的旧正式结果。"
+  );
+  els.regenerationModal.classList.remove("hidden");
+}
+
+function hideRegenerationModal() {
+  if (els.regenerationModal) els.regenerationModal.classList.add("hidden");
+}
+
+async function confirmRegeneration() {
+  if (!els.regenerationModal) return;
+  const mode = els.regenerationModal.querySelector('input[name="regenerationMode"]:checked')?.value || "recompute_frozen";
+  const role = els.regenerationModal.querySelector('input[name="requestedRunRole"]:checked')?.value || "research";
+  const clientRequestId = window.crypto?.randomUUID?.() || `t1-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  hideRegenerationModal();
+  await startRun({
+    force: true,
+    baseRunId: Number(state.run?.id || 0),
+    requestedRunRole: role,
+    regenerationMode: mode,
+    clientRequestId
+  });
 }
 
 async function preheatEvidence() {
@@ -2380,9 +2474,21 @@ function buildNotice(run) {
   const messages = [];
   const autoNotice = autoRunNotice();
   if (autoNotice) messages.push(autoNotice);
+  const sourceHealth = state.marketPrefetchStatus?.sourceHealth || {};
+  if (sourceHealth.status === "degraded") {
+    messages.push("行情快照健康状态：降级。系统会按新浪→腾讯→AKShare/东财自动切换；未达到正式标准时只生成数据不可用记录。");
+  }
+  if (sourceHealth.sources) {
+    const labels = Object.values(sourceHealth.sources).map((item) => {
+      const status = item.connectivity === "last_success" ? "最近成功" : item.connectivity === "dependency_missing" ? "依赖缺失" : "待实际调用";
+      return `${item.label}${status}`;
+    });
+    messages.push(`真实行情源：${labels.join("；")}。`);
+  }
+  if (sourceHealth.alertAt1439) messages.push("14:39 仍没有满足正式门槛的同日冻结快照，请优先检查行情源，不要把后续结果解释为主动空仓。");
   if (isHistoricalSignalDate(runSignalDate(run))) messages.push(`当前展示的是历史 T+1 候选 · ${runSignalDate(run)}，不是今日信号。建议运行今日 T+1 筛选后再审计。`);
   if (run.timeHint) messages.push(run.timeHint);
-  if (run.reusedExisting) messages.push("已复用今天同参数的最近结果；勾选“强制重新生成”才会重新拉行情并调用 DeepSeek。");
+  if (run.reusedExisting) messages.push("已复用今天同参数或同一请求的 Run；如需新建任务，请使用“重新生成…”并明确选择行情方式和结果用途。");
   const source = (run.market || {}).sourceStatus || {};
   const freeze = (run.market || {}).marketSnapshotFreeze || {};
   const critic = (run.market || {}).critic || {};
@@ -2390,6 +2496,22 @@ function buildNotice(run) {
   const policy = (run.market || {}).recommendationPolicy || {};
   const evidence = (run.market || {}).t1Evidence || {};
   const aiParticipation = (run.market || {}).aiParticipation || {};
+  const request = run.request || {};
+  const finalAudit = (run.market || {}).finalSelectionAudit || {};
+  if (request.force) {
+    const requestedLabel = request.requestedRunRole === "official" ? "申请正式" : "仅研究";
+    const actualLabel = (run.runRole || request.runRole) === "official" ? "正式" : "研究";
+    messages.push(`重新生成：${request.regenerationMode === "refresh_real_then_recompute" ? "刷新真实行情后重算" : "复用冻结行情重算"}；请求类型 ${requestedLabel}，当前实际类型 ${actualLabel}。`);
+    if (request.runRoleResolution === "pending") messages.push("正式身份等待 Run 完成和安全门复核，旧正式结果保持不变。");
+    if (request.runRoleResolution === "blocked_by_safety" || request.runRoleResolution === "blocked_by_market_data") {
+      messages.push(`正式申请未生效：${request.runRoleResolutionReason || run.market?.runRoleResolutionReason || run.error || "安全门未通过"}。`);
+    }
+  }
+  if (finalAudit.mode === "budgeted_tournament") {
+    messages.push(`AI 终选采用预算化分层比较：原始 ${formatInteger(finalAudit.originalCandidateCount)} 只，分组 ${formatInteger(finalAudit.groups?.length || 0)} 轮次记录，最终轮 ${formatInteger(finalAudit.finalRoundCandidateCount || 0)} 只。`);
+  } else if (finalAudit.originalCandidateCount) {
+    messages.push(`AI 终选候选 ${formatInteger(finalAudit.originalCandidateCount)} 只，在安全预算内完成一次全局比较。`);
+  }
   if (isQuickResearchRun(run)) messages.push(`当前为快速研究模式，候选池低于 ${OFFICIAL_MIN_POOL_SIZE}，不能作为正式复盘学习样本。`);
   if (source.isT1Frozen || freeze.reused) messages.push(`已复用同日全市场冻结快照，生成时间 ${source.freezeGeneratedAt || freeze.generatedAt || "--"}，避免连续重跑候选池跳动。`);
   if (evidence.evidenceRunId) messages.push(`当前使用 T+1 独立冻结证据 #${formatInteger(evidence.evidenceRunId)}，不混用早盘雷达。`);
@@ -2397,6 +2519,7 @@ function buildNotice(run) {
   if (aiParticipation.mode === "limited_ai_no_sector") messages.push("AI 当前为无板块有限参与：可比较个股量价和市场风险，但不得写正向行业/概念结论。");
   if (aiParticipation.mode === "research_ai") messages.push("关键行情证据不足，AI 只进入研究模式，不生成真实 Top。");
   if (source.isMock) messages.push("当前结果来自 Mock 模拟数据，不可用于真实推荐。");
+  if (run.selectionMode === "market_data_unavailable_zero_pick") messages.push("真实行情不可用：系统没有形成买入或主动空仓判断，当前仅保留故障诊断记录。");
   if (source.isCache) messages.push(`当前使用全市场缓存${source.cacheStale ? "，缓存已过期" : ""}。`);
   if (["panic", "heavy_down"].includes(context.state)) messages.push(`市场状态为${context.label}，系统允许少选或推荐 0 只。`);
   if (Number(policy.maxPickCount || run.finalLimit || 3) < Number(run.finalLimit || 3)) messages.push(policy.reason || "市场/数据质量限制了推荐数量。");
@@ -3447,6 +3570,9 @@ function isZeroPickRun(run) {
 
 function zeroPickReason(run) {
   const market = run?.market || {};
+  if (run?.selectionMode === "market_data_unavailable_zero_pick") {
+    return market.userMessage || "真实行情不可用，系统没有形成买入或主动空仓判断。";
+  }
   const policy = market.recommendationPolicy || {};
   const context = market.marketContext || {};
   return policy.reason || run?.error || (context.label ? `市场状态为${context.label}，当前按风控推荐 0 只。` : "当前 run 为空仓/避险决策，没有最终 Top3，不做个股验证。");
@@ -3513,7 +3639,9 @@ function hideActionModal() {
 
 function setLoading(loading) {
   state.loading = loading;
-  setDisabled(els.runButton, loading || state.actionLoading);
+  const runActive = ["pending", "running"].includes(state.run?.status);
+  setDisabled(els.runButton, loading || state.actionLoading || runActive);
+  setDisabled(els.regenerateButton, loading || state.actionLoading || runActive);
   setDisabled(els.latestButton, loading || state.actionLoading);
   setDisabled(els.preheatEvidenceButton, loading || state.actionLoading);
   setActionButtons();
@@ -3521,7 +3649,9 @@ function setLoading(loading) {
 
 function setActionLoading(loading) {
   state.actionLoading = loading;
-  setDisabled(els.runButton, loading || state.loading);
+  const runActive = ["pending", "running"].includes(state.run?.status);
+  setDisabled(els.runButton, loading || state.loading || runActive);
+  setDisabled(els.regenerateButton, loading || state.loading || runActive);
   setDisabled(els.latestButton, loading || state.loading);
   setDisabled(els.preheatEvidenceButton, loading || state.loading);
   setActionButtons();
@@ -3529,6 +3659,9 @@ function setActionLoading(loading) {
 
 function setActionButtons() {
   const disabled = state.loading || state.actionLoading;
+  const runActive = ["pending", "running"].includes(state.run?.status);
+  setDisabled(els.runButton, disabled || runActive);
+  setDisabled(els.regenerateButton, disabled || runActive);
   setDisabled(els.preheatEvidenceButton, disabled);
   const zeroPick = isZeroPickRun(state.run);
   const quickResearch = isQuickResearchRun(state.run);
@@ -3617,6 +3750,7 @@ function selectionModeLabel(value) {
     rules_fallback: "规则兜底",
     ai_failed: "AI失败",
     market_risk_zero_pick: "市场风险Top0",
+    market_data_unavailable_zero_pick: "真实行情不可用",
     data_quality_zero_pick: "数据质量Top0",
     guardrail_zero_pick: "守门Top0",
     v3_t1_official: "V3 T+1正式策略",

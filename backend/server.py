@@ -703,6 +703,10 @@ class AppHandler(SimpleHTTPRequestHandler):
                     final_limit=_parse_int(payload.get("finalLimit", payload.get("final_limit", 3)), 3),
                     trigger=str(payload.get("trigger") or "manual"),
                     auto_schedule=bool(payload.get("autoSchedule", payload.get("auto_schedule", False))),
+                    base_run_id=_parse_int(payload.get("baseRunId", payload.get("base_run_id", 0)), 0),
+                    requested_run_role=str(payload.get("requestedRunRole", payload.get("requested_run_role", ""))),
+                    regeneration_mode=str(payload.get("regenerationMode", payload.get("regeneration_mode", ""))),
+                    client_request_id=str(payload.get("clientRequestId", payload.get("client_request_id", ""))),
                 )
             except ValueError as error:
                 LOGGER.warning("request t1 overnight bad_request elapsed_ms=%.0f error=%s", (time.perf_counter() - started) * 1000, error)

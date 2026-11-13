@@ -78,6 +78,11 @@ PORTFOLIO_SLOT_COUNT = 3
 DEFAULT_SCAN_TIME = "14:40"
 T1_TIMEOUT_SECONDS = 90
 T1_MAX_TOKENS = 3500
+T1_AI_SAFE_REQUEST_CHARACTERS = 95_000
+T1_AI_HARD_REQUEST_CHARACTERS = 110_000
+T1_FINAL_DECISION_CARD_MAX_CHARACTERS = 6_500
+T1_FINAL_DECISION_CARD_VERSION = "v3_final_decision_card"
+T1_FINAL_TOURNAMENT_VERSION = "v1_budgeted_tournament"
 CRITIC_CONFIG_KEY = "t1_overnight_critic_config"
 EXECUTION_CONFIG_KEY = "t1_overnight_execution_config"
 STAGE_CONFIG_KEY = "t1_overnight_stage_config"
@@ -93,6 +98,7 @@ THEORETICAL_VALIDATION_VERSION = "v1_theoretical"
 HISTORY_SOFT_CLEANUP_VERSION = "v2_semantic_evidence_isolation"
 ZERO_PICK_SELECTION_MODES = {
     "market_risk_zero_pick",
+    "market_data_unavailable_zero_pick",
     "data_quality_zero_pick",
     "guardrail_zero_pick",
     "ai_zero_pick",
@@ -352,7 +358,7 @@ DEFAULT_AUTO_RUN_CONFIG = {
 }
 DEFAULT_MARKET_PREFETCH_CONFIG = {
     "enabled": True,
-    "scheduleTimes": ["14:20", "14:25", "14:30", "14:35", "14:39", "14:40"],
+    "scheduleTimes": ["14:10", "14:20", "14:30", "14:35", "14:38", "14:39"],
     "pollIntervalSeconds": 45,
     "source": "auto",
     "retainDays": 10,
@@ -415,6 +421,33 @@ class T1OvernightSelectionService:
         state["nextSlots"] = _market_prefetch_due_slots(
             datetime.now(), state.get("config") or DEFAULT_MARKET_PREFETCH_CONFIG, state, include_future=True
         )
+        latest = self.analysis_service.full_market_context_store.latest_cached()
+        latest_meta = market_context_meta(latest) if latest else {}
+        same_day_usable = bool(
+            latest_meta.get("snapshotDecisionUsable")
+            and str(latest_meta.get("tradeDate") or "") == date.today().isoformat()
+        )
+        latest_source = str(latest_meta.get("source") or "")
+        akshare_available = bool(getattr(self.analysis_service.full_market_context_store.akshare_provider, "available", lambda: False)())
+        state["sourceHealth"] = {
+            "providerOrder": ["新浪", "腾讯", "AKShare/东财"],
+            "schedulerAlive": state["schedulerAlive"],
+            "latestSnapshotSource": latest_source,
+            "latestSnapshotAt": latest_meta.get("generatedAt") or "",
+            "snapshotDecisionUsable": same_day_usable,
+            "decisionQuality": latest_meta.get("decisionQuality") or {},
+            "status": "ready" if same_day_usable else "degraded",
+            "sources": {
+                "sina": {"label": "新浪", "dependencyAvailable": True, "connectivity": "last_success" if latest_source == "sina" else "not_checked"},
+                "tencent": {"label": "腾讯", "dependencyAvailable": True, "connectivity": "last_success" if latest_source == "tencent" else "not_checked"},
+                "akshare": {
+                    "label": "AKShare/东财",
+                    "dependencyAvailable": akshare_available,
+                    "connectivity": "dependency_missing" if not akshare_available else "last_success" if latest_source == "akshare" else "not_checked",
+                },
+            },
+            "alertAt1439": datetime.now().strftime("%H:%M") >= "14:39" and not same_day_usable,
+        }
         return state
 
     def start_market_prefetch_scheduler(self) -> Dict[str, Any]:
@@ -462,13 +495,27 @@ class T1OvernightSelectionService:
             slots = [_normalize_scan_time(slot)] if slot else _market_prefetch_due_slots(now_dt, config, state)
             processed: List[Dict[str, Any]] = []
             for due_slot in slots:
+                lease_key = f"t1_market_prefetch_lease:{today}:{due_slot}"
+                if not self.database.acquire_app_lease(lease_key, self.worker_id, lease_seconds=240):
+                    processed.append(
+                        {
+                            "status": "lease_busy",
+                            "slot": due_slot,
+                            "tradeDate": today,
+                            "triggerSource": trigger_source,
+                            "checkedAt": checked_at,
+                            "message": "另一个服务进程正在生成该时点快照，本进程稍后复核结果。",
+                        }
+                    )
+                    continue
                 try:
                     snapshot = self.analysis_service.full_market_context_store.prefetch(
                         source=str(config.get("source") or "auto"), force=True
                     )
                     meta = market_context_meta(snapshot)
+                    decision_usable = bool(meta.get("snapshotDecisionUsable"))
                     event = {
-                        "status": "done",
+                        "status": "done" if decision_usable else "partial",
                         "slot": due_slot,
                         "tradeDate": today,
                         "triggerSource": trigger_source,
@@ -478,7 +525,13 @@ class T1OvernightSelectionService:
                         "snapshotStatus": meta.get("status") or "",
                         "coverage": meta.get("coverage") or {},
                         "failedPages": meta.get("failedPages") or [],
-                        "message": f"{today} {due_slot} 全市场快照预取完成。",
+                        "snapshotDecisionUsable": decision_usable,
+                        "decisionQuality": meta.get("decisionQuality") or {},
+                        "message": (
+                            f"{today} {due_slot} 全市场快照预取完成。"
+                            if decision_usable
+                            else f"{today} {due_slot} 快照已保存，但尚不满足正式决策标准，将自动重试。"
+                        ),
                     }
                 except Exception as error:  # noqa: BLE001 - scheduler must remain alive.
                     LOGGER.warning("t1 market prefetch failed slot=%s error=%s", due_slot, error)
@@ -490,6 +543,8 @@ class T1OvernightSelectionService:
                         "checkedAt": checked_at,
                         "message": str(error),
                     }
+                finally:
+                    self.database.release_app_lease(lease_key, self.worker_id)
                 processed.append(event)
                 _record_market_prefetch_event(state, today, due_slot, event, config)
             state["lastStatus"] = processed[-1].get("status") if processed else "waiting"
@@ -600,16 +655,46 @@ class T1OvernightSelectionService:
         final_limit: int = DEFAULT_FINAL_LIMIT,
         trigger: str = "manual",
         auto_schedule: bool = False,
+        base_run_id: int = 0,
+        requested_run_role: str = "",
+        regeneration_mode: str = "",
+        client_request_id: str = "",
     ) -> Dict[str, Any]:
         risk_mode = "balanced"
-        source = source if source in {"auto", "sina", "akshare", "mock"} else "auto"
+        source = source if source in {"auto", "sina", "tencent", "akshare", "mock"} else "auto"
         scan_time = _normalize_scan_time(scan_time)
         pool_size = _clamp_int(pool_size, 80, 500, DEFAULT_POOL_SIZE)
         batch_size = _clamp_int(batch_size, 20, 80, DEFAULT_BATCH_SIZE)
         batch_pick = _clamp_int(batch_pick, 2, 8, DEFAULT_BATCH_PICK)
         final_limit = _clamp_int(final_limit, 1, 5, DEFAULT_FINAL_LIMIT)
+        requested_run_role = str(requested_run_role or "").strip().lower()
+        regeneration_mode = str(regeneration_mode or "").strip().lower()
+        client_request_id = str(client_request_id or "").strip()[:120]
+        base_run_id = max(0, int(base_run_id or 0))
+        if force:
+            requested_run_role = requested_run_role or "research"
+            regeneration_mode = regeneration_mode or "recompute_frozen"
+            if requested_run_role not in {"official", "research"}:
+                raise ValueError("重新生成必须明确选择“申请正式结果”或“仅研究结果”。")
+            if regeneration_mode not in {"recompute_frozen", "refresh_real_then_recompute"}:
+                raise ValueError("重新生成方式只支持“复用冻结行情重算”或“刷新真实行情后重算”。")
+            if requested_run_role == "official":
+                current_time = datetime.now().strftime("%H:%M")
+                if not (OFFICIAL_SCAN_START <= current_time <= OFFICIAL_SCAN_END):
+                    raise ValueError("当前不在 14:30—14:50 正式信号窗口；仍可选择“仅研究结果”重新生成。")
+        else:
+            requested_run_role = ""
+            regeneration_mode = ""
         run_profile = _run_profile_for_pool(pool_size)
         recommendation_date = date.today().isoformat()
+        if force and client_request_id:
+            existing_request = self.database.find_t1_run_by_client_request_id(recommendation_date, client_request_id)
+            if existing_request:
+                self._resume_thread_if_needed(existing_request)
+                result = self._run_start_receipt(int(existing_request["id"]))
+                result["reusedExisting"] = True
+                result["idempotentReplay"] = True
+                return result
         deployment_snapshot = self.strategy_deployment.freeze_for_run(recommendation_date)
         stage_config = self.stage_config()
         stage_status = self.stage_status(stage_config)
@@ -618,7 +703,7 @@ class T1OvernightSelectionService:
             self.database,
             recommendation_date,
             calendar_provider=self.candidate_tracking.calendar,
-            refresh=True,
+            refresh=False,
         )
         trade_date_status = _t1_trade_date_status(
             recommendation_date,
@@ -626,7 +711,16 @@ class T1OvernightSelectionService:
             actual_source=source,
             exchange_calendar=exchange_calendar,
         )
-        run_role = _initial_run_role(scan_time, force, pool_size)
+        if force and requested_run_role == "official":
+            if source == "mock":
+                raise ValueError("Mock 模拟行情只能生成研究 Run，不能申请正式结果。")
+            if pool_size < T1_OFFICIAL_MIN_POOL_SIZE:
+                raise ValueError(f"候选池少于 {T1_OFFICIAL_MIN_POOL_SIZE} 只，只能生成研究 Run。")
+            if _t1_trade_date_blocks_official(trade_date_status):
+                raise ValueError(_t1_trade_date_block_reason(trade_date_status))
+            if _stage_controls_force_research(stage_status):
+                raise ValueError("当前启用了尚处实验阶段的策略配置，只能生成研究 Run。")
+        run_role = "research" if force else _initial_run_role(scan_time, False, pool_size)
         if _t1_trade_date_blocks_official(trade_date_status):
             run_role = "invalid"
         elif str(trade_date_status.get("eligibility") or "") == "research_only":
@@ -655,6 +749,25 @@ class T1OvernightSelectionService:
             run["reusedExisting"] = True
             return run
 
+        regeneration_lease_key = ""
+        if force:
+            regeneration_lease_key = f"t1_regeneration_create:{recommendation_date}:{base_run_id or 'new'}"
+            if not self.database.acquire_app_lease(regeneration_lease_key, self.worker_id, lease_seconds=60):
+                active = self.database.find_active_t1_regeneration(recommendation_date, base_run_id=base_run_id)
+                if active:
+                    result = self._run_start_receipt(int(active["id"]))
+                    result["reusedExisting"] = True
+                    result["regenerationInProgress"] = True
+                    return result
+                raise ValueError("同一基础 Run 正在创建重新生成任务，请稍后查看运行状态。")
+            active = self.database.find_active_t1_regeneration(recommendation_date, base_run_id=base_run_id)
+            if active:
+                self.database.release_app_lease(regeneration_lease_key, self.worker_id)
+                result = self._run_start_receipt(int(active["id"]))
+                result["reusedExisting"] = True
+                result["regenerationInProgress"] = True
+                return result
+
         run_id = self.database.create_t1_overnight_selection_run(
             {
                 "recommendationDate": recommendation_date,
@@ -682,6 +795,11 @@ class T1OvernightSelectionService:
                     "trigger": str(trigger or "manual"),
                     "autoSchedule": bool(auto_schedule),
                     "force": bool(force),
+                    "baseRunId": base_run_id,
+                    "requestedRunRole": requested_run_role,
+                    "regenerationMode": regeneration_mode,
+                    "clientRequestId": client_request_id,
+                    "runRoleResolution": "pending" if force else "applied",
                     "runProfile": run_profile,
                     "runRole": run_role,
                     "tradeDateStatus": trade_date_status,
@@ -715,6 +833,8 @@ class T1OvernightSelectionService:
             },
             [],
         )
+        if regeneration_lease_key:
+            self.database.release_app_lease(regeneration_lease_key, self.worker_id)
         if bool(deployment_snapshot.get("effectiveForThisRun")) and not _t1_trade_date_blocks_official(trade_date_status):
             activated = self.strategy_deployment.activate_for_run(run_id, recommendation_date)
             current = self.database.load_t1_overnight_selection_run(run_id) or {}
@@ -744,18 +864,31 @@ class T1OvernightSelectionService:
                     "finishedAt": datetime.now().isoformat(timespec="seconds"),
                 },
             )
-            run = self.get_run(run_id)
+            run = self._run_start_receipt(run_id)
             run["reusedExisting"] = False
             return run
         self._start_thread(run_id)
-        run = self.get_run(run_id)
+        run = self._run_start_receipt(run_id)
         run["reusedExisting"] = False
+        return run
+
+    def _run_start_receipt(self, run_id: int) -> Dict[str, Any]:
+        """Return the newly created Run identity without loading review-heavy details."""
+        run = self.database.load_t1_overnight_selection_run(run_id)
+        if not run:
+            raise ValueError(f"未找到 T+1 超短线筛选任务 {run_id}")
+        run = _apply_read_time_run_corrections(run)
+        run["runRole"] = _run_role(run)
+        run["progressPct"] = _progress_pct(run)
+        run["elapsedSeconds"] = _elapsed_seconds(run)
+        run["timeHint"] = _time_hint(str(run.get("scanTime") or ""))
         return run
 
     def get_run(self, run_id: int) -> Dict[str, Any]:
         run = self.database.load_t1_overnight_selection_run(run_id)
         if not run:
             raise ValueError(f"未找到 T+1 超短线筛选任务 {run_id}")
+        run = _apply_read_time_run_corrections(run)
         items = self.database.load_t1_overnight_selection_items(run_id)
         outcomes = self.database.load_t1_overnight_selection_outcomes(run_id)
         scenarios = self.database.load_t1_overnight_validation_scenarios(run_id)
@@ -781,7 +914,7 @@ class T1OvernightSelectionService:
 
     def latest(self, risk_mode: str = "balanced", source: str = "auto") -> Dict[str, Any]:
         risk_mode = "balanced"
-        source = source if source in {"auto", "sina", "akshare", "mock"} else "auto"
+        source = source if source in {"auto", "sina", "tencent", "akshare", "mock"} else "auto"
         run = self.database.latest_t1_overnight_selection_run(risk_mode=risk_mode, requested_source=source)
         if not run:
             return {"status": "empty", "riskMode": risk_mode, "requestedSource": source, "items": []}
@@ -793,7 +926,7 @@ class T1OvernightSelectionService:
         scan_time: str = DEFAULT_SCAN_TIME,
         pool_size: int = DEFAULT_POOL_SIZE,
     ) -> Dict[str, Any]:
-        source = source if source in {"auto", "sina", "akshare", "mock"} else "auto"
+        source = source if source in {"auto", "sina", "tencent", "akshare", "mock"} else "auto"
         scan_time = _normalize_scan_time(scan_time)
         pool_size = _clamp_int(pool_size, T1_OFFICIAL_MIN_POOL_SIZE, 500, DEFAULT_POOL_SIZE)
         started = time.perf_counter()
@@ -3045,6 +3178,16 @@ class T1OvernightSelectionService:
         if _historical_treatment_applied(market, request):
             raise ValueError("旧口径历史 run 已软清理为仅展示，不能重新设为 official。")
         if normalized == "official":
+            if str(run.get("status") or "") != "done":
+                raise ValueError("Run 尚未完成，不能切换为正式结果。")
+            blocked_modes = {
+                "market_data_unavailable_zero_pick", "ai_technical_failure_zero_pick",
+                "ai_unavailable_zero_pick", "ai_failed", "invalid_non_trading_day",
+            }
+            if str(run.get("selectionMode") or "") in blocked_modes:
+                raise ValueError("该 Run 属于数据或技术失败，不能切换为正式推荐或正式空仓。")
+            if not _t1_market_decision_usable(str(run.get("actualSource") or ""), market):
+                raise ValueError("该 Run 没有满足正式决策要求的真实行情，不能切换为正式结果。")
             requested_pool_size = _run_requested_pool_size(run)
             if requested_pool_size < T1_OFFICIAL_MIN_POOL_SIZE:
                 raise ValueError(f"候选池 {requested_pool_size} 小于正式样本最低 {T1_OFFICIAL_MIN_POOL_SIZE}，只能作为研究 run。")
@@ -3054,8 +3197,14 @@ class T1OvernightSelectionService:
             if _requires_legacy_isolation(run):
                 raise ValueError("该 run 缺少新版 T+1 独立证据或存在板块语义污染风险，只能保留为历史/研究样本，不能设为 official。")
         updated_at = datetime.now().isoformat(timespec="seconds")
+        request["runRole"] = normalized
+        market["runRole"] = normalized
+        market["runRoleUpdatedAt"] = updated_at
+        market["runRoleReviewerNote"] = str(reviewer_note or ("用户手动设为正式 run。" if normalized == "official" else "用户手动改为研究 run。"))
         if normalized == "official":
             with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                replaced_official_ids: List[int] = []
                 rows = connection.execute(
                     """
                     SELECT id, request_json, market_json
@@ -3070,6 +3219,10 @@ class T1OvernightSelectionService:
                     other_market = _json_dict(row["market_json"])
                     if _historical_treatment_applied(other_market, other_request):
                         continue
+                    other_role = str(other_market.get("runRole") or other_request.get("runRole") or "")
+                    if other_role != "official":
+                        continue
+                    replaced_official_ids.append(int(row["id"]))
                     other_request["runRole"] = "research"
                     other_market["runRole"] = "research"
                     other_market["runRoleUpdatedAt"] = updated_at
@@ -3084,13 +3237,69 @@ class T1OvernightSelectionService:
                         """,
                         (json.dumps(other_request, ensure_ascii=False), json.dumps(other_market, ensure_ascii=False), updated_at, int(row["id"])),
                     )
-        request["runRole"] = normalized
-        market["runRole"] = normalized
-        market["runRoleUpdatedAt"] = updated_at
-        market["runRoleReviewerNote"] = str(reviewer_note or ("用户手动设为正式 run。" if normalized == "official" else "用户手动改为研究 run。"))
-        self.database.update_t1_overnight_selection_run(run_id, {"request": request, "market": market})
-        feedback = self.refresh_strategy_feedback(source_run_id=run_id, trigger_source="manual_run_role")
-        return {"run": self.get_run(run_id), "feedback": feedback, "criticStatus": self.critic_status()}
+                replaced_official_run_id = max(replaced_official_ids) if replaced_official_ids else 0
+                request["replacedOfficialRunId"] = replaced_official_run_id or None
+                market["replacedOfficialRunId"] = replaced_official_run_id or None
+                connection.execute(
+                    """
+                    UPDATE t1_overnight_selection_runs
+                    SET request_json=?, market_json=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (json.dumps(request, ensure_ascii=False), json.dumps(market, ensure_ascii=False), updated_at, int(run_id)),
+                )
+        else:
+            self.database.update_t1_overnight_selection_run(run_id, {"request": request, "market": market})
+        warning = ""
+        try:
+            feedback = self.refresh_strategy_feedback(source_run_id=run_id, trigger_source="manual_run_role")
+        except Exception as error:  # Role switch is already committed; feedback refresh is non-critical.
+            LOGGER.exception("run role changed but feedback refresh failed run=%s", run_id)
+            feedback = self.latest_strategy_feedback()
+            warning = f"角色已切换，但策略反馈刷新失败：{error}"
+        return {
+            "run": self.get_run(run_id),
+            "feedback": feedback,
+            "criticStatus": self.critic_status(),
+            "warning": warning,
+        }
+
+    def _finalize_requested_run_role(self, run_id: int) -> None:
+        run = self.database.load_t1_overnight_selection_run(run_id)
+        if not run:
+            return
+        request = dict(run.get("request") or {})
+        requested = str(request.get("requestedRunRole") or "")
+        if requested not in {"official", "research"}:
+            return
+        if str(request.get("runRoleResolution") or "") not in {"pending", ""}:
+            return
+        market = dict(run.get("market") or {})
+        if requested == "research":
+            request["runRole"] = "research"
+            request["runRoleResolution"] = "applied"
+            market["runRole"] = "research"
+            market["runRoleResolution"] = "applied"
+            self.database.update_t1_overnight_selection_run(run_id, {"request": request, "market": market})
+            return
+        try:
+            self.update_run_role(run_id, "official", reviewer_note="用户重新生成时申请正式结果；完成安全门复核后生效。")
+            refreshed = self.database.load_t1_overnight_selection_run(run_id) or {}
+            refreshed_request = dict(refreshed.get("request") or {})
+            refreshed_market = dict(refreshed.get("market") or {})
+            refreshed_request["runRoleResolution"] = "applied"
+            refreshed_market["runRoleResolution"] = "applied"
+            self.database.update_t1_overnight_selection_run(
+                run_id, {"request": refreshed_request, "market": refreshed_market}
+            )
+        except ValueError as error:
+            request["runRole"] = "research"
+            request["runRoleResolution"] = "blocked_by_safety"
+            request["runRoleResolutionReason"] = str(error)
+            market["runRole"] = "research"
+            market["runRoleResolution"] = "blocked_by_safety"
+            market["runRoleResolutionReason"] = str(error)
+            self.database.update_t1_overnight_selection_run(run_id, {"request": request, "market": market})
 
     def _portfolio_feedback(self, window_runs: int, selection_version: str = "") -> Dict[str, Any]:
         with self.database.connect() as connection:
@@ -3216,6 +3425,7 @@ class T1OvernightSelectionService:
         recommendation_date: str = "",
         stage_controls: Optional[Dict[str, Any]] = None,
         selection_run_id: int = 0,
+        regeneration_mode: str = "",
     ) -> Dict[str, Any]:
         recommendation_date = str(recommendation_date or date.today().isoformat())
         stage_controls = stage_controls or self.stage_status()
@@ -3239,7 +3449,11 @@ class T1OvernightSelectionService:
             raw_stocks = [_stock_from_dict(x["rawStock"]) for x in existing_archive]
             provider_warning = "已恢复该 Run 的冻结候选与价格，不重新抓取市场候选。"
         else:
-            provider, market, raw_stocks, provider_warning = self._load_market_data_for_t1(source, scan_time=scan_time)
+            provider, market, raw_stocks, provider_warning = self._load_market_data_for_t1(
+                source,
+                scan_time=scan_time,
+                refresh_first=regeneration_mode == "refresh_real_then_recompute",
+            )
             market = _enrich_market_turnover_context(self.database, market, provider.source)
         quote_data_as_of_date = _t1_stock_data_as_of_date(raw_stocks)
         if quote_data_as_of_date:
@@ -3778,7 +3992,12 @@ class T1OvernightSelectionService:
             "market": market,
         }
 
-    def _load_market_data_for_t1(self, source: str, scan_time: str = DEFAULT_SCAN_TIME) -> tuple[Any, Dict[str, Any], List[RawStock], str]:
+    def _load_market_data_for_t1(
+        self,
+        source: str,
+        scan_time: str = DEFAULT_SCAN_TIME,
+        refresh_first: bool = False,
+    ) -> tuple[Any, Dict[str, Any], List[RawStock], str]:
         if source == "mock":
             provider, market, raw_stocks, provider_warning = self.analysis_service._load_market_data("mock")
             market = dict(market or {})
@@ -3789,8 +4008,8 @@ class T1OvernightSelectionService:
             return provider, market, raw_stocks, provider_warning
 
         context_store = self.analysis_service.full_market_context_store
-        frozen = context_store.latest_for_scan(date.today().isoformat(), scan_time, source=source)
-        if not frozen:
+        frozen = {} if refresh_first else context_store.latest_for_scan(date.today().isoformat(), scan_time, source=source)
+        if not frozen and not refresh_first:
             frozen = context_store.latest_cached()
         frozen_stocks = frozen.get("stocks") or []
         frozen_meta = market_context_meta(frozen) if frozen else {}
@@ -3817,6 +4036,8 @@ class T1OvernightSelectionService:
                 "asOfTime": frozen_meta.get("asOfTime") or generated_at,
                 "coverage": frozen_meta.get("coverage") or {},
                 "failedPages": frozen_meta.get("failedPages") or [],
+                "snapshotDecisionUsable": bool(frozen_meta.get("snapshotDecisionUsable")),
+                "decisionQuality": frozen_meta.get("decisionQuality") or {},
             }
             market["marketSnapshotFreeze"] = {
                 "enabled": True,
@@ -3829,6 +4050,8 @@ class T1OvernightSelectionService:
                 "asOfTime": frozen_meta.get("asOfTime") or generated_at,
                 "coverage": frozen_meta.get("coverage") or {},
                 "failedPages": frozen_meta.get("failedPages") or [],
+                "snapshotDecisionUsable": bool(frozen_meta.get("snapshotDecisionUsable")),
+                "decisionQuality": frozen_meta.get("decisionQuality") or {},
                 "ageSeconds": int(frozen_meta.get("ageSeconds") or 0),
                 "reuseWindowSeconds": T1_FULL_MARKET_FREEZE_REUSE_SECONDS,
                 "count": len(frozen_stocks),
@@ -3836,16 +4059,15 @@ class T1OvernightSelectionService:
             provider = SimpleNamespace(source=actual)
             return provider, market, frozen_stocks, warning
 
-        refresh_sources = [source] if source in {"sina", "akshare"} else ["sina", "akshare"]
+        refresh_sources = context_store._provider_order(source)
         refresh_errors: List[str] = []
         for refresh_source in refresh_sources:
             try:
-                provider = self.analysis_service.sina_provider if refresh_source == "sina" else self.analysis_service.akshare_provider
-                stocks = provider.fetch_snapshot()
+                stocks = context_store._fetch_by_provider(refresh_source)
                 if len(stocks) < 1200:
                     raise RuntimeError(f"全市场快照样本过少：{len(stocks)}")
                 market_stocks = self.analysis_service._confirmed_universe(stocks)
-                market = dict(provider.fetch_market(market_stocks) or {})
+                market = dict(context_store._fetch_market_by_provider(refresh_source, market_stocks) or {})
                 generated_at = datetime.now().isoformat(timespec="seconds")
                 cache_meta: Dict[str, Any] = {}
                 try:
@@ -3855,12 +4077,15 @@ class T1OvernightSelectionService:
                         requested_source=refresh_source,
                         actual_source=refresh_source,
                         warning="",
-                        provider_meta=dict(getattr(provider, "last_meta", {}) or {}),
+                        provider_meta=context_store._provider_meta(refresh_source),
                     )
                     cache_meta = market_context_meta(context)
                     generated_at = str(cache_meta.get("generatedAt") or generated_at)
                 except Exception as cache_error:  # noqa: BLE001 - cache write must not break live T+1 selection.
                     LOGGER.warning("t1 full market cache write failed source=%s error=%s", refresh_source, cache_error)
+                if not bool(cache_meta.get("snapshotDecisionUsable")):
+                    quality_reasons = (cache_meta.get("decisionQuality") or {}).get("reasons") or []
+                    raise RuntimeError("快照不满足正式决策标准：" + "；".join(quality_reasons or ["质量状态未知"]))
                 warning = _join_warning(
                     f"已使用 {refresh_source} 真实全市场行情，生成时间 {generated_at or '--'}。",
                 )
@@ -3873,6 +4098,8 @@ class T1OvernightSelectionService:
                     "status": cache_meta.get("status") or "",
                     "coverage": cache_meta.get("coverage") or {},
                     "failedPages": cache_meta.get("failedPages") or [],
+                    "snapshotDecisionUsable": True,
+                    "decisionQuality": cache_meta.get("decisionQuality") or {},
                 }
                 market["marketSnapshotFreeze"] = {
                     "enabled": True,
@@ -3885,6 +4112,8 @@ class T1OvernightSelectionService:
                     "asOfTime": cache_meta.get("asOfTime") or generated_at,
                     "coverage": cache_meta.get("coverage") or {},
                     "failedPages": cache_meta.get("failedPages") or [],
+                    "snapshotDecisionUsable": True,
+                    "decisionQuality": cache_meta.get("decisionQuality") or {},
                     "reuseWindowSeconds": T1_FULL_MARKET_FREEZE_REUSE_SECONDS,
                     "count": len(stocks),
                 }
@@ -3894,7 +4123,9 @@ class T1OvernightSelectionService:
                 LOGGER.warning("t1 full market refresh failed source=%s error=%s", refresh_source, error)
                 refresh_errors.append(f"{refresh_source} 行情源失败：{error}")
 
-        cached = self.analysis_service.full_market_context_store.latest_cached()
+        cached = self.analysis_service.full_market_context_store.latest_for_scan(
+            date.today().isoformat(), scan_time, source=source
+        )
         cached_stocks = cached.get("stocks") or []
         try:
             if len(cached_stocks) >= 1200 and _usable_t1_full_market_freeze(cached, source, scan_time=scan_time, allow_stale=True):
@@ -3919,6 +4150,8 @@ class T1OvernightSelectionService:
                     "asOfTime": meta.get("asOfTime") or meta.get("generatedAt") or "",
                     "coverage": meta.get("coverage") or {},
                     "failedPages": meta.get("failedPages") or [],
+                    "snapshotDecisionUsable": bool(meta.get("snapshotDecisionUsable")),
+                    "decisionQuality": meta.get("decisionQuality") or {},
                 }
                 provider = SimpleNamespace(source=f"cache:{meta.get('source') or 'unknown'}")
                 market["marketSnapshotFreeze"] = {
@@ -3932,34 +4165,55 @@ class T1OvernightSelectionService:
                     "asOfTime": meta.get("asOfTime") or meta.get("generatedAt") or "",
                     "coverage": meta.get("coverage") or {},
                     "failedPages": meta.get("failedPages") or [],
+                    "snapshotDecisionUsable": bool(meta.get("snapshotDecisionUsable")),
+                    "decisionQuality": meta.get("decisionQuality") or {},
                     "ageSeconds": int(meta.get("ageSeconds") or 0),
                     "reuseWindowSeconds": T1_FULL_MARKET_FREEZE_REUSE_SECONDS,
                     "count": len(cached_stocks),
                 }
                 return provider, market, cached_stocks, warning
-            provider, market, raw_stocks, provider_warning = self.analysis_service._load_market_data("mock")
-            market = dict(market or {})
-            market["providerWarning"] = _join_warning(
-                provider_warning,
+            warning = _join_warning(
                 *refresh_errors,
-                "真实行情源失败且无可用全市场缓存，已回退 Mock。",
-                "当前使用 Mock 模拟数据，不可用于真实 T+1 推荐。",
+                "真实行情源失败且无可用同日冻结快照，系统未使用模拟行情代替正式决策。",
             )
-            market["cacheStatus"] = {"used": False, "fallbackReason": "；".join(refresh_errors)}
-            market["mockStatus"] = {"used": True, "reason": "；".join(refresh_errors)}
-            return provider, market, raw_stocks, market["providerWarning"]
+            market = {
+                "providerWarning": warning,
+                "cacheStatus": {"used": False, "fallbackReason": "；".join(refresh_errors)},
+                "sourceStatus": {
+                    "status": "data_unavailable",
+                    "decisionUsable": False,
+                    "reason": warning,
+                },
+                "marketSnapshotFreeze": {
+                    "enabled": True,
+                    "reused": False,
+                    "source": "unavailable",
+                    "snapshotDecisionUsable": False,
+                    "decisionUsabilityReasons": refresh_errors or ["没有可用真实行情"],
+                    "count": 0,
+                },
+            }
+            return SimpleNamespace(source="unavailable"), market, [], warning
         except Exception as error:  # noqa: BLE001 - keep T+1 task visible even if fallback metadata is broken.
-            provider, market, raw_stocks, provider_warning = self.analysis_service._load_market_data("mock")
-            market = dict(market or {})
-            market["providerWarning"] = _join_warning(
-                provider_warning,
+            warning = _join_warning(
                 *refresh_errors,
-                f"缓存回退失败，已回退 Mock：{error}",
-                "当前使用 Mock 模拟数据，不可用于真实 T+1 推荐。",
+                f"真实缓存检查失败：{error}",
+                "系统未使用模拟行情代替正式决策。",
             )
-            market["cacheStatus"] = {"used": False, "fallbackReason": str(error)}
-            market["mockStatus"] = {"used": True, "reason": str(error)}
-            return provider, market, raw_stocks, market["providerWarning"]
+            market = {
+                "providerWarning": warning,
+                "cacheStatus": {"used": False, "fallbackReason": str(error)},
+                "sourceStatus": {"status": "data_unavailable", "decisionUsable": False, "reason": warning},
+                "marketSnapshotFreeze": {
+                    "enabled": True,
+                    "reused": False,
+                    "source": "unavailable",
+                    "snapshotDecisionUsable": False,
+                    "decisionUsabilityReasons": [str(error)],
+                    "count": 0,
+                },
+            }
+            return SimpleNamespace(source="unavailable"), market, [], warning
 
     def _prepare_t1_evidence_run(
         self,
@@ -4485,6 +4739,50 @@ class T1OvernightSelectionService:
         if run.get("status") in {"pending", "running"}:
             self._start_thread(int(run["id"]))
 
+    def _complete_market_data_unavailable_run(
+        self,
+        run_id: int,
+        request: Dict[str, Any],
+        batch: Dict[str, Any],
+        market: Dict[str, Any],
+        pool_size: int,
+    ) -> None:
+        reason = (
+            "没有取得满足正式决策要求的真实同日行情；本 Run 仅记录数据不可用，"
+            "不得解释为市场主动空仓。"
+        )
+        updated_request = dict(request or {})
+        updated_request["runRole"] = "research"
+        updated_request["runRoleResolution"] = "blocked_by_market_data"
+        market.update(
+            runRole="research",
+            aiDecisionStatus="not_run_market_data_unavailable",
+            officialDecisionStatus="data_unavailable",
+            officialDecisionReason="market_data_unavailable",
+            zeroPickReasonCode="market_data_unavailable",
+            userMessage="真实行情不可用，系统没有形成买入或空仓判断。",
+        )
+        _stamp_decision_timing(market)
+        self.database.update_t1_overnight_selection_run(
+            run_id,
+            {
+                "status": "done",
+                "selectionMode": "market_data_unavailable_zero_pick",
+                "currentStage": "done",
+                "actualSource": batch.get("actualSource", ""),
+                "evidenceRunId": int(batch.get("evidenceRunId") or 0),
+                "totalCount": batch.get("totalCount", 0),
+                "hardFilteredCount": batch.get("hardFilteredCount", 0),
+                "poolSize": int(pool_size or 0),
+                "finalPicks": [],
+                "finalCount": 0,
+                "request": updated_request,
+                "market": market,
+                "error": reason,
+                "finishedAt": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+
     def _run_worker(self, run_id: int) -> None:
         try:
             self.database.update_t1_overnight_selection_run(
@@ -4528,12 +4826,16 @@ class T1OvernightSelectionService:
                 recommendation_date=recommendation_date,
                 stage_controls=stage_controls,
                 selection_run_id=run_id,
+                regeneration_mode=str(request.get("regenerationMode") or ""),
             )
             pool = batch["pool"]
             selection_pool = batch.get("selectionPool") or []
+            market = batch.get("market") or {}
+            if not _t1_market_decision_usable(str(batch.get("actualSource") or ""), market):
+                self._complete_market_data_unavailable_run(run_id, request, batch, market, len(pool))
+                return
             if not pool:
                 raise ValueError(batch.get("error") or "没有可供 T+1 超短线筛选的候选池。")
-            market = batch.get("market") or {}
             trade_date_status = market.get("tradeDateStatus") or {}
             if _t1_trade_date_blocks_official(trade_date_status):
                 reason = _t1_trade_date_block_reason(trade_date_status)
@@ -4940,6 +5242,10 @@ class T1OvernightSelectionService:
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=1.0)
+            try:
+                self._finalize_requested_run_role(run_id)
+            except Exception:
+                LOGGER.exception("requested run role finalization failed run=%s", run_id)
             try:
                 self.candidate_store.sync_decisions(run_id)
                 self.candidate_tracking.ensure_job(run_id)
@@ -5361,6 +5667,7 @@ class T1OvernightSelectionService:
         limit: int,
         stage: str,
         batch_index: int,
+        budget_depth: int = 0,
     ) -> tuple[List[Dict[str, Any]], str]:
         if not candidates or limit <= 0:
             return [], ""
@@ -5379,16 +5686,133 @@ class T1OvernightSelectionService:
             stage,
             feedback,
         )
-        if len(base_user_content) + len(system_content) > 110000:
+        request_characters = len(base_user_content) + len(system_content)
+        request_limit = T1_AI_SAFE_REQUEST_CHARACTERS if stage == "final" else T1_AI_HARD_REQUEST_CHARACTERS
+        if stage == "final" and budget_depth == 0:
+            market["finalSelectionAudit"] = {
+                "version": T1_FINAL_TOURNAMENT_VERSION,
+                "mode": "direct_compact" if request_characters <= request_limit else "budgeted_tournament",
+                "originalCandidateCount": len(candidates),
+                "safeRequestCharacters": T1_AI_SAFE_REQUEST_CHARACTERS,
+                "hardRequestCharacters": T1_AI_HARD_REQUEST_CHARACTERS,
+                "initialRequestCharacters": request_characters,
+                "maxPlannedRequestCharacters": request_characters,
+                "maxActualRequestCharacters": 0,
+                "maxObservedRequestCharacters": 0,
+                "groups": [],
+                "status": "running",
+            }
+        if request_characters > request_limit:
             market.setdefault("aiContextBudget", []).append({"stage": stage, "candidateCount": len(candidates),
-                "characters": len(base_user_content) + len(system_content), "limit": 110000, "action": "stable_split" if stage == "batch" else "reject"})
-            if stage != "batch" or len(candidates) < 2:
-                return [], "AI 上下文超过预算，未截断证据，停止本次选择。"
+                "characters": request_characters, "limit": request_limit,
+                "hardLimit": T1_AI_HARD_REQUEST_CHARACTERS,
+                "action": "budgeted_tournament" if stage == "final" else "stable_split",
+                "depth": budget_depth})
+            if len(candidates) < 2 or budget_depth >= 8:
+                if stage == "final":
+                    audit = market.get("finalSelectionAudit") or {}
+                    audit.update(status="technical_failure", failureReason="单只候选决策卡仍超过安全预算。")
+                return [], "AI 上下文超过安全预算，分组终选无法继续；本次记为技术失败，不记为主动空仓。"
             split = len(candidates) // 2
-            left_limit = max(1, round(limit * split / len(candidates)))
-            left, left_error = self._select_with_ai(candidates[:split], market, left_limit, stage, batch_index)
-            right, right_error = self._select_with_ai(candidates[split:], market, max(1, limit-left_limit), stage, batch_index)
-            return _unique_by_code(left + right)[:limit], "；".join(e for e in [left_error, right_error] if e)
+            if stage == "batch":
+                left_limit = max(1, round(limit * split / len(candidates)))
+                left, left_error = self._select_with_ai(candidates[:split], market, left_limit, stage, batch_index)
+                right, right_error = self._select_with_ai(candidates[split:], market, max(1, limit-left_limit), stage, batch_index)
+                return _unique_by_code(left + right)[:limit], "；".join(e for e in [left_error, right_error] if e)
+
+            groups = [candidates[:split], candidates[split:]]
+            group_limit = max(1, min(limit, math.ceil(limit / (2 + budget_depth))))
+            promoted: List[Dict[str, Any]] = []
+            errors: List[str] = []
+            audit = market.get("finalSelectionAudit") or {}
+            audit["maxPlannedRequestCharacters"] = max(
+                int(audit.get("maxPlannedRequestCharacters") or 0), request_characters
+            )
+            for group_index, group in enumerate(groups, start=1):
+                before_zero = copy.deepcopy(market.get("lastAiZeroPick"))
+                selected, group_error = self._select_with_ai(
+                    group,
+                    market,
+                    min(group_limit, len(group)),
+                    stage,
+                    -(budget_depth * 10 + group_index),
+                    budget_depth=budget_depth + 1,
+                )
+                group_zero = bool(
+                    not selected
+                    and not group_error
+                    and ((market.get("lastAiZeroPick") or {}).get("stage") == "final")
+                )
+                if before_zero is None:
+                    market.pop("lastAiZeroPick", None)
+                else:
+                    market["lastAiZeroPick"] = before_zero
+                group_candidates = {
+                    _normalize_code(item.get("code")): item for item in group
+                }
+                promoted.extend(
+                    {
+                        **dict(group_candidates[_normalize_code(item.get("code"))]),
+                        "tournamentPriorDecision": dict(item),
+                    }
+                    for item in selected
+                    if _normalize_code(item.get("code")) in group_candidates
+                )
+                if group_error:
+                    errors.append(group_error)
+                audit.setdefault("groups", []).append(
+                    {
+                        "depth": budget_depth,
+                        "groupIndex": group_index,
+                        "candidateCount": len(group),
+                        "candidateCodes": [_normalize_code(item.get("code")) for item in group],
+                        "requestedPickCount": min(group_limit, len(group)),
+                        "promotedCodes": [_normalize_code(item.get("code")) for item in selected],
+                        "validZeroPick": group_zero,
+                        "status": "technical_failure" if group_error else "valid_zero_pick" if group_zero else "completed",
+                        "error": group_error,
+                    }
+                )
+            market["finalSelectionAudit"] = audit
+            if errors:
+                audit.update(status="technical_failure", failureReason="；".join(errors))
+                return [], "；".join(errors)
+            promoted = _unique_by_code(promoted)
+            if not promoted:
+                market["lastAiZeroPick"] = _ai_zero_pick_meta(stage, batch_index, len(candidates), limit, cached=False)
+                audit.update(status="completed_valid_zero_pick", finalRoundCandidateCount=0, finalPickCount=0)
+                return [], ""
+            market.pop("lastAiZeroPick", None)
+            final_picks, final_error = self._select_with_ai(
+                promoted,
+                market,
+                limit,
+                stage,
+                batch_index,
+                budget_depth=budget_depth + 1,
+            )
+            audit.update(
+                status="technical_failure" if final_error else "completed",
+                finalRoundCandidateCount=len(promoted),
+                finalPickCount=len(final_picks),
+                finalPickCodes=[_normalize_code(item.get("code")) for item in final_picks],
+                failureReason=final_error,
+            )
+            market["finalSelectionAudit"] = audit
+            return final_picks, final_error
+        if request_characters > T1_AI_HARD_REQUEST_CHARACTERS:
+            return [], "AI 请求超过硬上限；本次记为技术失败，不记为主动空仓。"
+        if stage == "final":
+            audit = market.get("finalSelectionAudit") or {}
+            audit["maxActualRequestCharacters"] = max(
+                int(audit.get("maxActualRequestCharacters") or 0), request_characters
+            )
+            audit["maxObservedRequestCharacters"] = max(
+                int(audit.get("maxObservedRequestCharacters") or 0), request_characters
+            )
+            if budget_depth == 0:
+                audit["status"] = "requesting"
+            market["finalSelectionAudit"] = audit
         fingerprint = _ai_input_fingerprint(
             provider=self.settings.ai_provider,
             model=self.settings.ai_model,
@@ -5448,6 +5872,7 @@ class T1OvernightSelectionService:
                 market["aiEvidenceValidationErrors"] = cached_validation.get("errors") or []
             if cached_validation.get("status") == "zero_pick":
                 market["lastAiZeroPick"] = _ai_zero_pick_meta(stage, batch_index, len(candidates), limit, cached=True)
+            _finish_final_selection_audit(market, cached_picks, "completed_cached")
             return _attach_ai_validation_to_picks(cached_picks, cached_validation), ""
         payload = {
             "model": self.settings.ai_model,
@@ -5646,6 +6071,7 @@ class T1OvernightSelectionService:
                 if repair_codes is not None:
                     market["aiEvidenceValidationStatus"] = "repair_exhausted"
                     market["aiEvidenceValidationErrors"] = validation_errors
+                    _finish_final_selection_audit(market, [], "technical_failure", "证据修复没有产生有效结果。")
                     return [], "原输出全部证据校验不合格，修复未产生有效结果；不计为正常空仓。"
                 market["aiEvidenceValidationStatus"] = "zero_pick"
                 market["aiEvidenceValidationErrors"] = []
@@ -5664,6 +6090,7 @@ class T1OvernightSelectionService:
                         "zeroPick": True,
                     },
                 )
+                _finish_final_selection_audit(market, [], "completed_valid_zero_pick")
                 return [], ""
             if locked_picks and effective_validation.get("valid"):
                 if failed_codes and attempt < 3:
@@ -5689,6 +6116,7 @@ class T1OvernightSelectionService:
                         "evidenceValidationVersion": AI_EVIDENCE_VALIDATION_VERSION,
                     },
                 )
+                _finish_final_selection_audit(market, clean_picks, "completed")
                 return clean_picks, ""
             if picks:
                 last_error = "AI 输出证据校验失败：" + "；".join((validation.get("errors") or [])[:5])
@@ -5713,9 +6141,12 @@ class T1OvernightSelectionService:
                 "acceptedPickCount": len(locked_picks), "repairAttempts": 2}
             market["aiEvidenceValidationStatus"] = "partial_passed"
             market["aiEvidenceValidationErrors"] = validation_errors
-            return _attach_ai_validation_to_picks(locked_picks, validation), ""
+            partial_picks = _attach_ai_validation_to_picks(locked_picks, validation)
+            _finish_final_selection_audit(market, partial_picks, "completed_partial")
+            return partial_picks, ""
         if last_error.startswith("AI 输出证据校验失败"):
             market["aiEvidenceValidationStatus"] = "failed"
+        _finish_final_selection_audit(market, [], "technical_failure", last_error)
         return [], last_error
 
     def _critic_with_ai(
@@ -7358,7 +7789,7 @@ def _usable_t1_full_market_freeze(
     if not payload:
         return False
     stocks = payload.get("stocks") or []
-    if len(stocks) < 1200:
+    if len(stocks) < 4500:
         return False
     meta = market_context_meta(payload)
     if not allow_stale and meta.get("stale"):
@@ -7366,20 +7797,29 @@ def _usable_t1_full_market_freeze(
     trade_date = str(meta.get("tradeDate") or "")
     if trade_date != date.today().isoformat():
         return False
-    if str(meta.get("status") or "") != "ready":
+    if not bool(meta.get("snapshotDecisionUsable")):
         return False
-    coverage = meta.get("coverage") or {}
-    if int(coverage.get("rows") or len(stocks)) < 1200:
+    decision_quality = meta.get("decisionQuality") or {}
+    if int(decision_quality.get("rowCount") or len(stocks)) < 4500:
         return False
     as_of = str(meta.get("asOfTime") or meta.get("generatedAt") or "")
     if not _snapshot_not_later_than_scan(as_of, trade_date, scan_time):
         return False
-    if int(meta.get("ageSeconds") or 0) > T1_FULL_MARKET_FREEZE_REUSE_SECONDS:
-        if not allow_stale:
-            return False
     requested = str(requested_source or "auto")
     actual = str(meta.get("source") or "")
     return requested == "auto" or requested == actual
+
+
+def _t1_market_decision_usable(actual_source: str, market: Dict[str, Any]) -> bool:
+    source = str(actual_source or "").removeprefix("cache:").lower()
+    if source in {"", "mock", "unavailable", "unknown"}:
+        return False
+    if bool((market.get("mockStatus") or {}).get("used")):
+        return False
+    freeze = market.get("marketSnapshotFreeze") or {}
+    if freeze.get("snapshotDecisionUsable") is False:
+        return False
+    return source in {"sina", "tencent", "akshare", "eastmoney"}
 
 
 def _snapshot_not_later_than_scan(as_of: str, trade_date: str, scan_time: str) -> bool:
@@ -10111,8 +10551,8 @@ def _prompt_contract(stage: str) -> Dict[str, Any]:
             "allowedDecisionTags": sorted(AI_DECISION_TAG_LABELS.keys()),
         }
     return {
-        "version": "v2_final_structured_selection_slip",
-        "candidatePayload": "final_full_candidate",
+        "version": "v3_final_structured_selection_slip",
+        "candidatePayload": T1_FINAL_DECISION_CARD_VERSION,
         "outputProtocol": AI_SELECTION_OUTPUT_PROTOCOL,
         "purpose": "终选阶段在半决赛池内比较最终 Top0-Top3。",
         "sectorRule": "仍必须遵守 evidenceRefs、sectorEvidence.evidenceLayers 和 allowedClaims。",
@@ -10122,7 +10562,162 @@ def _prompt_contract(stage: str) -> Dict[str, Any]:
     }
 
 
+def _finish_final_selection_audit(
+    market: Dict[str, Any],
+    picks: List[Dict[str, Any]],
+    status: str,
+    error: str = "",
+) -> None:
+    audit = market.get("finalSelectionAudit")
+    if not isinstance(audit, dict):
+        return
+    audit.update(
+        status=status,
+        finalPickCount=len(picks),
+        finalPickCodes=[_normalize_code(item.get("code")) for item in picks],
+        failureReason=str(error or ""),
+    )
+
+
+def _prompt_text(value: Any, limit: int = 240) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else f"{text[: max(0, limit - 1)]}…"
+
+
+def _final_decision_card(candidate: Dict[str, Any], include_sector_state: bool) -> Dict[str, Any]:
+    """Build the bounded, auditable payload used only by the AI final round."""
+    clean = candidate if include_sector_state else _without_shadow_sector_prompt_fields(candidate)
+    refs = []
+    for raw_ref in clean.get("evidenceRefs") or []:
+        if not isinstance(raw_ref, dict):
+            continue
+        refs.append(
+            {
+                "id": raw_ref.get("id"),
+                "status": raw_ref.get("status"),
+                "summary": _prompt_text(
+                    raw_ref.get("summary")
+                    or raw_ref.get("fact")
+                    or raw_ref.get("description")
+                    or raw_ref.get("value"),
+                    220,
+                ),
+            }
+        )
+    score_components = candidate.get("scoreComponents") or {}
+    if not isinstance(score_components, dict):
+        score_components = {}
+    setup = candidate.get("setupEvidence") or {}
+    tail = candidate.get("tailSupportPackV2") or {}
+    tradeability = candidate.get("tradeability") or {}
+    quality = candidate.get("dataQuality") or {}
+    sector_evidence = clean.get("sectorEvidence") or {}
+    prior_decision = candidate.get("pick") or candidate.get("tournamentPriorDecision") or {}
+    supporting_refs = _normalize_evidence_refs(
+        candidate.get("supportingEvidenceRefs") or prior_decision.get("supportingEvidenceRefs")
+    )[:3]
+    counter_refs = _normalize_evidence_refs(
+        candidate.get("counterEvidenceRefs") or prior_decision.get("counterEvidenceRefs")
+    )[:3]
+    card: Dict[str, Any] = {
+        "cardVersion": T1_FINAL_DECISION_CARD_VERSION,
+        "code": candidate.get("code"),
+        "name": candidate.get("name"),
+        "candidateCore": {
+            "poolRank": candidate.get("poolRank"),
+            "candidateType": candidate.get("candidateType"),
+            "candidateTypes": candidate.get("candidateTypes") or [],
+            "style": candidate.get("style"),
+            "status": candidate.get("status"),
+        },
+        "qualification": {
+            "dataEligible": candidate.get("dataEligible"),
+            "setupEligible": candidate.get("setupEligible"),
+            "formalEligible": candidate.get("formalEligible"),
+            "formalExclusionReasons": [
+                _prompt_text(reason, 160) for reason in (candidate.get("formalExclusionReasons") or [])[:8]
+            ],
+        },
+        "scorePack": {
+            "scoreMeaning": "启发式比较分，不是概率或收益承诺。",
+            "t1Score": candidate.get("t1Score"),
+            "ruleScore": candidate.get("score"),
+            "premiumPotentialScore": candidate.get("premiumPotentialScore"),
+            "relStrength": candidate.get("relStrength"),
+            "change": candidate.get("change"),
+            "selectedComponents": {
+                str(key): value
+                for key, value in score_components.items()
+                if key in {
+                    "trend", "strength", "tail", "tradeability", "sector", "risk",
+                    "setup", "dataQuality", "premiumPotential", "penalty",
+                }
+            },
+        },
+        "setupPack": {
+            "confirmedTypes": setup.get("confirmedTypes") or [],
+            "failedTypes": setup.get("failedTypes") or [],
+            "missingTypes": setup.get("missingTypes") or [],
+        },
+        "tradeabilityPack": {
+            "level": tradeability.get("level"),
+            "label": tradeability.get("label"),
+            "reasons": [_prompt_text(reason, 160) for reason in (tradeability.get("reasons") or [])[:6]],
+        },
+        "qualityPack": {
+            "grade": quality.get("grade"),
+            "eligibleForRealTop": quality.get("eligibleForRealTop"),
+            "reasons": [_prompt_text(reason, 160) for reason in (quality.get("reasons") or [])[:6]],
+        },
+        "tailSupportPack": {
+            "status": tail.get("status"),
+            "score": tail.get("score"),
+            "reasons": [_prompt_text(reason, 160) for reason in (tail.get("reasons") or [])[:6]],
+        },
+        "sectorPack": {
+            "industrySector": candidate.get("industrySector"),
+            "conceptSectors": (candidate.get("conceptSectors") or [])[:8],
+            "status": candidate.get("sectorEvidenceStatus") or sector_evidence.get("status"),
+            "allowedClaims": [_prompt_text(claim, 180) for claim in (sector_evidence.get("allowedClaims") or [])[:8]],
+            "state": candidate.get("sectorStateShadow") if include_sector_state else None,
+            "stateReasons": [
+                _prompt_text(reason, 160) for reason in (candidate.get("sectorStateReasons") or [])[:5]
+            ] if include_sector_state else [],
+        },
+        "riskPack": {
+            "overnightRisk": (candidate.get("t1Dimensions") or {}).get("overnightRisk"),
+            "riskFlags": (candidate.get("riskFlags") or [])[:10],
+            "riskReasons": [_prompt_text(reason, 160) for reason in (candidate.get("riskReasons") or [])[:6]],
+        },
+        "priorDecisionEvidence": {
+            "supportingEvidenceRefs": supporting_refs,
+            "counterEvidenceRefs": counter_refs,
+        },
+        "evidenceRefs": refs[:16],
+        "allowedDecisionTags": _available_decision_tags(clean),
+    }
+    # The card is reduced by whole business fields, never by cutting serialized JSON.
+    if len(json.dumps(card, ensure_ascii=False, separators=(",", ":"))) > T1_FINAL_DECISION_CARD_MAX_CHARACTERS:
+        card["evidenceRefs"] = [
+            {**ref, "summary": _prompt_text(ref.get("summary"), 100)} for ref in refs[:10]
+        ]
+        card["sectorPack"].pop("allowedClaims", None)
+        card["scorePack"].pop("selectedComponents", None)
+    if len(json.dumps(card, ensure_ascii=False, separators=(",", ":"))) > T1_FINAL_DECISION_CARD_MAX_CHARACTERS:
+        card["evidenceRefs"] = [
+            {"id": ref.get("id"), "status": ref.get("status"), "summary": _prompt_text(ref.get("summary"), 60)}
+            for ref in refs[:8]
+        ]
+        for key in ("riskReasons",):
+            card["riskPack"].pop(key, None)
+        card["sectorPack"].pop("stateReasons", None)
+    card["cardCharacters"] = len(json.dumps(card, ensure_ascii=False, separators=(",", ":")))
+    return card
+
+
 def _compact_candidate_for_prompt(candidate: Dict[str, Any], stage: str, include_sector_state: bool) -> Dict[str, Any]:
+    if stage == "final":
+        return _final_decision_card(candidate, include_sector_state=include_sector_state)
     if candidate.get("selectionPolicyVersion") == selection_policy.VERSION:
         clean = candidate if include_sector_state else _without_shadow_sector_prompt_fields(candidate)
         item = _compact_batch_candidate(clean, include_sector_state=include_sector_state)
@@ -10140,15 +10735,10 @@ def _compact_candidate_for_prompt(candidate: Dict[str, Any], stage: str, include
         item["scorePack"]["fundStrengthLabel"] = "成交活跃度，非资金净流入"
         item["qualityPack"] = {key: item["qualityPack"].get(key) for key in
             ("grade", "label", "eligibleForRealTop", "reasons")}
-        if stage == "final":
-            item["tailSupportPack"] = candidate.get("tailSupportPackV2") or {}
         return item
     if stage == "batch":
         return _compact_batch_candidate(candidate, include_sector_state=include_sector_state)
-    item = _compact_candidate(candidate)
-    if not include_sector_state:
-        return _without_shadow_sector_prompt_fields(item)
-    return item
+    return _compact_batch_candidate(candidate, include_sector_state=include_sector_state)
 
 
 def _available_decision_tags(candidate):
@@ -14626,7 +15216,7 @@ def _normalize_auto_run_config(config: Any) -> Dict[str, Any]:
     normalized["enabled"] = bool(normalized.get("enabled"))
     normalized["latestTriggerTime"] = _normalize_scan_time(normalized.get("latestTriggerTime") or OFFICIAL_SCAN_END)
     normalized["pollIntervalSeconds"] = _clamp_int(normalized.get("pollIntervalSeconds"), 30, 600, 60)
-    normalized["source"] = str(normalized.get("source") or "auto") if str(normalized.get("source") or "") in {"auto", "sina", "akshare", "mock"} else "auto"
+    normalized["source"] = str(normalized.get("source") or "auto") if str(normalized.get("source") or "") in {"auto", "sina", "tencent", "akshare", "mock"} else "auto"
     normalized["scanTime"] = _normalize_scan_time(normalized.get("scanTime") or DEFAULT_SCAN_TIME)
     normalized["poolSize"] = _clamp_int(normalized.get("poolSize"), T1_OFFICIAL_MIN_POOL_SIZE, 500, DEFAULT_POOL_SIZE)
     normalized["batchSize"] = _clamp_int(normalized.get("batchSize"), 20, 80, DEFAULT_BATCH_SIZE)
@@ -14675,7 +15265,7 @@ def _normalize_market_prefetch_state(state: Any) -> Dict[str, Any]:
     config = _normalize_market_prefetch_config(raw.get("config") or DEFAULT_MARKET_PREFETCH_CONFIG)
     days = raw.get("days") if isinstance(raw.get("days"), dict) else {}
     return {
-        "version": "v1_t1_market_prefetch",
+        "version": "v2_t1_market_prefetch_retry",
         "config": config,
         "days": days,
         "lastCheckAt": str(raw.get("lastCheckAt") or ""),
@@ -14697,8 +15287,21 @@ def _market_prefetch_due_slots(
     slots = []
     for slot in config.get("scheduleTimes") or []:
         normalized = _normalize_scan_time(slot)
-        if not normalized or normalized in day_state:
+        if not normalized:
             continue
+        existing = day_state.get(normalized) if isinstance(day_state.get(normalized), dict) else {}
+        if existing.get("status") == "done":
+            continue
+        attempts = int(existing.get("attemptCount") or (1 if existing else 0))
+        if attempts >= 3:
+            continue
+        if existing:
+            try:
+                retry_deadline = datetime.fromisoformat(f"{today}T{normalized}:00") + timedelta(minutes=5)
+            except ValueError:
+                continue
+            if now_dt > retry_deadline:
+                continue
         if include_future and normalized >= current_time:
             slots.append(normalized)
         elif not include_future and normalized <= current_time:
@@ -14715,6 +15318,9 @@ def _record_market_prefetch_event(
 ) -> None:
     days = state.setdefault("days", {})
     day_state = days.setdefault(trade_date, {})
+    previous = day_state.get(slot) if isinstance(day_state.get(slot), dict) else {}
+    event = dict(event)
+    event["attemptCount"] = int(previous.get("attemptCount") or 0) + 1
     day_state[slot] = event
     state["lastEvent"] = event
     retain_days = int(config.get("retainDays") or DEFAULT_MARKET_PREFETCH_CONFIG["retainDays"])
@@ -15215,6 +15821,8 @@ def _outcome_status(run: Dict[str, Any], outcomes: List[Dict[str, Any]]) -> str:
         return "verified" if any(label != "数据不足" for label in labels) else "data_insufficient"
     if run.get("status") != "done":
         return "not_ready"
+    if _effective_selection_mode(run) == "market_data_unavailable_zero_pick":
+        return "data_unavailable"
     if _is_zero_pick_run(run):
         return "zero_pick"
     if str(run.get("recommendationDate") or "") >= date.today().isoformat():
@@ -15264,10 +15872,37 @@ def _historical_market_cash_correction(run: Dict[str, Any]) -> bool:
     return _market_policy_requires_cash(run) and _all_batches_valid_zero_pick(run.get("batchSummary") or [])
 
 
+def _historical_mock_data_unavailable_correction(run: Dict[str, Any]) -> bool:
+    market = run.get("market") or {}
+    source = str(run.get("actualSource") or market.get("actualSource") or "").removeprefix("cache:").lower()
+    return bool(
+        run.get("status") == "done"
+        and (source == "mock" or (market.get("mockStatus") or {}).get("used"))
+    )
+
+
 def _effective_selection_mode(run: Dict[str, Any]) -> str:
+    if _historical_mock_data_unavailable_correction(run):
+        return "market_data_unavailable_zero_pick"
     if _historical_market_cash_correction(run):
         return "market_risk_zero_pick"
     return str(run.get("selectionMode") or "")
+
+
+def _apply_read_time_run_corrections(run: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose corrected business semantics while preserving immutable stored facts."""
+    corrected = dict(run or {})
+    stored_mode = str(corrected.get("selectionMode") or "")
+    effective_mode = _effective_selection_mode(corrected)
+    corrected["storedSelectionMode"] = stored_mode
+    corrected["selectionMode"] = effective_mode
+    corrected["selectionModeCorrected"] = effective_mode != stored_mode
+    if effective_mode == "market_data_unavailable_zero_pick":
+        market = dict(corrected.get("market") or {})
+        market["officialDecisionStatus"] = "data_unavailable"
+        market.setdefault("userMessage", "真实行情不可用：本次未形成买入或主动空仓决策，仅保留故障诊断。")
+        corrected["market"] = market
+    return corrected
 
 
 def _is_technical_failure_run(run: Dict[str, Any]) -> bool:
@@ -15316,7 +15951,10 @@ def _requires_legacy_isolation(run: Dict[str, Any]) -> bool:
 def _run_role(run: Dict[str, Any]) -> str:
     market = run.get("market") or {}
     request = run.get("request") or {}
-    if _effective_selection_mode(run) in {"rules_fallback", "ai_technical_failure_zero_pick", "ai_unavailable_zero_pick", "ai_failed"}:
+    if _effective_selection_mode(run) in {
+        "rules_fallback", "market_data_unavailable_zero_pick", "ai_technical_failure_zero_pick",
+        "ai_unavailable_zero_pick", "ai_failed",
+    }:
         return "research"
     if _historical_treatment_applied(market, request):
         return "legacy"
@@ -15352,6 +15990,8 @@ def _run_requested_pool_size(run: Dict[str, Any]) -> int:
 
 def _zero_pick_reason(run: Dict[str, Any]) -> str:
     market = run.get("market") or {}
+    if _effective_selection_mode(run) == "market_data_unavailable_zero_pick":
+        return str(market.get("userMessage") or "").strip() or "真实行情不可用，本次未形成买入或主动空仓决策。"
     policy = market.get("recommendationPolicy") or {}
     context = market.get("marketContext") or {}
     return (
@@ -15364,6 +16004,33 @@ def _zero_pick_reason(run: Dict[str, Any]) -> str:
 
 def _zero_pick_verification_result(run: Dict[str, Any], strategy_feedback: Dict[str, Any]) -> Dict[str, Any]:
     reason = _zero_pick_reason(run)
+    if _effective_selection_mode(run) == "market_data_unavailable_zero_pick":
+        return {
+            "runId": int(run.get("id") or 0),
+            "status": "data_unavailable",
+            "reason": reason,
+            "items": [],
+            "scenarios": [],
+            "summary": {
+                "count": 0,
+                "verifiedCount": 0,
+                "successCount": 0,
+                "dataUnavailable": True,
+                "zeroPick": False,
+            },
+            "tradeableSummary": {
+                "count": 0,
+                "tradeableCount": 0,
+                "ruleTradeableCount": 0,
+                "successCount": 0,
+                "dataUnavailable": True,
+                "zeroPick": False,
+                "reason": reason,
+                "validationVersion": TRADEABLE_VALIDATION_VERSION,
+            },
+            "baselineComparison": {},
+            "strategyFeedback": strategy_feedback,
+        }
     summary = {"count": 0, "verifiedCount": 0, "successCount": 0, "zeroPick": True}
     tradeable_summary = {
         "count": 0,
@@ -15497,6 +16164,12 @@ def _review_sample_meta(
             "sampleClass": "technical_failure",
             "sampleLabel": "技术失败",
             "sampleReason": "AI 调用、配置或输出发生技术失败；本日不属于策略主动空仓，不计入收益，但计入系统可靠性。",
+        }
+    if _effective_selection_mode(run) == "market_data_unavailable_zero_pick":
+        return {
+            "sampleClass": "diagnostic",
+            "sampleLabel": "真实行情不可用",
+            "sampleReason": "模拟行情或真实行情缺失没有形成正式买入/空仓决策；不计入收益、主动空仓率、技术失败率或策略学习。",
         }
     if outcome_status == "pending_next_trade_day":
         return {"sampleClass": "waiting", "sampleLabel": "等待数据", "sampleReason": "还没到次日开盘后 15 分钟，暂时不能验证。"}
@@ -15727,6 +16400,7 @@ def _review_ai_decision_meta(run: Dict[str, Any]) -> Dict[str, str]:
     if selection_mode in ZERO_PICK_SELECTION_MODES:
         labels = {
             "market_risk_zero_pick": "风控空仓",
+            "market_data_unavailable_zero_pick": "真实行情不可用",
             "data_quality_zero_pick": "数据空仓",
             "guardrail_zero_pick": "守门空仓",
             "ai_zero_pick": "AI 主动空仓",

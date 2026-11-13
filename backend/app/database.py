@@ -1452,6 +1452,48 @@ class Database:
                 (key, json.dumps(value, ensure_ascii=False), now),
             )
 
+    def acquire_app_lease(self, key: str, owner: str, lease_seconds: int = 180) -> bool:
+        now = datetime.now()
+        expires_at = (now + timedelta(seconds=max(10, int(lease_seconds or 180)))).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT value_json FROM app_settings WHERE key=?", (key,)).fetchone()
+            current = _json_or_default(row["value_json"], {}) if row else {}
+            current_owner = str(current.get("owner") or "")
+            try:
+                current_expiry = datetime.fromisoformat(str(current.get("expiresAt") or ""))
+            except ValueError:
+                current_expiry = datetime.min
+            if current_owner and current_owner != owner and current_expiry > now:
+                connection.rollback()
+                return False
+            payload = json.dumps(
+                {"owner": owner, "acquiredAt": now.isoformat(timespec="seconds"), "expiresAt": expires_at},
+                ensure_ascii=False,
+            )
+            connection.execute(
+                """
+                INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
+                ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at
+                """,
+                (key, payload, now.isoformat(timespec="seconds")),
+            )
+        return True
+
+    def release_app_lease(self, key: str, owner: str) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT value_json FROM app_settings WHERE key=?", (key,)).fetchone()
+            current = _json_or_default(row["value_json"], {}) if row else {}
+            if str(current.get("owner") or "") != owner:
+                connection.rollback()
+                return
+            connection.execute(
+                "UPDATE app_settings SET value_json=?,updated_at=? WHERE key=?",
+                (json.dumps({"owner": "", "releasedAt": now, "expiresAt": now}), now, key),
+            )
+
     def upsert_daily_kline_series(self, code: str, series: List[Dict[str, Any]], source: str = "") -> int:
         normalized_code = str(code or "").strip().zfill(6)
         if not normalized_code or not series:
@@ -3805,6 +3847,35 @@ class Database:
                 LIMIT 1
                 """,
                 (risk_mode, requested_source),
+            ).fetchone()
+        return self._t1_overnight_run_from_row(row) if row else None
+
+    def find_t1_run_by_client_request_id(self, recommendation_date: str, client_request_id: str) -> Optional[Dict[str, Any]]:
+        if not str(client_request_id or "").strip():
+            return None
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM t1_overnight_selection_runs
+                WHERE recommendation_date=?
+                  AND json_extract(request_json, '$.clientRequestId')=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (str(recommendation_date), str(client_request_id)),
+            ).fetchone()
+        return self._t1_overnight_run_from_row(row) if row else None
+
+    def find_active_t1_regeneration(self, recommendation_date: str, base_run_id: int = 0) -> Optional[Dict[str, Any]]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM t1_overnight_selection_runs
+                WHERE recommendation_date=? AND status IN ('pending','running')
+                  AND COALESCE(json_extract(request_json, '$.force'), 0)=1
+                  AND (?=0 OR COALESCE(json_extract(request_json, '$.baseRunId'), 0)=?)
+                ORDER BY id DESC LIMIT 1
+                """,
+                (str(recommendation_date), int(base_run_id or 0), int(base_run_id or 0)),
             ).fetchone()
         return self._t1_overnight_run_from_row(row) if row else None
 

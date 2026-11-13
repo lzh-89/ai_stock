@@ -86,6 +86,7 @@
             <select id="sourceSelect">
               <option value="auto">自动</option>
               <option value="sina">新浪</option>
+              <option value="tencent">腾讯</option>
               <option value="akshare">AKShare/东财</option>
               <option value="mock">Mock</option>
             </select>
@@ -110,10 +111,7 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5Z"/></svg>
             开始 T+1 筛选
           </button>
-          <label class="force-check">
-            <input id="forceCheck" type="checkbox" />
-            <span>强制重新生成</span>
-          </label>
+          <button id="regenerateButton" class="secondary-button" type="button">重新生成…</button>
         </div>
       </header>
 
@@ -477,7 +475,33 @@
       </div>
     </div>
 
+    <div id="regenerationModal" class="action-modal hidden" role="dialog" aria-modal="true" aria-labelledby="regenerationModalTitle">
+      <div class="action-modal-card regeneration-card">
+        <div class="action-modal-head">
+          <span class="status-pill neutral">重新生成</span>
+          <button id="regenerationModalClose" class="icon-button" type="button" aria-label="关闭重新生成弹窗">×</button>
+        </div>
+        <h2 id="regenerationModalTitle">确认本次重新生成方式</h2>
+        <p id="regenerationBaseRun">将基于当前参数创建一个新 Run；原正式结果在新 Run 安全完成前保持不变。</p>
+        <fieldset class="regeneration-options">
+          <legend>行情处理方式</legend>
+          <label><input type="radio" name="regenerationMode" value="recompute_frozen" checked />复用 14:40 前同日冻结行情重算（更快、结果可复核）</label>
+          <label><input type="radio" name="regenerationMode" value="refresh_real_then_recompute" />重新拉取真实行情后重算（耗时更长，仍受截止时间约束）</label>
+        </fieldset>
+        <fieldset class="regeneration-options">
+          <legend>结果用途</legend>
+          <label id="officialRoleOption"><input id="requestedOfficialRole" type="radio" name="requestedRunRole" value="official" />申请正式结果</label>
+          <label><input type="radio" name="requestedRunRole" value="research" checked />仅研究结果（不替换正式推荐）</label>
+          <small id="officialRoleHint">只有 14:30—14:50 且全部安全门通过后，正式结果才会自动生效。</small>
+        </fieldset>
+        <div class="regeneration-actions">
+          <button id="regenerationCancelButton" class="secondary-button" type="button">取消</button>
+          <button id="regenerationConfirmButton" class="primary-button" type="button">创建新 Run</button>
+        </div>
+      </div>
+    </div>
+
     <script src="./src/intraday-entry-audit.js?v=20260719-entry-audit"></script>
-    <script src="./src/t1-overnight-selection.js?v=20261014-entry-evidence-v2"></script>
+    <script src="./src/t1-overnight-selection.js?v=20261112-emergency-reliability-v1"></script>
   </body>
 </html>

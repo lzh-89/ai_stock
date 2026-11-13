@@ -43,6 +43,35 @@ def pick(code="000001", **changes):
 
 
 class PolicyTest(unittest.TestCase):
+    def test_final_decision_cards_keep_nine_and_thirty_candidates_inside_safe_budget(self):
+        rows = []
+        for index in range(30):
+            item = policy.formal_tail(candidate(f"{index + 1:06d}"), tail(), "14:40")
+            item["supportingEvidenceRefs"] = ["P1", "T1"]
+            item["counterEvidenceRefs"] = ["R1"]
+            item["evidenceRefs"] = list(item.get("evidenceRefs") or []) + [
+                {"id": "T1", "status": "available", "summary": "真实尾盘承接证据"}
+            ]
+            rows.append(item)
+        cards = [svc._compact_candidate_for_prompt(item, "final", True) for item in rows]
+        self.assertTrue(all(card["cardVersion"] == svc.T1_FINAL_DECISION_CARD_VERSION for card in cards))
+        self.assertTrue(all(card["cardCharacters"] <= svc.T1_FINAL_DECISION_CARD_MAX_CHARACTERS for card in cards))
+        self.assertEqual(cards[0]["priorDecisionEvidence"]["supportingEvidenceRefs"], ["P1", "T1"])
+        self.assertEqual(cards[0]["priorDecisionEvidence"]["counterEvidenceRefs"], ["R1"])
+        for count in (9, 12, 30):
+            prompt = svc._user_prompt(rows[:count], {"selectionPolicyVersion": policy.VERSION}, 3, "final", {})
+            self.assertLess(len(prompt), svc.T1_AI_SAFE_REQUEST_CHARACTERS, count)
+
+    def test_mock_and_unavailable_sources_never_become_official_market_decisions(self):
+        self.assertFalse(svc._t1_market_decision_usable("mock", {"mockStatus": {"used": True}}))
+        self.assertFalse(svc._t1_market_decision_usable("unavailable", {}))
+        self.assertFalse(svc._t1_market_decision_usable(
+            "sina", {"marketSnapshotFreeze": {"snapshotDecisionUsable": False}}
+        ))
+        self.assertTrue(svc._t1_market_decision_usable(
+            "cache:tencent", {"marketSnapshotFreeze": {"snapshotDecisionUsable": True}}
+        ))
+
     def test_proxy_scores_and_board_do_not_manufacture_independent_evidence(self):
         c = candidate()
         other = policy.annotate(dict(c, amountFactor=99, volumeRatio=99, sectorRank=1,
@@ -193,6 +222,44 @@ class AIRepairTest(unittest.TestCase):
         self.assertEqual((picks, error), ([], ""))
         self.assertEqual(market["aiEvidenceValidationStatus"], "zero_pick")
         self.assertEqual(call.call_count, 1)
+
+    def test_over_budget_final_uses_audited_tournament_without_dropping_input_candidates(self):
+        service = object.__new__(svc.T1OvernightSelectionService)
+        service.settings = SimpleNamespace(ai_provider="deepseek", ai_model="fixture", ai_base_url="https://example.test/v1", ai_api_key="fixture")
+        service._cached_ai_picks = lambda _: None
+        service._save_ai_picks_cache = lambda *args: None
+        service.latest_strategy_feedback = lambda: {}
+        candidates = []
+        for index in range(12):
+            item = policy.formal_tail(candidate(f"{index + 1:06d}"), tail(), "14:40")
+            item["evidenceRefs"] = list(item.get("evidenceRefs") or []) + [
+                {"id": "T1", "status": "available", "summary": "真实尾盘承接证据"}
+            ]
+            candidates.append(item)
+        sent_sizes = []
+
+        def response(request, timeout=0):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_prompt = payload["messages"][1]["content"]
+            sent_sizes.append(len(user_prompt) + len(payload["messages"][0]["content"]))
+            marker = "客观复盘只描述事实；只有 confirmedStrategyConstraints 是用户已确认的策略约束。\n"
+            prompt_payload = json.loads(user_prompt.split(marker, 1)[1])
+            code = prompt_payload["candidates"][0]["code"]
+            body = {"picks": [pick(code, supportingEvidenceRefs=["P1", "T1"])]}
+            return io.BytesIO(json.dumps({"choices": [{"message": {"content": json.dumps(body)}}]}).encode())
+
+        market = {"selectionPolicyVersion": policy.VERSION}
+        with patch.object(svc, "T1_AI_SAFE_REQUEST_CHARACTERS", 20_000), patch.object(
+            svc.urllib.request, "urlopen", side_effect=response
+        ):
+            picks, error = service._select_with_ai(candidates, market, 3, "final", 0)
+        self.assertEqual(error, "")
+        self.assertEqual(len(picks), 1)
+        self.assertTrue(all(size <= 20_000 for size in sent_sizes))
+        audit = market["finalSelectionAudit"]
+        self.assertEqual(audit["mode"], "budgeted_tournament")
+        audited_codes = {code for group in audit["groups"] for code in group["candidateCodes"] if group["depth"] == 0}
+        self.assertEqual(audited_codes, {item["code"] for item in candidates})
 
 
 if __name__ == "__main__":

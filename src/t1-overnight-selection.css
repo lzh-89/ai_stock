@@ -479,6 +479,53 @@ a.secondary-button {
   justify-self: end;
 }
 
+.regeneration-card {
+  width: min(620px, 100%);
+  gap: 16px;
+}
+
+.regeneration-options {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+}
+
+.regeneration-options legend {
+  padding: 0 6px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.regeneration-options label {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.regeneration-options small {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.regeneration-options .option-disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.regeneration-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;

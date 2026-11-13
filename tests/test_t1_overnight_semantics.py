@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from backend.app.services import t1_overnight_selection_service as svc
 from backend.app.database import Database
@@ -22,6 +23,124 @@ class T1OvernightSemanticsTest(unittest.TestCase):
         self.assertEqual(status["eligibility"], "official_blocked")
         self.assertTrue(svc._t1_trade_date_blocks_official(status))
 
+    def test_market_prefetch_failed_slot_retries_but_done_or_exhausted_does_not(self):
+        self.assertEqual(
+            svc.DEFAULT_MARKET_PREFETCH_CONFIG["scheduleTimes"],
+            ["14:10", "14:20", "14:30", "14:35", "14:38", "14:39"],
+        )
+        config = dict(svc.DEFAULT_MARKET_PREFETCH_CONFIG, scheduleTimes=["14:20"])
+        today = "2026-11-12"
+        failed = {"days": {today: {"14:20": {"status": "failed", "attemptCount": 1}}}}
+        self.assertEqual(
+            svc._market_prefetch_due_slots(datetime.fromisoformat(f"{today}T14:21:00"), config, failed),
+            ["14:20"],
+        )
+        exhausted = {"days": {today: {"14:20": {"status": "failed", "attemptCount": 3}}}}
+        done = {"days": {today: {"14:20": {"status": "done", "attemptCount": 1}}}}
+        self.assertEqual(svc._market_prefetch_due_slots(datetime.fromisoformat(f"{today}T14:21:00"), config, exhausted), [])
+        self.assertEqual(svc._market_prefetch_due_slots(datetime.fromisoformat(f"{today}T14:21:00"), config, done), [])
+
+    def test_app_lease_prevents_two_processes_from_running_same_prefetch_slot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "t1.sqlite"
+            first = Database(path)
+            second = Database(path)
+            key = "t1_market_prefetch_lease:2026-11-12:14:39"
+            self.assertTrue(first.acquire_app_lease(key, "worker-a", lease_seconds=60))
+            self.assertFalse(second.acquire_app_lease(key, "worker-b", lease_seconds=60))
+            first.release_app_lease(key, "worker-a")
+            self.assertTrue(second.acquire_app_lease(key, "worker-b", lease_seconds=60))
+
+    def test_regeneration_client_request_is_idempotently_findable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "t1.sqlite")
+            run_id = db.create_t1_overnight_selection_run(
+                {
+                    "recommendationDate": "2026-11-12",
+                    "scanTime": "14:40",
+                    "riskMode": "balanced",
+                    "requestedSource": "auto",
+                    "status": "pending",
+                    "request": {
+                        "force": True,
+                        "baseRunId": 116,
+                        "clientRequestId": "fixture-request-1",
+                        "requestedRunRole": "research",
+                        "regenerationMode": "recompute_frozen",
+                    },
+                },
+                [],
+            )
+            self.assertEqual(
+                db.find_t1_run_by_client_request_id("2026-11-12", "fixture-request-1")["id"], run_id
+            )
+            self.assertEqual(db.find_active_t1_regeneration("2026-11-12", 116)["id"], run_id)
+
+    def test_official_promotion_and_old_official_demotion_are_committed_together(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "t1.sqlite")
+            base = {
+                "recommendationDate": "2026-11-12",
+                "scanTime": "14:40",
+                "riskMode": "balanced",
+                "requestedSource": "auto",
+                "actualSource": "sina",
+                "status": "done",
+                "selectionMode": "ai_t1_overnight",
+                "poolSize": 500,
+                "request": {"poolSize": 500, "runRole": "official"},
+                "market": {"runRole": "official", "marketSnapshotFreeze": {"snapshotDecisionUsable": True}},
+            }
+            old_id = db.create_t1_overnight_selection_run(base, [])
+            research_payload = dict(base)
+            research_payload["request"] = {"poolSize": 500, "runRole": "research"}
+            research_payload["market"] = {"runRole": "research", "marketSnapshotFreeze": {"snapshotDecisionUsable": True}}
+            research_id = db.create_t1_overnight_selection_run(research_payload, [])
+            new_payload = dict(base)
+            new_payload["request"] = {"poolSize": 500, "runRole": "research"}
+            new_payload["market"] = {"runRole": "research", "marketSnapshotFreeze": {"snapshotDecisionUsable": True}}
+            new_id = db.create_t1_overnight_selection_run(new_payload, [])
+            service = object.__new__(svc.T1OvernightSelectionService)
+            service.database = db
+            service.refresh_strategy_feedback = lambda **kwargs: {}
+            service.latest_strategy_feedback = lambda: {}
+            service.critic_status = lambda: {}
+            service.get_run = lambda run_id: db.load_t1_overnight_selection_run(run_id)
+            with patch.object(svc, "_requires_legacy_isolation", return_value=False), patch.object(
+                svc, "_run_signal_window_guard", return_value={"officialEligible": True}
+            ):
+                service.update_run_role(new_id, "official")
+            self.assertEqual(db.load_t1_overnight_selection_run(old_id)["request"]["runRole"], "research")
+            self.assertEqual(db.load_t1_overnight_selection_run(research_id)["request"]["runRole"], "research")
+            self.assertEqual(db.load_t1_overnight_selection_run(new_id)["request"]["runRole"], "official")
+            self.assertEqual(db.load_t1_overnight_selection_run(new_id)["market"]["replacedOfficialRunId"], old_id)
+
+    def test_failed_official_request_keeps_existing_official_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "t1.sqlite")
+            base = {
+                "recommendationDate": "2026-11-12",
+                "scanTime": "14:40",
+                "riskMode": "balanced",
+                "requestedSource": "auto",
+                "actualSource": "sina",
+                "status": "done",
+                "poolSize": 500,
+                "request": {"poolSize": 500, "runRole": "official"},
+                "market": {"runRole": "official", "marketSnapshotFreeze": {"snapshotDecisionUsable": True}},
+            }
+            old_id = db.create_t1_overnight_selection_run(dict(base, selectionMode="ai_t1_overnight"), [])
+            failed_payload = dict(base, selectionMode="ai_technical_failure_zero_pick")
+            failed_payload["request"] = {"poolSize": 500, "runRole": "research"}
+            failed_payload["market"] = {"runRole": "research", "marketSnapshotFreeze": {"snapshotDecisionUsable": True}}
+            failed_id = db.create_t1_overnight_selection_run(failed_payload, [])
+            service = object.__new__(svc.T1OvernightSelectionService)
+            service.database = db
+            with self.assertRaisesRegex(ValueError, "数据或技术失败"):
+                service.update_run_role(failed_id, "official")
+            self.assertEqual(db.load_t1_overnight_selection_run(old_id)["request"]["runRole"], "official")
+            self.assertEqual(db.load_t1_overnight_selection_run(failed_id)["request"]["runRole"], "research")
+
     def test_technical_failure_top0_is_diagnostic_not_active_cash(self):
         run = {
             "status": "done",
@@ -37,6 +156,58 @@ class T1OvernightSemanticsTest(unittest.TestCase):
         self.assertEqual(sample["sampleClass"], "technical_failure")
         self.assertEqual(display["reviewStatus"], "diagnostic")
         self.assertEqual(display["reviewStatusLabel"], "技术失败")
+
+    def test_historical_mock_run_is_read_as_data_unavailable_without_rewriting_saved_mode(self):
+        run = {
+            "id": 115,
+            "status": "done",
+            "selectionMode": "market_risk_zero_pick",
+            "actualSource": "mock",
+            "recommendationDate": "2026-11-10",
+            "scanTime": "14:40",
+            "finalCount": 0,
+            "finalPicks": [],
+            "request": {"runRole": "official", "poolSize": 500},
+            "market": {"runRole": "official", "mockStatus": {"used": True}},
+        }
+        self.assertEqual(run["selectionMode"], "market_risk_zero_pick")
+        self.assertEqual(svc._effective_selection_mode(run), "market_data_unavailable_zero_pick")
+        self.assertEqual(svc._run_role(run), "research")
+        sample = svc._review_sample_meta(run, "zero_pick", "research", 0, 0, 0)
+        self.assertEqual(sample["sampleClass"], "diagnostic")
+        self.assertEqual(sample["sampleLabel"], "真实行情不可用")
+        corrected = svc._apply_read_time_run_corrections(run)
+        self.assertEqual(corrected["storedSelectionMode"], "market_risk_zero_pick")
+        self.assertEqual(corrected["selectionMode"], "market_data_unavailable_zero_pick")
+        self.assertEqual(corrected["market"]["officialDecisionStatus"], "data_unavailable")
+        verification = svc._zero_pick_verification_result(corrected, {})
+        self.assertEqual(verification["status"], "data_unavailable")
+        self.assertFalse(verification["summary"]["zeroPick"])
+        self.assertEqual(verification["baselineComparison"], {})
+
+    def test_run_start_receipt_is_lightweight_and_returns_created_run_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "t1.sqlite")
+            run_id = db.create_t1_overnight_selection_run(
+                {
+                    "recommendationDate": "2026-11-12",
+                    "scanTime": "14:40",
+                    "riskMode": "balanced",
+                    "requestedSource": "auto",
+                    "status": "pending",
+                    "request": {"force": True, "poolSize": 500, "requestedRunRole": "research"},
+                    "market": {"runRole": "research"},
+                },
+                [],
+            )
+            service = object.__new__(svc.T1OvernightSelectionService)
+            service.database = db
+            receipt = service._run_start_receipt(run_id)
+            self.assertEqual(receipt["id"], run_id)
+            self.assertEqual(receipt["status"], "pending")
+            self.assertEqual(receipt["runRole"], "research")
+            self.assertNotIn("items", receipt)
+            self.assertNotIn("strategyFeedback", receipt)
 
     def test_market_cash_has_priority_and_keeps_ai_research_status_separate(self):
         run = {
