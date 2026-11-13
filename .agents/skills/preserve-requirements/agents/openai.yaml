@@ -1,0 +1,5 @@
+interface:
+  display_name: "需求完整性门禁"
+  short_description: "防止需求在文档整合、实现和验收过程中被压缩或遗漏"
+  default_prompt: "使用 $preserve-requirements 审计本次需求整合与实现是否完整。"
+

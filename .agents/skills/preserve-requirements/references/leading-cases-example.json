@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "changeId": "T1-RV",
+  "title": "T+1 leading-case requirement preservation example",
+  "sourceDocuments": [
+    "docs/2026-11-06_已过期_T+1全链路筛选与影子体系优化方案.md"
+  ],
+  "requirements": [
+    {
+      "id": "T1-RV-005",
+      "statement": "Preserve every confirmed leading-case classification and filtering explanation during integration.",
+      "status": "proposed",
+      "sourceRefs": [
+        {
+          "id": "SRC-T1-RV-005",
+          "path": "docs/2026-11-06_已过期_T+1全链路筛选与影子体系优化方案.md",
+          "locator": "section 10.2, original line 1255",
+          "excerpt": "Leading cases are split into opening-premium leading, close/intraday rise, hard to buy, high risk, and normally tradable miss, and show at which layer each was filtered out."
+        }
+      ],
+      "decisionRefs": [],
+      "requirementDocRefs": [],
+      "implementationDocRefs": [],
+      "releaseRefs": [],
+      "rollbackRefs": [],
+      "criteria": [
+        {
+          "id": "T1-RV-005-A",
+          "statement": "Provide the opening-premium-leading classification.",
+          "status": "proposed",
+          "sourceRefIds": ["SRC-T1-RV-005"],
+          "appliesTo": ["backend", "frontend"],
+          "evidence": {"artifacts": [], "tests": [], "uiAcceptance": [], "dataAcceptance": [], "reviews": []}
+        },
+        {
+          "id": "T1-RV-005-B",
+          "statement": "Provide the close-or-intraday-rise classification.",
+          "status": "proposed",
+          "sourceRefIds": ["SRC-T1-RV-005"],
+          "appliesTo": ["backend", "frontend"],
+          "evidence": {"artifacts": [], "tests": [], "uiAcceptance": [], "dataAcceptance": [], "reviews": []}
+        },
+        {
+          "id": "T1-RV-005-C",
+          "statement": "Provide the hard-to-buy business conclusion.",
+          "status": "proposed",
+          "sourceRefIds": ["SRC-T1-RV-005"],
+          "appliesTo": ["backend", "frontend"],
+          "evidence": {"artifacts": [], "tests": [], "uiAcceptance": [], "dataAcceptance": [], "reviews": []}
+        },
+        {
+          "id": "T1-RV-005-D",
+          "statement": "Provide the high-risk business conclusion.",
+          "status": "proposed",
+          "sourceRefIds": ["SRC-T1-RV-005"],
+          "appliesTo": ["backend", "frontend"],
+          "evidence": {"artifacts": [], "tests": [], "uiAcceptance": [], "dataAcceptance": [], "reviews": []}
+        },
+        {
+          "id": "T1-RV-005-E",
+          "statement": "Provide the normally-tradable-miss business conclusion.",
+          "status": "proposed",
+          "sourceRefIds": ["SRC-T1-RV-005"],
+          "appliesTo": ["backend", "frontend"],
+          "evidence": {"artifacts": [], "tests": [], "uiAcceptance": [], "dataAcceptance": [], "reviews": []}
+        },
+        {
+          "id": "T1-RV-006-A",
+          "statement": "Show the terminal filtering stage for every leading case.",
+          "status": "proposed",
+          "sourceRefIds": ["SRC-T1-RV-005"],
+          "appliesTo": ["backend", "frontend", "data"],
+          "evidence": {"artifacts": [], "tests": [], "uiAcceptance": [], "dataAcceptance": [], "reviews": []}
+        },
+        {
+          "id": "T1-RV-006-B",
+          "statement": "Show the filtering reason for every leading case.",
+          "status": "proposed",
+          "sourceRefIds": ["SRC-T1-RV-005"],
+          "appliesTo": ["backend", "frontend", "data"],
+          "evidence": {"artifacts": [], "tests": [], "uiAcceptance": [], "dataAcceptance": [], "reviews": []}
+        }
+      ]
+    }
+  ]
+}

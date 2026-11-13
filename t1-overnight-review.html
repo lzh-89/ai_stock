@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>T+1 复盘</title>
     <link rel="stylesheet" href="./src/t1-overnight-selection.css?v=20261014-entry-evidence-layout" />
-    <link rel="stylesheet" href="./src/t1-overnight-review.css?v=20261013-policy-run-shadow-reason" />
+    <link rel="stylesheet" href="./src/t1-overnight-review.css?v=20261107-leader-pagination-v1" />
   </head>
   <body data-t1-page="review">
     <div class="t1-app-shell">
@@ -85,6 +85,7 @@
             <span>数据用途</span>
             <select id="statusSelect">
               <option value="learnable">可用于优化</option>
+              <option value="historical">历史口径可分析</option>
               <option value="reviewable">可看结果</option>
               <option value="partial">部分缺数据</option>
               <option value="waiting">等待数据</option>
@@ -122,13 +123,17 @@
           </div>
           <div class="shadow-analytics-controls">
             <label>
+              <span>统计版本</span>
+              <select id="shadowSliceSelect" aria-label="影子策略与执行版本"></select>
+            </label>
+            <label>
               <span>角色</span>
               <select id="shadowRoleSelect"></select>
             </label>
             <label>
               <span>窗口</span>
               <select id="shadowWindowSelect">
-                <option value="all">当前版本全部</option>
+                <option value="all">所选版本全部</option>
                 <option value="20d">近 20 个有效日</option>
                 <option value="discovery60">前 60 日发现期</option>
                 <option value="confirmation60">第 61-120 日确认期</option>
@@ -137,9 +142,10 @@
           </div>
         </div>
         <div id="shadowFamilyTabs" class="shadow-family-tabs" role="tablist" aria-label="影子家族">
-          <button type="button" role="tab" data-shadow-family="legacy_tail_rule">规则尾盘影子</button>
-          <button type="button" role="tab" data-shadow-family="legacy_tail_ai">AI 尾盘影子</button>
-          <button type="button" role="tab" data-shadow-family="policy_experiment">本期策略实验</button>
+          <button type="button" role="tab" data-shadow-family="v3_main_experiment">V3 全链路主实验</button>
+          <button type="button" role="tab" data-shadow-family="policy_experiment">历史策略组件</button>
+          <button type="button" role="tab" data-shadow-family="legacy_tail_rule">历史：规则尾盘</button>
+          <button type="button" role="tab" data-shadow-family="legacy_tail_ai">历史：AI 尾盘</button>
         </div>
         <p id="shadowAnalyticsNotice" class="shadow-analytics-notice">正在加载影子统计...</p>
         <div id="shadowAnalyticsMetrics" class="metric-grid"></div>
@@ -155,8 +161,8 @@
       <section class="panel optimization-stats-panel">
         <div class="panel-head">
           <div>
-            <span>只统计“可用于优化”</span>
-            <h2>可用于优化样本统计</h2>
+            <span>当前严格收益与历史样本分层</span>
+            <h2>当前严格样本收益统计</h2>
           </div>
           <small id="optimizationStatsMeta">--</small>
         </div>
@@ -235,15 +241,16 @@
               <form id="archiveFilters" class="archive-toolbar">
                 <input id="archiveQuery" aria-label="搜索候选股票" placeholder="代码 / 名称" maxlength="80">
                 <select id="archiveGroup" aria-label="验证分组"><option value="">全部分组</option><option value="core">核心</option><option value="single">单项突出</option><option value="boundary">边界分歧</option><option value="coverage">行业覆盖</option><option value="explore">探索</option></select>
-                <select id="archiveStage" aria-label="候选阶段"><option value="">全部阶段</option><option value="not_requested">未分配15m</option><option value="request_failed">15m失败</option><option value="quality_rejected">门禁淘汰</option><option value="semifinal">半决赛</option><option value="official">正式入选</option><option value="shadow">影子入选</option></select>
+                <select id="archiveRound" aria-label="验证轮次"><option value="0">全部轮次</option><option value="1">第一轮</option><option value="2">第二轮</option></select>
+                <select id="archiveStage" aria-label="最终停留阶段"><option value="">全部最终阶段</option><option value="legacy_validation_not_allocated">未分配15分钟验证</option><option value="legacy_minute15m_technical_failure">15分钟请求技术失败</option><option value="legacy_minute15m_quality_rejected">15分钟数据质量不合格</option><option value="legacy_setup_rejected">形态未成立</option><option value="legacy_ai_batch_rejected">AI批次未晋级</option><option value="legacy_tail_rejected">尾盘资格未通过</option><option value="legacy_final_not_selected">AI终选未入选</option><option value="legacy_guardrail_rejected">最终护栏淘汰</option><option value="legacy_official_selected">正式入选</option><option value="legacy_stage_unknown">旧版层级未知</option></select>
+                <select id="archiveIdentity" aria-label="身份标签"><option value="">全部身份标签</option><option value="legacy_semifinal">半决赛候选</option><option value="official_pick">正式推荐</option><option value="rule_shadow">规则影子</option><option value="ai_shadow">AI影子</option></select>
                 <select id="archiveSort" aria-label="候选排序"><option value="preliminary_rank">初始排名</option><option value="verified_rank">真实评分排名</option><option value="open_proxy">开盘代理降序</option><option value="close_proxy">收盘代理降序</option></select>
                 <button class="secondary-button" type="submit">查询</button>
               </form>
               <div class="table-wrap"><table class="data-table candidate-archive-table"><thead><tr>
-                <th>股票</th><th>初始排名 / 分</th><th>分组 / 轮次</th><th>15m / 1m</th><th>决策去向</th><th>开盘代理</th><th>收盘代理</th><th>依据</th>
+                <th>股票</th><th>初始排名 / 分</th><th>验证分组 / 轮次</th><th>15m / 1m</th><th>最终阶段 / 身份</th><th>开盘代理</th><th>收盘代理</th><th>依据</th>
               </tr></thead><tbody id="archiveRows"></tbody></table></div>
               <div class="archive-pagination"><button id="archivePrev" class="secondary-button" type="button">上一页</button><span id="archivePageMeta"></span><button id="archiveNext" class="secondary-button" type="button">下一页</button></div>
-              <div id="archiveEvidence" class="archive-evidence" hidden></div>
             </details>
           </section>
 
@@ -255,9 +262,16 @@
             <details id="nextDayCollectionDetails" class="archive-collection" hidden><summary>采集记录</summary><p id="nextDayCollection" class="archive-note"></p></details>
             <p id="nextDayNote" class="archive-note"></p>
             <div id="nextDayCoverage" class="archive-funnel"></div>
-            <div class="table-wrap"><table class="data-table next-day-group-table"><thead><tr>
-              <th>观察组</th><th>候选 / 有效样本</th><th>验证分配</th><th>开盘代理</th><th>收盘代理</th><th>收盘正代理比例</th>
-            </tr></thead><tbody id="nextDayGroups"></tbody></table></div>
+            <section id="nextDayV3Section" hidden><h3>V3全链路阶段表现</h3><p id="nextDayV3Scope" class="archive-note"></p>
+              <div class="table-wrap"><table class="data-table next-day-group-table"><thead><tr>
+                <th>V3阶段</th><th>候选 / 有效样本</th><th>阶段说明</th><th>开盘代理</th><th>收盘代理</th><th>收盘正代理比例</th>
+              </tr></thead><tbody id="nextDayV3Groups"></tbody></table></div>
+            </section>
+            <section id="nextDayLegacySection" hidden><h3>旧版验证抽样对比</h3><p class="archive-note">分组只表示验证预算用途，不代表股票质量等级。</p>
+              <div class="table-wrap"><table class="data-table next-day-group-table"><thead><tr>
+                <th>观察组</th><th>候选 / 有效样本</th><th>验证执行</th><th>开盘代理</th><th>收盘代理</th><th>收盘正代理比例</th>
+              </tr></thead><tbody id="nextDayLegacyGroups"></tbody></table></div>
+            </section>
             <div id="nextDayMissed" class="archive-note"></div>
           </section>
 
@@ -274,7 +288,7 @@
                 <thead>
                   <tr>
                     <th>股票</th>
-                    <th>买入参考</th>
+                    <th>正式入场价</th>
                     <th>次日</th>
                     <th>主KPI</th>
                     <th>开盘</th>
@@ -310,6 +324,21 @@
     </main>
     </div>
 
+    <div id="candidateDetailModal" class="action-modal candidate-detail-modal" role="dialog" aria-modal="true" aria-labelledby="candidateDetailTitle" hidden>
+      <section class="action-modal-card candidate-detail-card">
+        <div class="action-modal-head candidate-detail-head">
+          <div>
+            <span>候选筛选档案</span>
+            <h2 id="candidateDetailTitle">候选详情</h2>
+          </div>
+          <button id="candidateDetailClose" class="icon-button" type="button" aria-label="关闭候选详情">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>
+          </button>
+        </div>
+        <div id="archiveEvidence" class="archive-evidence candidate-detail-content" role="status" aria-live="polite"></div>
+      </section>
+    </div>
+
     <div id="actionModal" class="action-modal hidden" role="dialog" aria-modal="true" aria-labelledby="actionModalTitle">
       <div class="action-modal-card">
         <div class="action-modal-head">
@@ -324,7 +353,7 @@
       </div>
     </div>
 
-    <script src="./src/t1-overnight-review.js?v=20261014-entry-evidence"></script>
-    <script src="./src/t1-candidate-review.js?v=20261010-candidate-review"></script>
+    <script src="./src/t1-overnight-review.js?v=20261106-sample-scope-v7-2"></script>
+    <script src="./src/t1-candidate-review.js?v=20261107-leader-pagination-v1"></script>
   </body>
 </html>

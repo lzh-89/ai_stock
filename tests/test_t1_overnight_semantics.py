@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from backend.app.services import t1_overnight_selection_service as svc
 from backend.app.database import Database
@@ -21,10 +23,420 @@ class T1OvernightSemanticsTest(unittest.TestCase):
         self.assertEqual(status["eligibility"], "official_blocked")
         self.assertTrue(svc._t1_trade_date_blocks_official(status))
 
+    def test_market_prefetch_failed_slot_retries_but_done_or_exhausted_does_not(self):
+        self.assertEqual(
+            svc.DEFAULT_MARKET_PREFETCH_CONFIG["scheduleTimes"],
+            ["14:10", "14:20", "14:30", "14:35", "14:38", "14:39"],
+        )
+        config = dict(svc.DEFAULT_MARKET_PREFETCH_CONFIG, scheduleTimes=["14:20"])
+        today = "2026-11-12"
+        failed = {"days": {today: {"14:20": {"status": "failed", "attemptCount": 1}}}}
+        self.assertEqual(
+            svc._market_prefetch_due_slots(datetime.fromisoformat(f"{today}T14:21:00"), config, failed),
+            ["14:20"],
+        )
+        exhausted = {"days": {today: {"14:20": {"status": "failed", "attemptCount": 3}}}}
+        done = {"days": {today: {"14:20": {"status": "done", "attemptCount": 1}}}}
+        self.assertEqual(svc._market_prefetch_due_slots(datetime.fromisoformat(f"{today}T14:21:00"), config, exhausted), [])
+        self.assertEqual(svc._market_prefetch_due_slots(datetime.fromisoformat(f"{today}T14:21:00"), config, done), [])
+
+    def test_app_lease_prevents_two_processes_from_running_same_prefetch_slot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "t1.sqlite"
+            first = Database(path)
+            second = Database(path)
+            key = "t1_market_prefetch_lease:2026-11-12:14:39"
+            self.assertTrue(first.acquire_app_lease(key, "worker-a", lease_seconds=60))
+            self.assertFalse(second.acquire_app_lease(key, "worker-b", lease_seconds=60))
+            first.release_app_lease(key, "worker-a")
+            self.assertTrue(second.acquire_app_lease(key, "worker-b", lease_seconds=60))
+
+    def test_regeneration_client_request_is_idempotently_findable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "t1.sqlite")
+            run_id = db.create_t1_overnight_selection_run(
+                {
+                    "recommendationDate": "2026-11-12",
+                    "scanTime": "14:40",
+                    "riskMode": "balanced",
+                    "requestedSource": "auto",
+                    "status": "pending",
+                    "request": {
+                        "force": True,
+                        "baseRunId": 116,
+                        "clientRequestId": "fixture-request-1",
+                        "requestedRunRole": "research",
+                        "regenerationMode": "recompute_frozen",
+                    },
+                },
+                [],
+            )
+            self.assertEqual(
+                db.find_t1_run_by_client_request_id("2026-11-12", "fixture-request-1")["id"], run_id
+            )
+            self.assertEqual(db.find_active_t1_regeneration("2026-11-12", 116)["id"], run_id)
+
+    def test_official_promotion_and_old_official_demotion_are_committed_together(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "t1.sqlite")
+            base = {
+                "recommendationDate": "2026-11-12",
+                "scanTime": "14:40",
+                "riskMode": "balanced",
+                "requestedSource": "auto",
+                "actualSource": "sina",
+                "status": "done",
+                "selectionMode": "ai_t1_overnight",
+                "poolSize": 500,
+                "request": {"poolSize": 500, "runRole": "official"},
+                "market": {"runRole": "official", "marketSnapshotFreeze": {"snapshotDecisionUsable": True}},
+            }
+            old_id = db.create_t1_overnight_selection_run(base, [])
+            research_payload = dict(base)
+            research_payload["request"] = {"poolSize": 500, "runRole": "research"}
+            research_payload["market"] = {"runRole": "research", "marketSnapshotFreeze": {"snapshotDecisionUsable": True}}
+            research_id = db.create_t1_overnight_selection_run(research_payload, [])
+            new_payload = dict(base)
+            new_payload["request"] = {"poolSize": 500, "runRole": "research"}
+            new_payload["market"] = {"runRole": "research", "marketSnapshotFreeze": {"snapshotDecisionUsable": True}}
+            new_id = db.create_t1_overnight_selection_run(new_payload, [])
+            service = object.__new__(svc.T1OvernightSelectionService)
+            service.database = db
+            service.refresh_strategy_feedback = lambda **kwargs: {}
+            service.latest_strategy_feedback = lambda: {}
+            service.critic_status = lambda: {}
+            service.get_run = lambda run_id: db.load_t1_overnight_selection_run(run_id)
+            with patch.object(svc, "_requires_legacy_isolation", return_value=False), patch.object(
+                svc, "_run_signal_window_guard", return_value={"officialEligible": True}
+            ):
+                service.update_run_role(new_id, "official")
+            self.assertEqual(db.load_t1_overnight_selection_run(old_id)["request"]["runRole"], "research")
+            self.assertEqual(db.load_t1_overnight_selection_run(research_id)["request"]["runRole"], "research")
+            self.assertEqual(db.load_t1_overnight_selection_run(new_id)["request"]["runRole"], "official")
+            self.assertEqual(db.load_t1_overnight_selection_run(new_id)["market"]["replacedOfficialRunId"], old_id)
+
+    def test_failed_official_request_keeps_existing_official_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "t1.sqlite")
+            base = {
+                "recommendationDate": "2026-11-12",
+                "scanTime": "14:40",
+                "riskMode": "balanced",
+                "requestedSource": "auto",
+                "actualSource": "sina",
+                "status": "done",
+                "poolSize": 500,
+                "request": {"poolSize": 500, "runRole": "official"},
+                "market": {"runRole": "official", "marketSnapshotFreeze": {"snapshotDecisionUsable": True}},
+            }
+            old_id = db.create_t1_overnight_selection_run(dict(base, selectionMode="ai_t1_overnight"), [])
+            failed_payload = dict(base, selectionMode="ai_technical_failure_zero_pick")
+            failed_payload["request"] = {"poolSize": 500, "runRole": "research"}
+            failed_payload["market"] = {"runRole": "research", "marketSnapshotFreeze": {"snapshotDecisionUsable": True}}
+            failed_id = db.create_t1_overnight_selection_run(failed_payload, [])
+            service = object.__new__(svc.T1OvernightSelectionService)
+            service.database = db
+            with self.assertRaisesRegex(ValueError, "数据或技术失败"):
+                service.update_run_role(failed_id, "official")
+            self.assertEqual(db.load_t1_overnight_selection_run(old_id)["request"]["runRole"], "official")
+            self.assertEqual(db.load_t1_overnight_selection_run(failed_id)["request"]["runRole"], "research")
+
+    def test_technical_failure_top0_is_diagnostic_not_active_cash(self):
+        run = {
+            "status": "done",
+            "selectionMode": "ai_technical_failure_zero_pick",
+            "recommendationDate": "2026-10-14",
+            "scanTime": "14:40",
+            "finalCount": 0,
+            "request": {"runRole": "official", "poolSize": 500},
+            "market": {"runRole": "official"},
+        }
+        sample = svc._review_sample_meta(run, "zero_pick", "research", 0, 0, 0)
+        display = svc._review_display_meta(run, sample, "zero_pick", "research")
+        self.assertEqual(sample["sampleClass"], "technical_failure")
+        self.assertEqual(display["reviewStatus"], "diagnostic")
+        self.assertEqual(display["reviewStatusLabel"], "技术失败")
+
+    def test_historical_mock_run_is_read_as_data_unavailable_without_rewriting_saved_mode(self):
+        run = {
+            "id": 115,
+            "status": "done",
+            "selectionMode": "market_risk_zero_pick",
+            "actualSource": "mock",
+            "recommendationDate": "2026-11-10",
+            "scanTime": "14:40",
+            "finalCount": 0,
+            "finalPicks": [],
+            "request": {"runRole": "official", "poolSize": 500},
+            "market": {"runRole": "official", "mockStatus": {"used": True}},
+        }
+        self.assertEqual(run["selectionMode"], "market_risk_zero_pick")
+        self.assertEqual(svc._effective_selection_mode(run), "market_data_unavailable_zero_pick")
+        self.assertEqual(svc._run_role(run), "research")
+        sample = svc._review_sample_meta(run, "zero_pick", "research", 0, 0, 0)
+        self.assertEqual(sample["sampleClass"], "diagnostic")
+        self.assertEqual(sample["sampleLabel"], "真实行情不可用")
+        corrected = svc._apply_read_time_run_corrections(run)
+        self.assertEqual(corrected["storedSelectionMode"], "market_risk_zero_pick")
+        self.assertEqual(corrected["selectionMode"], "market_data_unavailable_zero_pick")
+        self.assertEqual(corrected["market"]["officialDecisionStatus"], "data_unavailable")
+        verification = svc._zero_pick_verification_result(corrected, {})
+        self.assertEqual(verification["status"], "data_unavailable")
+        self.assertFalse(verification["summary"]["zeroPick"])
+        self.assertEqual(verification["baselineComparison"], {})
+
+    def test_run_start_receipt_is_lightweight_and_returns_created_run_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "t1.sqlite")
+            run_id = db.create_t1_overnight_selection_run(
+                {
+                    "recommendationDate": "2026-11-12",
+                    "scanTime": "14:40",
+                    "riskMode": "balanced",
+                    "requestedSource": "auto",
+                    "status": "pending",
+                    "request": {"force": True, "poolSize": 500, "requestedRunRole": "research"},
+                    "market": {"runRole": "research"},
+                },
+                [],
+            )
+            service = object.__new__(svc.T1OvernightSelectionService)
+            service.database = db
+            receipt = service._run_start_receipt(run_id)
+            self.assertEqual(receipt["id"], run_id)
+            self.assertEqual(receipt["status"], "pending")
+            self.assertEqual(receipt["runRole"], "research")
+            self.assertNotIn("items", receipt)
+            self.assertNotIn("strategyFeedback", receipt)
+
+    def test_market_cash_has_priority_and_keeps_ai_research_status_separate(self):
+        run = {
+            "status": "done",
+            "selectionMode": "ai_technical_failure_zero_pick",
+            "recommendationDate": "2026-11-06",
+            "scanTime": "14:40",
+            "finalCount": 0,
+            "finalPicks": [],
+            "request": {"runRole": "official", "poolSize": 500},
+            "market": {
+                "runRole": "official",
+                "marketContext": {"state": "panic", "maxPickCount": 0},
+                "recommendationPolicy": {"maxPickCount": 0, "reason": "市场风险要求空仓"},
+            },
+            "batchSummary": [
+                {"batchIndex": 1, "pickCount": 0, "error": "", "aiZeroPick": True},
+                {"batchIndex": 2, "pickCount": 0, "error": "", "aiZeroPick": True},
+            ],
+        }
+        self.assertEqual(svc._effective_selection_mode(run), "market_risk_zero_pick")
+        self.assertFalse(svc._is_technical_failure_run(run))
+        self.assertEqual(svc._run_role(run), "official")
+        ai = svc._review_ai_decision_meta(run)
+        self.assertEqual(ai["status"], "research_ai_valid_zero_pick")
+        self.assertEqual(ai["label"], "AI研究正常 Top0")
+
+    def test_batch_top0_requires_every_batch_to_be_valid(self):
+        self.assertTrue(svc._all_batches_valid_zero_pick([
+            {"pickCount": 0, "error": "", "aiZeroPick": True},
+            {"pickCount": 0, "error": "", "aiZeroPick": True},
+        ]))
+        self.assertFalse(svc._all_batches_valid_zero_pick([]))
+        self.assertFalse(svc._all_batches_valid_zero_pick([
+            {"pickCount": 0, "error": "timeout", "aiZeroPick": False},
+        ]))
+
+    def test_strict_learning_eligibility_rejects_legacy_entry_model(self):
+        base = {
+            "validationVersion": svc.TRADEABLE_VALIDATION_VERSION,
+            "validationStatus": "final",
+            "entryModel": "formal_unit",
+            "executionProfile": {"version": "execution-v2"},
+            "dataQuality": {"grade": "A"},
+            "priceConsistency": {"ok": True},
+            "benchmarkReturnPct": 0.1,
+            "tradeable": {"primaryScenario": {
+                "scenarioKey": svc.PRIMARY_TRADEABLE_SCENARIO_KEY,
+                "dataStatus": "ok",
+                "netReturnPct": 0.5,
+            }},
+            "learningEligible": True,
+        }
+        self.assertTrue(svc._is_learning_eligible_outcome({"outcome": base}))
+        legacy = dict(base)
+        legacy.pop("entryModel")
+        self.assertFalse(svc._is_learning_eligible_outcome({"outcome": legacy}))
+
+    def test_historical_v2_is_visible_but_not_strict_learning(self):
+        historical = {
+            "validationVersion": "v2_tradeable",
+            "validationStatus": "final",
+            "dataQuality": {"grade": "A"},
+            "priceConsistency": {"ok": True},
+            "benchmarkReturnPct": 0.1,
+            "tradeable": {"primaryScenario": {
+                "scenarioKey": svc.PRIMARY_TRADEABLE_SCENARIO_KEY,
+                "dataStatus": "ok",
+                "netReturnPct": 0.5,
+            }},
+            "learningEligible": True,
+        }
+        item = {"outcome": historical}
+        self.assertFalse(svc._is_learning_eligible_outcome(item))
+        self.assertTrue(svc._is_historical_learning_outcome(item))
+
+    def test_review_stats_preserve_35_analyzable_runs_without_mixing_scopes(self):
+        current = [{
+            "reviewStatus": "learnable",
+            "selectionPolicyVersion": svc.selection_policy.VERSION,
+            "learningEligibleCount": 3 if index < 2 else 2,
+            "runRole": "official",
+            "exitTimingStats": [],
+        } for index in range(10)]
+        historical_strict = [{
+            "reviewStatus": "learnable",
+            "selectionPolicyVersion": "legacy",
+            "learningEligibleCount": count,
+            "runRole": "official",
+            "exitTimingStats": [],
+        } for count in (1, 2)]
+        historical_legacy = [{
+            "reviewStatus": "historical",
+            "historicalLearningEligibleCount": 3 if index < 3 else 2,
+            "runRole": "official",
+            "exitTimingStats": [],
+        } for index in range(23)]
+        stats = svc._review_stats(current + historical_strict + historical_legacy)
+        self.assertEqual(stats["currentStrictRuns"], 10)
+        self.assertEqual(stats["historicalAnalyzableRuns"], 25)
+        self.assertEqual(stats["totalAnalyzableRuns"], 35)
+        self.assertEqual(stats["historicalLegacyRuns"], 23)
+        self.assertEqual(stats["historicalLegacyOutcomes"], 49)
+        self.assertEqual(stats["totalAnalyzableOutcomes"], 74)
+
+    def test_benchmark_win_rate_is_primary_only_and_weightable(self):
+        outcomes = []
+        for net, excess in ((1.0, 0.4), (-0.5, -0.2), (0.2, 0.1)):
+            outcomes.append({
+                "excessReturnPct": excess,
+                "outcome": {"tradeable": {"scenarios": [
+                    {"scenarioKey": "open", "dataStatus": "ok", "netReturnPct": net + 0.1},
+                    {"scenarioKey": "open_15m", "dataStatus": "ok", "netReturnPct": net},
+                ]}},
+            })
+        rows = {row["scenarioKey"]: row for row in svc._exit_timing_stats(outcomes)}
+        self.assertIsNone(rows["open"]["benchmarkWinRate"])
+        self.assertEqual(rows["open"]["benchmarkReadyCount"], 0)
+        self.assertEqual(rows["open_15m"]["benchmarkWinCount"], 2)
+        self.assertEqual(rows["open_15m"]["benchmarkReadyCount"], 3)
+        self.assertEqual(rows["open_15m"]["benchmarkWinRate"], 66.7)
+
+    def test_primary_timing_uses_frozen_primary_instead_of_stale_duplicate_scenario(self):
+        item = {"outcome": {"tradeable": {
+            "primaryScenario": {"scenarioKey": "open_15m", "dataStatus": "ok", "netReturnPct": 0.8},
+            "scenarios": [{"scenarioKey": "open_15m", "dataStatus": "minute_missing", "netReturnPct": None}],
+        }}}
+        self.assertEqual(svc._outcome_scenario_by_key(item, "open_15m")["netReturnPct"], 0.8)
+
+    def test_review_filters_before_applying_list_limit(self):
+        runs = [
+            {
+                "id": run_id,
+                "reviewStatus": "diagnostic" if run_id <= 10 else "reviewable",
+                "selectionPolicyVersion": svc.T1_STRATEGY_POLICY_VERSION,
+                "learningEligibleCount": 0,
+                "exitTimingStats": [],
+            }
+            for run_id in range(1, 21)
+        ]
+        service = object.__new__(svc.T1OvernightSelectionService)
+        service.database = SimpleNamespace(
+            list_t1_overnight_selection_runs=lambda limit, status: runs,
+            load_t1_overnight_selection_run=lambda run_id: next((row for row in runs if row["id"] == run_id), None),
+        )
+        service._review_run_summary = lambda run: dict(run)
+        service._review_run_detail = lambda run: dict(run) if run else None
+        service.validation_auto_freeze_status = lambda: {}
+        result = service.review(limit=5, review_status="reviewable")
+        self.assertEqual(result["count"], 5)
+        self.assertEqual(result["matchingCount"], 10)
+        self.assertEqual([row["id"] for row in result["runs"]], [11, 12, 13, 14, 15])
+        self.assertEqual(result["selectedRunId"], 11)
+
     def test_weekday_trade_date_allows_official(self):
         status = svc._t1_trade_date_status("2026-08-03", "14:40")
         self.assertEqual(status["eligibility"], "official_allowed")
         self.assertFalse(svc._t1_trade_date_blocks_official(status))
+
+    def test_exchange_calendar_holiday_blocks_official(self):
+        calendar = {
+            "start": "2026-09-01",
+            "end": "2026-11-01",
+            "openDates": ["2026-09-30", "2026-10-08"],
+            "source": "SSE/tushare",
+            "version": "fixture-2026",
+        }
+        status = svc._t1_trade_date_status(
+            "2026-10-01",
+            "14:40",
+            actual_source="sina",
+            market={"marketSnapshotFreeze": {"generatedAt": "2026-10-01T14:40:00"}},
+            exchange_calendar=calendar,
+        )
+        self.assertEqual(status["status"], "non_trading_exchange_calendar")
+        self.assertEqual(status["eligibility"], "official_blocked")
+        self.assertFalse(status["isTradingDay"])
+        self.assertTrue(status["calendarCovered"])
+
+    def test_official_sse_holiday_fallback_blocks_without_exchange_calendar(self):
+        status = svc._t1_trade_date_status(
+            "2026-10-01",
+            "14:40",
+            actual_source="sina",
+            market={"marketSnapshotFreeze": {"generatedAt": "2026-10-01T14:40:00"}},
+        )
+        self.assertEqual(status["status"], "non_trading_official_holiday")
+        self.assertEqual(status["eligibility"], "official_blocked")
+        self.assertFalse(status["isTradingDay"])
+
+    def test_exchange_calendar_open_day_allows_matching_quote_date(self):
+        calendar = {
+            "start": "2026-09-01",
+            "end": "2026-11-01",
+            "openDates": ["2026-10-08"],
+            "source": "SSE/tushare",
+            "version": "fixture-2026",
+        }
+        status = svc._t1_trade_date_status(
+            "2026-10-08",
+            "14:40",
+            actual_source="sina",
+            market={"dataAsOfDate": "2026-10-08"},
+            exchange_calendar=calendar,
+        )
+        self.assertEqual(status["status"], "confirmed_trading_day")
+        self.assertEqual(status["eligibility"], "official_allowed")
+        self.assertTrue(status["isTradingDay"])
+
+    def test_snapshot_generated_at_is_not_treated_as_market_trade_date(self):
+        market = {
+            "marketSnapshotFreeze": {"generatedAt": "2026-10-01T14:40:00"},
+            "cacheStatus": {"generatedAt": "2026-10-01T14:40:00"},
+        }
+        self.assertEqual(svc._t1_market_data_as_of_date(market), "")
+
+    def test_quote_consensus_exposes_stale_pre_holiday_trade_date(self):
+        stocks = [SimpleNamespace(trade_date="2026-09-30") for _ in range(100)]
+        self.assertEqual(svc._t1_stock_data_as_of_date(stocks), "2026-09-30")
+        incomplete = stocks[:79] + [SimpleNamespace(trade_date="") for _ in range(21)]
+        self.assertEqual(svc._t1_stock_data_as_of_date(incomplete), "")
+        status = svc._t1_trade_date_status(
+            "2026-10-01",
+            "14:40",
+            actual_source="sina",
+            market={"dataAsOfDate": svc._t1_stock_data_as_of_date(stocks)},
+        )
+        self.assertEqual(status["status"], "data_date_mismatch")
+        self.assertEqual(status["eligibility"], "official_blocked")
 
     def test_non_trading_run_is_diagnostic_even_with_tradeable_result(self):
         sample = svc._review_sample_meta(
@@ -53,6 +465,46 @@ class T1OvernightSemanticsTest(unittest.TestCase):
         self.assertEqual(sample["sampleClass"], "partial")
         self.assertEqual(display["reviewStatus"], "partial")
         self.assertEqual(display["reviewStatusLabel"], "部分缺数据")
+
+    def test_partial_execution_has_its_own_review_label(self):
+        sample = svc._review_sample_meta(
+            run={"recommendationDate": "2026-08-03", "scanTime": "14:40", "status": "done"},
+            outcome_status="verified",
+            run_role="official",
+            tradeable_count=1,
+            outcome_count=1,
+            learning_eligible_count=0,
+            primary_partial_execution_count=1,
+        )
+        display = svc._review_display_meta({}, sample, "verified", "official")
+        self.assertEqual(sample["sampleClass"], "usable")
+        self.assertEqual(sample["sampleLabel"], "部分成交样本")
+        self.assertEqual(display["reviewStatusLabel"], "部分成交样本")
+        self.assertEqual(display["reviewStatusTone"], "warn")
+
+    def test_portfolio_keeps_true_empty_slot_as_cash_but_rejects_missing_component_data(self):
+        complete = {
+            "code": "000001",
+            "aiRank": 1,
+            "tradeable": {"primaryScenario": {"dataStatus": "ok", "netReturnPct": 3.0}},
+            "tradeReturnEligible": True,
+            "recommendationQualityEligible": True,
+        }
+        two_pick = svc._portfolio_comparison([complete, {**complete, "code": "000002", "aiRank": 2}])
+        self.assertEqual(two_pick["cashSlots"], 1)
+        self.assertEqual(two_pick["portfolioReturnPct"], 2.0)
+        missing = {
+            "code": "000003",
+            "aiRank": 3,
+            "tradeable": {"primaryScenario": {"dataStatus": "minute_missing", "netReturnPct": None}},
+            "tradeReturnEligible": False,
+            "recommendationQualityEligible": True,
+        }
+        incomplete = svc._portfolio_comparison([complete, {**complete, "code": "000002", "aiRank": 2}, missing])
+        self.assertEqual(incomplete["cashSlots"], 0)
+        self.assertEqual(incomplete["dataMissingSlots"], 1)
+        self.assertIsNone(incomplete["portfolioReturnPct"])
+        self.assertEqual(incomplete["status"], "data_insufficient")
 
     def test_data_insufficient_official_run_is_partial_not_diagnostic(self):
         sample = svc._review_sample_meta(
@@ -122,7 +574,7 @@ class T1OvernightSemanticsTest(unittest.TestCase):
         )
         self.assertTrue(any("正式推荐发布后的分钟成交证据" in reason for reason in reasons))
 
-    def test_post_publish_minute_produces_strict_entry_execution(self):
+    def test_formal_entry_does_not_depend_on_board_lot_capacity(self):
         result = svc._simulated_entry_execution(
             run={
                 "recommendationDate": "2026-10-14",
@@ -131,11 +583,14 @@ class T1OvernightSemanticsTest(unittest.TestCase):
             },
             buy_reference=10.0,
             recommendation_minute_series=[
-                {"time": "2026-10-14 14:42", "open": 10.1, "close": 10.2, "volume": 5000}
+                {"time": "2026-10-14 14:42", "timeLabel": "end", "open": 10.1, "close": 10.2, "volume": 1, "amount": 10.2},
+                {"time": "2026-10-14 14:43", "timeLabel": "end", "open": 10.2, "close": 10.3, "volume": 1, "amount": 10.3},
             ],
         )
-        self.assertEqual(result["status"], "executed_from_minute")
+        self.assertEqual(result["status"], "formal_entry_priced")
         self.assertTrue(result["executable"])
+        self.assertEqual(result["entryTime"], "2026-10-14T14:43:00")
+        self.assertNotIn("filledQuantity", result)
 
     def test_legacy_recommendation_snapshot_cannot_become_strict_entry_evidence(self):
         outcome = svc._build_outcome(
@@ -161,12 +616,27 @@ class T1OvernightSemanticsTest(unittest.TestCase):
             ],
             entry_execution_minute_series=[],
         )
-        self.assertEqual(outcome["entryExecution"]["status"], "reference_price_without_minute")
+        self.assertEqual(outcome["entryExecution"]["status"], "entry_price_evidence_missing")
         self.assertFalse(outcome["learningEligible"])
 
     def test_dedicated_post_publish_snapshot_can_become_strict_entry_evidence(self):
         post_publish = [
-            {"time": "2026-10-12 14:42", "open": 10.02, "close": 10.03, "volume": 5000}
+            {
+                "time": "2026-10-12 14:42",
+                "timeLabel": "end",
+                "open": 10.02,
+                "close": 10.03,
+                "volume": 1000,
+                "amount": 10.03 * 1000,
+            },
+            {
+                "time": "2026-10-12 14:43",
+                "timeLabel": "end",
+                "open": 10.02,
+                "close": 10.03,
+                "volume": 500000,
+                "amount": 10.03 * 500000,
+            }
         ]
         outcome = svc._build_outcome(
             run={
@@ -189,8 +659,97 @@ class T1OvernightSemanticsTest(unittest.TestCase):
             recommendation_minute_series=post_publish,
             entry_execution_minute_series=post_publish,
         )
-        self.assertEqual(outcome["entryExecution"]["status"], "executed_from_minute")
+        self.assertEqual(outcome["entryExecution"]["status"], "formal_entry_priced")
         self.assertTrue(outcome["learningEligible"])
+
+    def test_formal_entry_ignores_capital_participation_and_remains_learnable(self):
+        post_publish = [
+            {
+                "time": "2026-10-12 14:42",
+                "timeLabel": "end",
+                "open": 10.02,
+                "close": 10.03,
+                "volume": 1000,
+                "amount": 10.03 * 1000,
+            },
+            {
+                "time": "2026-10-12 14:43",
+                "timeLabel": "end",
+                "open": 10.02,
+                "close": 10.03,
+                "volume": 100000,
+                "amount": 10.03 * 100000,
+            },
+        ]
+        outcome = svc._build_outcome(
+            run={
+                "id": 96,
+                "recommendationDate": "2026-10-12",
+                "scanTime": "14:40",
+                "market": {"decisionTiming": {"signalPublishedAt": "2026-10-12T14:41:00"}},
+            },
+            pick={"code": "000001", "name": "测试股", "price": 10.0, "dataQuality": {"grade": "A"}},
+            series=[
+                {"date": "2026-10-12", "open": 9.8, "high": 10.1, "low": 9.7, "close": 10.0},
+                {"date": "2026-10-13", "open": 10.1, "high": 10.3, "low": 9.9, "close": 10.2},
+            ],
+            minute_series=[
+                {"time": "2026-10-13 09:45", "timeLabel": "end", "open": 10.1, "high": 10.2, "low": 10.0, "close": 10.15, "volume": 100000, "amount": 10.15 * 100000}
+            ],
+            data_source="daily_test",
+            minute_source="minute_test",
+            verified_at="2026-10-13T15:10:00",
+            recommendation_minute_series=post_publish,
+            entry_execution_minute_series=post_publish,
+        )
+        primary = outcome["tradeable"]["primaryScenario"]
+        self.assertEqual(outcome["entryExecution"]["status"], "formal_entry_priced")
+        self.assertNotIn("filledQuantity", outcome["entryExecution"])
+        self.assertIsNotNone(primary["netReturnPct"])
+        self.assertTrue(outcome["learningEligible"])
+
+    def test_shadow_stress_fallback_keeps_stats_without_formal_entry_evidence(self):
+        outcome = svc._build_outcome(
+            run={
+                "id": 97,
+                "recommendationDate": "2026-10-14",
+                "scanTime": "14:40",
+                "market": {"decisionTiming": {"signalPublishedAt": "2026-10-14T14:41:00"}},
+            },
+            pick={"code": "000001", "name": "影子股", "price": 10.0, "dataQuality": {"grade": "A"}},
+            series=[
+                {"date": "2026-10-14", "open": 9.8, "high": 10.1, "low": 9.7, "close": 10.0},
+                {"date": "2026-10-15", "open": 10.1, "high": 10.3, "low": 9.9, "close": 10.2},
+            ],
+            minute_series=[
+                {"time": "2026-10-15 09:45", "open": 10.1, "high": 10.2, "low": 10.0, "close": 10.15, "volume": 100000, "amount": 10.15 * 100000}
+            ],
+            data_source="daily_test",
+            minute_source="minute_test",
+            verified_at="2026-10-15T15:10:00",
+            recommendation_minute_series=[
+                {"time": "2026-10-14 14:40", "timeLabel": "end", "open": 9.98, "close": 10.0, "volume": 5000}
+            ],
+            entry_execution_minute_series=[],
+            entry_model="stress_participation",
+        )
+        self.assertEqual(outcome["entryExecution"]["status"], "stress_reference_price")
+        self.assertEqual(outcome["entryModel"], "stress_participation")
+        self.assertIsNotNone(outcome["tradeable"]["primaryScenario"]["netReturnPct"])
+        self.assertFalse(outcome["learningEligible"])
+
+    def test_no_post_publish_execution_after_cutoff_remains_unexecutable(self):
+        result = svc._simulated_entry_execution(
+            run={
+                "recommendationDate": "2026-10-12",
+                "scanTime": "14:56",
+                "market": {"decisionTiming": {"signalPublishedAt": "2026-10-12T14:56:00"}},
+            },
+            buy_reference=10.0,
+            recommendation_minute_series=[],
+        )
+        self.assertEqual(result["status"], "entry_not_executable")
+        self.assertFalse(result["executable"])
 
     def test_learnable_ai_semifinal_rules_final_keeps_ai_scope_separate(self):
         sample = {

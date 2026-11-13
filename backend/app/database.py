@@ -1166,6 +1166,68 @@ class Database:
                   SELECT RAISE(ABORT, 'risk policy events are append-only');
                 END;
 
+                CREATE TABLE IF NOT EXISTS t1_overnight_strategy_deployment_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  revision INTEGER NOT NULL,
+                  event_type TEXT NOT NULL,
+                  previous_state TEXT NOT NULL DEFAULT '',
+                  next_state TEXT NOT NULL DEFAULT '',
+                  current_official_version TEXT NOT NULL DEFAULT '',
+                  target_strategy_version TEXT NOT NULL DEFAULT '',
+                  effective_from_trade_date TEXT NOT NULL DEFAULT '',
+                  first_effective_run_id INTEGER NOT NULL DEFAULT 0,
+                  actor TEXT NOT NULL DEFAULT 'system',
+                  reason TEXT NOT NULL DEFAULT '',
+                  detail_json TEXT NOT NULL DEFAULT '{}',
+                  created_at TEXT NOT NULL,
+                  UNIQUE(revision, event_type)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_strategy_deployment_events_created
+                  ON t1_overnight_strategy_deployment_events(created_at DESC, id DESC);
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_strategy_deployment_events_no_update
+                BEFORE UPDATE ON t1_overnight_strategy_deployment_events
+                BEGIN
+                  SELECT RAISE(ABORT, 'strategy deployment events are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_strategy_deployment_events_no_delete
+                BEFORE DELETE ON t1_overnight_strategy_deployment_events
+                BEGIN
+                  SELECT RAISE(ABORT, 'strategy deployment events are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS t1_overnight_v3_replay_reports (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  replay_version TEXT NOT NULL,
+                  period_start TEXT NOT NULL DEFAULT '',
+                  period_end TEXT NOT NULL DEFAULT '',
+                  run_count INTEGER NOT NULL DEFAULT 0,
+                  grade_a_count INTEGER NOT NULL DEFAULT 0,
+                  grade_b_count INTEGER NOT NULL DEFAULT 0,
+                  grade_c_count INTEGER NOT NULL DEFAULT 0,
+                  exact_outcome_count INTEGER NOT NULL DEFAULT 0,
+                  report_hash TEXT NOT NULL,
+                  report_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_t1_v3_replay_reports_created
+                  ON t1_overnight_v3_replay_reports(created_at DESC, id DESC);
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_v3_replay_reports_no_update
+                BEFORE UPDATE ON t1_overnight_v3_replay_reports
+                BEGIN
+                  SELECT RAISE(ABORT, 'V3 replay reports are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_t1_v3_replay_reports_no_delete
+                BEFORE DELETE ON t1_overnight_v3_replay_reports
+                BEGIN
+                  SELECT RAISE(ABORT, 'V3 replay reports are append-only');
+                END;
+
                 CREATE TABLE IF NOT EXISTS t1_overnight_strategy_feedback (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   feedback_date TEXT NOT NULL,
@@ -1388,6 +1450,48 @@ class Database:
                 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
                 """,
                 (key, json.dumps(value, ensure_ascii=False), now),
+            )
+
+    def acquire_app_lease(self, key: str, owner: str, lease_seconds: int = 180) -> bool:
+        now = datetime.now()
+        expires_at = (now + timedelta(seconds=max(10, int(lease_seconds or 180)))).isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT value_json FROM app_settings WHERE key=?", (key,)).fetchone()
+            current = _json_or_default(row["value_json"], {}) if row else {}
+            current_owner = str(current.get("owner") or "")
+            try:
+                current_expiry = datetime.fromisoformat(str(current.get("expiresAt") or ""))
+            except ValueError:
+                current_expiry = datetime.min
+            if current_owner and current_owner != owner and current_expiry > now:
+                connection.rollback()
+                return False
+            payload = json.dumps(
+                {"owner": owner, "acquiredAt": now.isoformat(timespec="seconds"), "expiresAt": expires_at},
+                ensure_ascii=False,
+            )
+            connection.execute(
+                """
+                INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
+                ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at
+                """,
+                (key, payload, now.isoformat(timespec="seconds")),
+            )
+        return True
+
+    def release_app_lease(self, key: str, owner: str) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT value_json FROM app_settings WHERE key=?", (key,)).fetchone()
+            current = _json_or_default(row["value_json"], {}) if row else {}
+            if str(current.get("owner") or "") != owner:
+                connection.rollback()
+                return
+            connection.execute(
+                "UPDATE app_settings SET value_json=?,updated_at=? WHERE key=?",
+                (json.dumps({"owner": "", "releasedAt": now, "expiresAt": now}), now, key),
             )
 
     def upsert_daily_kline_series(self, code: str, series: List[Dict[str, Any]], source: str = "") -> int:
@@ -3660,6 +3764,14 @@ class Database:
             code = str(item.get("code") or "").zfill(6)
             if not code:
                 continue
+            canonical_item = item.get("item") or item
+            role_reference = {
+                "schemaVersion": "t1_role_reference_v1",
+                "candidateRef": f"{int(run_id)}:{code}",
+                "code": code,
+                "role": str(stage or ""),
+                "rank": int(item.get("aiRank") or item.get("rank") or index),
+            }
             rows.append(
                 (
                     run_id,
@@ -3678,8 +3790,8 @@ class Database:
                     str(item.get("sellPlan") or ""),
                     str(item.get("risk") or ""),
                     str(item.get("invalidCondition") or ""),
-                    json.dumps(item.get("item") or item, ensure_ascii=False),
-                    json.dumps(item, ensure_ascii=False),
+                    json.dumps(canonical_item, ensure_ascii=False),
+                    json.dumps(role_reference, ensure_ascii=False),
                 )
             )
         if not rows:
@@ -3735,6 +3847,35 @@ class Database:
                 LIMIT 1
                 """,
                 (risk_mode, requested_source),
+            ).fetchone()
+        return self._t1_overnight_run_from_row(row) if row else None
+
+    def find_t1_run_by_client_request_id(self, recommendation_date: str, client_request_id: str) -> Optional[Dict[str, Any]]:
+        if not str(client_request_id or "").strip():
+            return None
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM t1_overnight_selection_runs
+                WHERE recommendation_date=?
+                  AND json_extract(request_json, '$.clientRequestId')=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (str(recommendation_date), str(client_request_id)),
+            ).fetchone()
+        return self._t1_overnight_run_from_row(row) if row else None
+
+    def find_active_t1_regeneration(self, recommendation_date: str, base_run_id: int = 0) -> Optional[Dict[str, Any]]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM t1_overnight_selection_runs
+                WHERE recommendation_date=? AND status IN ('pending','running')
+                  AND COALESCE(json_extract(request_json, '$.force'), 0)=1
+                  AND (?=0 OR COALESCE(json_extract(request_json, '$.baseRunId'), 0)=?)
+                ORDER BY id DESC LIMIT 1
+                """,
+                (str(recommendation_date), int(base_run_id or 0), int(base_run_id or 0)),
             ).fetchone()
         return self._t1_overnight_run_from_row(row) if row else None
 
@@ -4674,6 +4815,123 @@ class Database:
             for row in rows
         ]
 
+    def save_t1_strategy_deployment_transition(
+        self,
+        setting_key: str,
+        expected_revision: int,
+        state: Dict[str, Any],
+        event: Dict[str, Any],
+    ) -> bool:
+        now = str(event.get("createdAt") or datetime.now().isoformat(timespec="seconds"))
+        payload = json.dumps(state, ensure_ascii=False)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value_json FROM app_settings WHERE key=?",
+                (str(setting_key),),
+            ).fetchone()
+            current = _json_or_default(row["value_json"], {}) if row else {}
+            current_revision = int(current.get("deploymentRevision") or current.get("revision") or 0)
+            if current_revision != int(expected_revision or 0):
+                connection.rollback()
+                return False
+            if row:
+                connection.execute(
+                    "UPDATE app_settings SET value_json=?,updated_at=? WHERE key=?",
+                    (payload, now, str(setting_key)),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)",
+                    (str(setting_key), payload, now),
+                )
+            connection.execute(
+                """INSERT INTO t1_overnight_strategy_deployment_events(
+                  revision,event_type,previous_state,next_state,
+                  current_official_version,target_strategy_version,
+                  effective_from_trade_date,first_effective_run_id,
+                  actor,reason,detail_json,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    int(state.get("deploymentRevision") or state.get("revision") or 0),
+                    str(event.get("eventType") or "state_transition"),
+                    str(event.get("previousState") or ""),
+                    str(event.get("nextState") or state.get("lifecycleState") or ""),
+                    str(state.get("currentOfficialVersion") or ""),
+                    str(state.get("targetStrategyVersion") or ""),
+                    str(state.get("effectiveFromTradeDate") or ""),
+                    int(state.get("firstEffectiveRunId") or 0),
+                    str(event.get("actor") or "system"),
+                    str(event.get("reason") or state.get("reason") or ""),
+                    json.dumps(event.get("detail") or {}, ensure_ascii=False),
+                    now,
+                ),
+            )
+        return True
+
+    def list_t1_strategy_deployment_events(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM t1_overnight_strategy_deployment_events
+                ORDER BY id DESC LIMIT ?""",
+                (max(1, int(limit or 50)),),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "deploymentRevision": int(row["revision"] or 0),
+                "eventType": row["event_type"],
+                "previousState": row["previous_state"],
+                "nextState": row["next_state"],
+                "currentOfficialVersion": row["current_official_version"],
+                "targetStrategyVersion": row["target_strategy_version"],
+                "effectiveFromTradeDate": row["effective_from_trade_date"],
+                "firstEffectiveRunId": int(row["first_effective_run_id"] or 0),
+                "actor": row["actor"],
+                "reason": row["reason"],
+                "detail": _json_or_default(row["detail_json"], {}),
+                "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def append_t1_v3_replay_report(self, report: Dict[str, Any]) -> int:
+        """Append a research-only replay report; historical recommendation rows stay untouched."""
+        now = str(report.get("createdAt") or datetime.now().isoformat(timespec="seconds"))
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO t1_overnight_v3_replay_reports(
+                  replay_version,period_start,period_end,run_count,
+                  grade_a_count,grade_b_count,grade_c_count,exact_outcome_count,
+                  report_hash,report_json,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(report.get("replayVersion") or ""),
+                    str(report.get("periodStart") or ""),
+                    str(report.get("periodEnd") or ""),
+                    int(report.get("runCount") or 0),
+                    int((report.get("gradeCounts") or {}).get("A") or 0),
+                    int((report.get("gradeCounts") or {}).get("B") or 0),
+                    int((report.get("gradeCounts") or {}).get("C") or 0),
+                    int(report.get("exactOutcomeCount") or 0),
+                    str(report.get("reportHash") or ""),
+                    json.dumps(report, ensure_ascii=False),
+                    now,
+                ),
+            )
+        return int(cursor.lastrowid or 0)
+
+    def latest_t1_v3_replay_report(self) -> Optional[Dict[str, Any]]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM t1_overnight_v3_replay_reports ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            return None
+        report = _json_or_default(row["report_json"], {})
+        report.update(id=int(row["id"]), createdAt=row["created_at"])
+        return report
+
     def count_t1_overnight_completed_runs(self) -> int:
         with self.connect() as connection:
             rows = connection.execute(
@@ -4771,7 +5029,7 @@ class Database:
             quality = payload.get("dataQuality") or {}
             primary = ((payload.get("tradeable") or {}).get("primaryScenario") or {})
             if (
-                payload.get("validationVersion") == "v2_tradeable"
+                payload.get("validationVersion") == "v3_unit_return"
                 and payload.get("validationStatus") == "final"
                 and quality.get("grade") in {"A", "B"}
                 and primary.get("scenarioKey") == "open_15m"
@@ -5163,6 +5421,10 @@ class Database:
             "market": run["market"],
             "request": run["request"],
             "finalPicks": run["finalPicks"],
+            # Needed by review-time status correction so a valid batch Top0 is
+            # not counted as a technical failure when the market already
+            # required an official cash position.
+            "batchSummary": run["batchSummary"],
             "outcomeCount": int(row["outcome_count"] or 0),
             "verifiedOutcomeCount": int(row["verified_outcome_count"] or 0),
             "successCount": int(row["success_count"] or 0),
@@ -5378,6 +5640,28 @@ class Database:
 
     def _t1_overnight_item_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         stage = row["stage"]
+        item_payload = _json_or_default(row["item_json"], {})
+        stored_pick = _json_or_default(row["pick_json"], {})
+        if str(stored_pick.get("schemaVersion") or "") == "t1_role_reference_v1":
+            pick_payload = {
+                **item_payload,
+                "code": row["code"],
+                "name": row["name"],
+                "poolRank": int(row["pool_rank"] or 0),
+                "aiRank": int(row["ai_rank"] or 0),
+                "batchIndex": int(row["batch_index"] or 0),
+                "candidateType": row["candidate_type"],
+                "score": row["score"],
+                "confidence": row["confidence"],
+                "reason": row["reason"],
+                "buyPlan": row["buy_plan"],
+                "sellPlan": row["sell_plan"],
+                "risk": row["risk"],
+                "invalidCondition": row["invalid_condition"],
+                "candidateRef": stored_pick.get("candidateRef") or "",
+            }
+        else:
+            pick_payload = stored_pick
         return {
             "runId": int(row["run_id"]),
             "code": row["code"],
@@ -5395,8 +5679,8 @@ class Database:
             "sellPlan": row["sell_plan"],
             "risk": row["risk"],
             "invalidCondition": row["invalid_condition"],
-            "item": _json_or_default(row["item_json"], {}),
-            "pick": _json_or_default(row["pick_json"], {}),
+            "item": item_payload,
+            "pick": pick_payload,
         }
 
     def _t1_overnight_outcome_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:

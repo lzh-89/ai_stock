@@ -6,9 +6,10 @@ const state = {
   loading: false,
   loadGeneration: 0,
   actionNotice: "",
-  shadowFamily: "legacy_tail_rule",
-  shadowRole: "tail_rule",
+  shadowFamily: "v3_main_experiment",
+  shadowRole: "v3_main",
   shadowWindow: "all",
+  shadowSliceKey: "",
   shadowPayload: null,
   shadowLoadGeneration: 0
 };
@@ -24,6 +25,7 @@ const els = {
   reviewNote: document.querySelector("#reviewNote"),
   shadowFamilyTabs: document.querySelector("#shadowFamilyTabs"),
   shadowRoleSelect: document.querySelector("#shadowRoleSelect"),
+  shadowSliceSelect: document.querySelector("#shadowSliceSelect"),
   shadowWindowSelect: document.querySelector("#shadowWindowSelect"),
   shadowAnalyticsNotice: document.querySelector("#shadowAnalyticsNotice"),
   shadowAnalyticsMetrics: document.querySelector("#shadowAnalyticsMetrics"),
@@ -108,12 +110,18 @@ function bindEvents() {
     if (!button) return;
     state.shadowFamily = normalizeShadowFamily(button.dataset.shadowFamily);
     state.shadowRole = defaultShadowRole(state.shadowFamily);
+    state.shadowSliceKey = "";
     populateShadowRoles();
     loadShadowAnalytics();
   });
   els.shadowRoleSelect?.addEventListener("change", () => {
     state.shadowRole = els.shadowRoleSelect.value || defaultShadowRole(state.shadowFamily);
+    state.shadowSliceKey = "";
     loadShadowAnalytics();
+  });
+  els.shadowSliceSelect?.addEventListener("change", () => {
+    state.shadowSliceKey = els.shadowSliceSelect.value || "";
+    renderShadowAnalytics();
   });
   els.shadowWindowSelect?.addEventListener("change", () => {
     state.shadowWindow = normalizeShadowWindow(els.shadowWindowSelect.value);
@@ -131,7 +139,8 @@ const SHADOW_ROLES = {
     { value: "policy_rank3", label: "第三槽" },
     { value: "policy_net_expectation", label: "净期望排序" },
     { value: "policy_adaptive_exit", label: "动态退出" }
-  ]
+  ],
+  v3_main_experiment: [{ value: "v3_main", label: "V3 主策略 vs 当前正式" }]
 };
 
 init();
@@ -159,6 +168,7 @@ async function loadShadowAnalytics() {
     if (generation !== state.shadowLoadGeneration) return;
     if (!response.ok) throw new Error(payload.error || `API ${response.status}`);
     state.shadowPayload = payload;
+    populateShadowSlices(payload.roles || []);
     renderShadowAnalytics();
     syncUrl();
   } catch (error) {
@@ -174,11 +184,35 @@ async function loadShadowAnalytics() {
   }
 }
 
+function shadowSliceKey(report) {
+  return `${report.strategyPolicyVersion || ""}::${report.executionProfileVersion || ""}`;
+}
+
+function populateShadowSlices(reports) {
+  if (!els.shadowSliceSelect) return;
+  const rows = Array.isArray(reports) ? reports : [];
+  if (!rows.some((report) => shadowSliceKey(report) === state.shadowSliceKey)) {
+    state.shadowSliceKey = rows[0] ? shadowSliceKey(rows[0]) : "";
+  }
+  els.shadowSliceSelect.innerHTML = rows.length
+    ? rows.map((report) => {
+      const key = shadowSliceKey(report);
+      const dates = report.firstUsableDate || report.lastUsableDate
+        ? ` · ${report.firstUsableDate || "--"}～${report.lastUsableDate || "--"}`
+        : "";
+      return `<option value="${escapeHtml(key)}">${escapeHtml(report.strategyPolicyVersion || "未标版本")} / ${escapeHtml(report.executionProfileVersion || "未标执行版本")}${escapeHtml(dates)}</option>`;
+    }).join("")
+    : `<option value="">暂无版本</option>`;
+  els.shadowSliceSelect.value = state.shadowSliceKey;
+}
+
 function renderShadowAnalytics() {
   const payload = state.shadowPayload || {};
-  const report = (payload.roles || [])[0] || {};
+  const reports = payload.roles || [];
+  const report = reports.find((item) => shadowSliceKey(item) === state.shadowSliceKey) || reports[0] || {};
   const facts = [...(payload.facts || [])]
     .filter((fact) => !report.strategyPolicyVersion || fact.strategyPolicyVersion === report.strategyPolicyVersion)
+    .filter((fact) => !report.executionProfileVersion || fact.executionProfileVersion === report.executionProfileVersion)
     .reverse();
   els.shadowFamilyTabs?.querySelectorAll("[data-shadow-family]").forEach((button) => {
     const active = button.dataset.shadowFamily === state.shadowFamily;
@@ -188,22 +222,35 @@ function renderShadowAnalytics() {
   const source = payload.sourceType === "historical_backfill" ? "历史数据已重建" : "从新策略版本开始前向累计";
   const coverage = report.coveragePct == null ? "暂无覆盖数据" : `覆盖率 ${formatRate(report.coveragePct)}`;
   if (els.shadowAnalyticsNotice) {
-    els.shadowAnalyticsNotice.textContent = `${payload.description || "各影子角色独立统计。"} ${source}；${coverage}。最后计算 ${payload.generatedAt || "--"}。`;
+    const dateScope = report.firstUsableDate || report.lastUsableDate
+      ? `统计日期 ${report.firstUsableDate || "--"} 至 ${report.lastUsableDate || "--"}`
+      : "暂无完整收益日期";
+    els.shadowAnalyticsNotice.textContent = `${payload.description || "各影子角色独立统计。"} ${source}；${dateScope}；${coverage}。最后计算 ${payload.generatedAt || "--"}。`;
   }
   if (els.shadowAnalyticsMetrics) {
+    const cumulativeMeaning = state.shadowFamily === "legacy_tail_rule" || state.shadowFamily === "legacy_tail_ai"
+      ? "三槽组合复利，空槽按现金"
+      : "仅统计适用且处理/控制结果完整的同日样本";
+    const positiveRateNote = report.positiveEffectiveDayRate == null
+      ? `盈亏比 ${formatNumber(report.profitLossRatio, 2)}`
+      : `含主动空仓的有效日正收益率 ${formatRate(report.positiveEffectiveDayRate)}`;
     els.shadowAnalyticsMetrics.innerHTML = [
-      metricCard("有效交易日", formatInteger(report.effectiveDays || 0), `目标日 ${formatInteger(report.targetTradeDays || 0)} · 命中 ${formatInteger(report.hitDays || 0)}`),
-      metricCard("累计净收益", formatPct(report.cumulativeReturnPct), "三槽组合复利，空槽按现金"),
+      metricCard("收益有效日", formatInteger(report.effectiveDays || 0), `计划日 ${formatInteger(report.targetTradeDays || 0)} · 完整持仓日 ${formatInteger(report.holdingDays || 0)}`),
+      metricCard("累计净收益", formatPct(report.cumulativeReturnPct), cumulativeMeaning),
       metricCard("日均净收益", formatPct(report.avgDailyNetReturnPct), `中位数 ${formatPct(report.medianDailyNetReturnPct)}`),
-      metricCard("持仓日正收益率", formatRate(report.positiveHoldingDayRate), `盈亏比 ${formatNumber(report.profitLossRatio, 2)}`),
+      metricCard("持仓日正收益率", formatRate(report.positiveHoldingDayRate), positiveRateNote),
       metricCard("最大回撤", formatPct(report.maxDrawdownPct), `最差 10% ${formatPct(report.worst10Pct)}`),
       metricCard("同日配对改善", formatPct(report.avgPairedDeltaPct), report.comparisonLabel || "诊断角色不解释为因果增益"),
-      metricCard("避免亏损", formatPct(report.avoidedLossPct), `错过盈利 ${formatPct(report.missedProfitPct)}`),
-      metricCard("评审状态", report.reviewStatusLabel || "收集中", `版本 ${report.strategyPolicyVersion || "--"}`)
+      metricCard("实际规避亏损", formatPct(report.avoidedLossPct), `实际错失盈利 ${formatPct(report.missedProfitPct)}`),
+      metricCard("运行状态", `${formatInteger(report.activeCashDays || 0)} 空仓 / ${formatInteger(report.technicalFailureDays || 0)} 失败`, `数据不足 ${formatInteger(report.dataInsufficientDays || 0)} 日 · 不适用 ${formatInteger(report.notApplicableDays || 0)} 日`),
+      metricCard("评审状态", report.reviewStatusLabel || "收集中", `策略 ${report.strategyPolicyVersion || "--"} · 执行 ${report.executionProfileVersion || "--"}`)
     ].join("");
   }
   const progress = report.progress || {};
   if (els.shadowAnalyticsProgress) {
+    if (progress.collecting === false) {
+      els.shadowAnalyticsProgress.innerHTML = `<div><strong>${escapeHtml(report.reviewStatusLabel || "历史诊断")}</strong><span>${escapeHtml(progress.reason || "该策略已停止新增，不进入自动晋级。")}</span></div>`;
+    } else {
     const target = Number(progress.nextTargetDays || 20);
     const current = Number(progress.effectiveDays || 0);
     const width = Math.max(0, Math.min(100, target ? current / target * 100 : 0));
@@ -211,11 +258,14 @@ function renderShadowAnalytics() {
       <div><strong>${escapeHtml(report.reviewStatusLabel || "收集中")}</strong><span>${formatInteger(current)} / ${formatInteger(target)} 个有效交易日，还差 ${formatInteger(progress.remainingDays || 0)} 日</span></div>
       <span class="shadow-progress-track"><i style="width:${width.toFixed(1)}%"></i></span>
     `;
+    }
   }
   renderShadowGateDiagnostics(report);
   if (els.shadowAnalyticsRows) {
     els.shadowAnalyticsRows.innerHTML = facts.length
-      ? facts.slice(0, 120).map((fact) => `
+      ? facts.slice(0, 120).map((fact) => {
+        const status = shadowFactStatusMeta(fact.status);
+        return `
         <tr>
           <td>${escapeHtml(fact.recommendationDate || "--")}</td>
           <td><a href="?runId=${formatIntegerRaw(fact.canonicalRunId)}">#${formatInteger(fact.canonicalRunId)}</a></td>
@@ -223,11 +273,23 @@ function renderShadowAnalytics() {
           <td class="${returnTone(fact.treatmentNetReturnPct)}">${formatPct(fact.treatmentNetReturnPct)}</td>
           <td>${formatPct(fact.controlNetReturnPct)}</td>
           <td class="${returnTone(fact.pairedDailyDeltaPct)}">${formatPct(fact.pairedDailyDeltaPct)}</td>
-          <td><span class="status-pill ${fact.status === "ok" ? "good" : "warn"}">${fact.status === "ok" ? "完整" : "数据不足"}</span><small>${fact.coveragePct == null ? "" : formatRate(fact.coveragePct)}</small></td>
+          <td><span class="status-pill ${status.tone}" title="${escapeHtml(fact.statusReason || status.reason)}">${escapeHtml(status.label)}</span><small>${fact.coveragePct == null ? "" : formatRate(fact.coveragePct)}</small></td>
         </tr>
-      `).join("")
+      `;
+      }).join("")
       : `<tr><td colspan="7" class="empty">当前角色还没有可用数据，将从符合条件的 Run 自动累计。</td></tr>`;
   }
+}
+
+function shadowFactStatusMeta(status) {
+  const values = {
+    ok: { label: "完整", tone: "good", reason: "处理组和同日控制组结果完整。" },
+    active_cash: { label: "主动空仓", tone: "good", reason: "策略明确选择 Top0，当日按现金收益 0% 计入。" },
+    not_applicable: { label: "本日不适用", tone: "neutral", reason: "当日未形成该实验所需的持仓或槽位，不计入收益。" },
+    technical_failure: { label: "技术失败", tone: "bad", reason: "系统或模型执行失败，不能解释为主动空仓。" },
+    data_insufficient: { label: "数据不足", tone: "warn", reason: "处理组或同日控制组的执行收益不完整。" },
+  };
+  return values[status] || { label: "待核对", tone: "warn", reason: "状态尚未识别，请核对原始事实。" };
 }
 
 function renderShadowGateDiagnostics(report) {
@@ -455,7 +517,7 @@ function render() {
   renderSummary(runs, selected);
   renderReviewNote(payload.reviewStats || {}, payload.validationAutoFreeze || {});
   renderOptimizationStats(payload.optimizationStats || {});
-  renderRunList(filteredRuns, runs.length, selected);
+  renderRunList(filteredRuns, Number(payload.matchingCount ?? runs.length), selected);
   renderDetail(selected);
   renderBaseline(selected);
   window.dispatchEvent(new CustomEvent("t1-review-run", { detail: { runId: Number(selected?.id || 0) } }));
@@ -470,13 +532,15 @@ function render() {
 function renderSummary(runs, selected) {
   const stats = state.payload?.reviewStats || {};
   els.summaryGrid.innerHTML = [
-    metricCard("可用于优化", formatInteger(stats.displayLearnableRuns || 0), `可用股票 ${formatInteger(stats.learningEligibleOutcomes || 0)} 个`),
+    metricCard("当前版本可优化", formatInteger(stats.displayLearnableRuns || 0), `严格可用股票 ${formatInteger(stats.learningEligibleOutcomes || 0)} 个`),
+    metricCard("历史版本可分析", formatInteger(stats.historicalAnalyzableRuns || 0), `${formatInteger(stats.historicalAnalyzableOutcomes || 0)} 只股票 · 其中旧口径 ${formatInteger(stats.historicalLegacyRuns || 0)} run`),
+    metricCard("全部可分析", formatInteger(stats.totalAnalyzableRuns || 0), `${formatInteger(stats.totalAnalyzableOutcomes || 0)} 只股票 · 分组展示不混算收益`),
     metricCard("可看结果", formatInteger(stats.displayReviewableRuns || 0), "能看次日15分钟表现"),
     metricCard("部分缺数据", formatInteger(stats.displayPartialRuns || 0), "有些股票缺15分钟价格"),
     metricCard("等待数据", formatInteger(stats.displayWaitingRuns || 0), "还没到验证时间或需刷新"),
     metricCard("仅排查", formatInteger(stats.displayDiagnosticRuns ?? stats.displayUnusableRuns ?? 0), "周末/异常/旧规则记录"),
-    metricCard("open_15m均值", formatPct(stats.avgNetReturnPct), "只看可用于优化样本"),
-    metricCard("open_15m成功率", formatRate(stats.successRate), `强成功 ${formatRate(stats.strongSuccessRate)}`),
+    metricCard("open_15m均值", formatPct(stats.avgNetReturnPct), `只看当前版本 ${stats.selectionPolicyVersion || "--"}`),
+    metricCard("正收益率", formatRate(stats.successRate), `净收益 > 0 · 强收益率 ${formatRate(stats.strongSuccessRate)}`),
     metricCard("选中 run", selected ? `#${formatInteger(selected.id)}` : "--", selected ? `${selected.recommendationDate || "--"} ${selected.scanTime || ""}` : "未选择"),
     metricCard("选中状态", selected ? reviewStatusLabel(selected) : "--", selected?.reviewStatusReason || "左侧选择 run 后显示")
   ].join("");
@@ -500,13 +564,18 @@ function renderReviewNote(stats, autoFreeze = {}) {
 function renderOptimizationStats(stats) {
   if (!els.optimizationStatsGrid || !els.exitTimingStatsRows) return;
   const primary = stats.primary || {};
-  els.optimizationStatsMeta.textContent = `${formatInteger(stats.runCount || 0)} 个 run · ${formatInteger(stats.outcomeCount || 0)} 只股票`;
+  els.optimizationStatsMeta.textContent = `${formatInteger(stats.runCount || 0)} 个当前严格 run · ${formatInteger(stats.outcomeCount || 0)} 只股票 · 版本 ${stats.selectionPolicyVersion || "legacy（旧版）"}`;
   els.optimizationStatsGrid.innerHTML = [
-    metricCard("统计范围", stats.scopeLabel || "可用于优化", "不受下方筛选和列表加载数量影响"),
+    metricCard("当前严格样本", `${formatInteger(stats.currentStrictRunCount || 0)} run`, `${formatInteger(stats.currentStrictOutcomeCount || 0)} 只股票 · 用于下方收益统计`),
+    metricCard("历史严格样本", `${formatInteger(stats.historicalStrictRunCount || 0)} run`, `${formatInteger(stats.historicalStrictOutcomeCount || 0)} 只股票 · 按历史版本单列`),
+    metricCard("历史旧口径", `${formatInteger(stats.historicalLegacyRunCount || 0)} run`, `${formatInteger(stats.historicalLegacyOutcomeCount || 0)} 只股票 · 仅分析，不与当前收益混算`),
     metricCard("主KPI", stats.primaryScenarioLabel || "开盘后15分钟", "固定主口径，缺失不 fallback"),
-    metricCard("平均净收益", formatPct(primary.avgNetReturnPct), "可用于优化样本的 open_15m 均值"),
+    metricCard("平均净收益", formatPct(primary.avgNetReturnPct), "仅当前严格样本的 open_15m 均值"),
     metricCard("成功率", formatRate(primary.successRate), "open_15m 净收益大于 0 的比例")
   ].join("");
+  els.optimizationStatsGrid.innerHTML += (stats.versionGroups || []).map((group) => metricCard(
+    group.selectionPolicyVersion === "legacy" ? "旧版基线" : `版本 ${group.selectionPolicyVersion}`,
+    formatPct(group.primary?.avgNetReturnPct), `${formatInteger(group.runCount)} 个可优化 run · 固定开盘后15分钟净收益，按版本独立统计`)).join("");
   const rows = stats.exitTimingStats || [];
   els.exitTimingStatsRows.innerHTML = rows.length
     ? rows.map((row) => `
@@ -546,6 +615,9 @@ function renderRunList(runs, totalCount, selected) {
   els.runList.innerHTML = runs.map((run) => {
     const active = Number(selected?.id || 0) === Number(run.id);
     const picks = (run.finalPicks || []).slice(0, 3).map((item) => `${item.name || "--"} ${item.code || ""}`.trim()).join(" / ");
+    const sampleCountText = reviewStatusKey(run) === "historical"
+      ? `历史可分析 ${formatInteger(run.historicalLearningEligibleCount || 0)} 只（不混算）`
+      : `正收益 ${formatInteger(run.successCount || 0)} / ${formatInteger(run.learningEligibleCount || 0)}（严格样本）`;
     return `
       <button class="run-card ${active ? "active" : ""}" type="button" data-run-id="${formatIntegerRaw(run.id)}">
         <span class="run-card-head">
@@ -559,11 +631,11 @@ function renderRunList(runs, totalCount, selected) {
           <small>${escapeHtml(selectionModeLabel(run.selectionMode))}</small>
           <small>${escapeHtml(sourceName(run.actualSource))}</small>
         </span>
-        <span class="run-card-picks">${escapeHtml(picks || zeroPickReason(run) || "暂无最终推荐")}</span>
+        <span class="run-card-picks">${escapeHtml(picks || run.zeroPickReason || zeroPickReason(run) || "暂无最终推荐")}</span>
         <span class="run-card-foot">
           <small>Top${formatInteger(run.finalCount || 0)}</small>
           <small>open_15m ${formatPct(run.avgPrimaryNetReturnPct)}</small>
-          <small>成功 ${formatInteger(run.successCount || 0)} / ${formatInteger(run.tradeableCount || 0)}</small>
+          <small>${escapeHtml(sampleCountText)}</small>
         </span>
       </button>
     `;
@@ -595,11 +667,16 @@ function renderDetail(run) {
   els.detailTitle.textContent = `run ${formatInteger(run.id)} · ${selectionModeLabel(run.selectionMode)}`;
   els.detailMetrics.innerHTML = [
     metricCard("复盘状态", reviewStatusLabel(run), run.reviewStatusReason || "--"),
-    metricCard("AI终选", aiDecisionLabel(run), run.aiDecisionReason || "--"),
+    metricCard("正式决策", selectionModeLabel(run.selectionMode), (run.market?.recommendationPolicy || {}).reason || run.error || "--"),
+    metricCard("AI研究链路", aiDecisionLabel(run), run.aiDecisionReason || "--"),
     metricCard("学习范围", learningScopeLabel(run), run.learningScopeReason || "--"),
     metricCard("主 KPI 均值", formatPct(tradeable.avgNetReturnPct), "固定 open_15m，缺失不 fallback"),
     metricCard("成功数量", `${formatInteger(summary.successCount || 0)} / ${formatInteger(summary.count || 0)}`, "强成功 / 成功溢价 / 弱成功"),
-    metricCard("用于优化股票", formatInteger(run.learningEligibleCount || 0), learningScopeLabel(run)),
+    metricCard(
+      reviewStatusKey(run) === "historical" ? "历史可分析股票" : "用于优化股票",
+      formatInteger(reviewStatusKey(run) === "historical" ? run.historicalLearningEligibleCount || 0 : run.learningEligibleCount || 0),
+      learningScopeLabel(run)
+    ),
     metricCard(
       "发布后买入证据",
       entryEvidence.complete ? `${formatInteger(entryEvidence.eligibleCount || 0)} / ${formatInteger(entryEvidence.expectedCount || 0)} 已冻结` : entryExecutionReviewLabel(entryEvidence.status),
@@ -628,7 +705,7 @@ function renderDetail(run) {
 
 function entryExecutionReviewLabel(status) {
   return {
-    available: "可用于成交回放",
+    available: "可用于正式入场定价",
     scheduled: "等待采集",
     running: "正在采集",
     retry_wait: "等待重试",
@@ -644,8 +721,8 @@ function entryExecutionReviewDetail(evidence = {}) {
   const ready = (evidence.snapshots || []).filter((item) => item.decisionEligible);
   if (ready.length) return ready.map((item) => `${item.code || "--"} ${item.entryTime || "--"} ${formatNumber(item.price)}`).join("；");
   if (evidence.job?.error) return evidence.job.error;
-  if (evidence.status === "legacy_not_recorded") return "当时未独立冻结正式推荐发布后的分钟成交，不能倒推为可优化样本。";
-  return "只认信号发布后的真实分钟成交；提前冻结选股价格不能替代。";
+  if (evidence.status === "legacy_not_recorded") return "当时未独立冻结正式推荐发布后的分钟行情，不能倒推正式入场价。";
+  return "正式复盘只使用下单时点后的第一根完整1分钟行情定价；提前冻结选股价格不能替代。";
 }
 
 function openingEvidenceStatusLabel(status) {
@@ -717,6 +794,9 @@ function renderPickSummary(run) {
         <span class="review-official-field"><small>open_15m</small><strong class="${returnTone(returnValue)}">${returnValue == null ? "待验证" : formatPct(returnValue)}</strong></span>
       </span>
       <span class="review-official-status ${escapeHtml(outcomeStatusTone(run.outcomeStatus))}">${escapeHtml(status)}</span>
+      <div class="review-official-evidence">${pick.selectionPolicyVersion
+        ? `<strong>${escapeHtml(pick.candidateTypeLabel || "形态待确认")}</strong> · 数据${pick.dataEligible ? "可用" : "不足"} / 形态${pick.setupEligible ? "成立" : "未成立"} / 正式资格${pick.formalEligible ? "通过" : "未通过"}<br>尾盘：${escapeHtml(pick.tailSupportPackV2?.label || "证据不足")} · 截止 ${escapeHtml(pick.tailSupportPackV2?.actualLastTime || "未知")}<br>${escapeHtml((pick.formalExclusionReasons || []).join("；"))}<small>冻结版本 ${escapeHtml(pick.selectionPolicyVersion)}；评分不是资金流或收益概率。</small>`
+        : `${escapeHtml(pick.candidateTypeLabel || "旧版分类")} · 旧版分类，非真实尾盘回流确认；保留当时原始依据。`}</div>
     </article>`;
   }).join("");
   els.pickSummary.innerHTML = `<section class="review-official-section"><div class="review-official-head"><div><strong>正式推荐</strong><small>系统最终交易组合，进入次日验证与策略复盘</small></div><span class="review-official-count">正式组合 · ${formatInteger(picks.length)} 只</span></div><div class="review-official-list">${rows}</div></section>`;
@@ -735,7 +815,8 @@ function renderShadow(run) {
   const aiRows = Array.isArray(outcome.deepSeekTailRows) ? outcome.deepSeekTailRows : [];
   const legacyAvailable = rulePicks.length || aiPicks.length || rows.length || aiRows.length;
   const policyHtml = policyExperimentRunSection(run);
-  if (!legacyAvailable && !policyHtml) {
+  const v3Html = v3ExperimentRunSection(run);
+  if (!legacyAvailable && !policyHtml && !v3Html) {
     els.shadowPanel.innerHTML = `<section class="review-shadow-box"><strong>影子 Top3</strong><span>该 run 未记录影子推荐数据（旧 run 或生成时未启用影子链路）。</span></section>`;
     return;
   }
@@ -755,13 +836,44 @@ function renderShadow(run) {
       <div class="review-shadow-returns">
         ${shadowReturnCard("正式 Top3", finalReturn, "正式推荐组合", "formal")}
         ${shadowReturnCard("规则尾盘影子", shadowReturn, "尾盘承接加权", "rule")}
-        ${shadowReturnCard("AI 尾盘影子", aiReturn, "DeepSeek 额外读取 T1", "ai")}
+        ${shadowReturnCard("AI 尾盘影子", aiReturn, "独立尾盘证据对照", "ai")}
       </div>
       ${cards}
       ${outcome.reason ? `<small class="review-shadow-note">${escapeHtml(outcome.reason)}</small>` : ""}
     </section>
   ` : "";
-  els.shadowPanel.innerHTML = `${legacyHtml}${policyHtml}`;
+  els.shadowPanel.innerHTML = `${v3Html}${legacyHtml}${policyHtml}`;
+}
+
+function v3ExperimentRunSection(run) {
+  const strategy = run?.market?.v3Strategy || {};
+  if (!strategy.pipelineVersion && !strategy.version) return "";
+  const recall = strategy.recallAllocation || {};
+  const validation = strategy.validationAllocation || {};
+  const model = strategy.netExpectationModel || {};
+  const tail = strategy.tailEvidence || strategy.tailAllocation || {};
+  const picks = Array.isArray(strategy.picks) ? strategy.picks : [];
+  const statusLabel = {
+    selected: `${formatInteger(picks.length)} 只`,
+    active_top0: "主动空仓",
+    technical_failure: "技术失败，不能当空仓",
+    not_ready: "模型收集中"
+  }[strategy.decisionStatus] || "等待运行";
+  const chips = picks.length ? picks.map((pick, index) => `<a href="${escapeHtml(stockAnalysisHref(pick))}"><b>#${index + 1}</b>${escapeHtml(pick.name || normalizedStockCode(pick.code))}<small>${escapeHtml(normalizedStockCode(pick.code))}</small></a>`).join("") : `<span class="policy-run-empty">Top0</span>`;
+  return `
+    <section class="review-shadow-box policy-run-shadow">
+      <div class="review-shadow-head"><div><strong>V3 全链路主实验 · 当日冻结漏斗</strong><small>硬过滤后全市场 → 500 → 120 → 数据合格 → 1分钟尾盘 → 短名单 → Top0～Top2</small></div><span class="review-shadow-badge">${strategy.affectsOfficialRecommendation ? "本 Run 正式" : "仅影子"}</span></div>
+      <div class="policy-run-meta">
+        <span><small>500 召回池</small><strong>${formatInteger(recall.selectedCount || 0)}</strong></span>
+        <span><small>15分钟验证</small><strong>${formatInteger(validation.selectedCount || strategy.validationCandidateCount || 0)}</strong></span>
+        <span><small>净期望模型</small><strong>${model.rankingReady ? "可排序" : "收集中"}</strong></span>
+        <span><small>1分钟尾盘</small><strong>${formatInteger(tail.available || tail.selectedCount || 0)} / ${formatInteger(tail.planned || tail.selectedCount || 0)}</strong></span>
+        <span><small>短名单</small><strong>${formatInteger(strategy.shortlistCount || 0)}</strong></span>
+        <span><small>最终结果</small><strong>${escapeHtml(statusLabel)}</strong></span>
+      </div>
+      <div class="policy-run-role"><div class="policy-run-role-head"><strong>V3 组合</strong><span>${formatInteger(picks.length)} 只</span></div><small>${escapeHtml(strategy.zeroPickReasonCode || "按保守净期望、尾盘负面门禁和组合独立性形成")}</small><div class="policy-run-picks">${chips}</div></div>
+      <small class="review-shadow-note">“技术失败”与“模型尚未就绪”不会记成主动 Top0；V3 未经批准前不会改变正式推荐。</small>
+    </section>`;
 }
 
 function policyExperimentRunSection(run) {
@@ -976,8 +1088,8 @@ function renderOutcomes(run) {
       </td>
       <td>
         <span class="buy-price-cell">
-          <strong>${formatPrice(item.buyReferencePrice)}</strong>
-          <small>${escapeHtml(buyReferenceHint(item))}</small>
+          <strong>${formatPrice((item.outcome || {}).simulatedEntryPrice ?? item.buyReferencePrice)}</strong>
+          <small>${escapeHtml(formalEntryHint(item))}</small>
         </span>
       </td>
       <td>${escapeHtml(item.nextTradeDate || "--")}</td>
@@ -1036,7 +1148,13 @@ function primaryScenario(item) {
   return ((item.outcome || {}).tradeable || {}).primaryScenario || {};
 }
 
-function buyReferenceHint(item) {
+function formalEntryHint(item) {
+  const entry = (item.outcome || {}).entryExecution || {};
+  if (entry.status === "formal_entry_priced") {
+    return `正式单位入场价 · ${String(entry.entryTime || "").slice(11, 16) || "发布后完整分钟"}`;
+  }
+  if (entry.status === "entry_price_evidence_missing") return "正式买入价格证据不足";
+  if (entry.status === "entry_not_executable") return entry.label || "超过正式执行窗口";
   const consistency = (item.outcome || {}).priceConsistency || {};
   const source = consistency.referenceSource || "";
   const date = consistency.referenceDate || item.recommendationDate || "";
@@ -1125,17 +1243,17 @@ function normalizeReviewFilter(value) {
   if (["problem", "data_insufficient"].includes(text)) return "partial";
   if (["legacy", "invalid", "unusable"].includes(text)) return "diagnostic";
   if (text === "rules_fallback") return "";
-  if (["reviewable", "learnable", "partial", "waiting", "diagnostic", ""].includes(text)) return text;
+  if (["reviewable", "learnable", "historical", "partial", "waiting", "diagnostic", ""].includes(text)) return text;
   return "reviewable";
 }
 
 function normalizeShadowFamily(value) {
   const family = String(value || "");
-  return Object.hasOwn(SHADOW_ROLES, family) ? family : "legacy_tail_rule";
+  return Object.hasOwn(SHADOW_ROLES, family) ? family : "v3_main_experiment";
 }
 
 function defaultShadowRole(family) {
-  return (SHADOW_ROLES[normalizeShadowFamily(family)] || [])[0]?.value || "tail_rule";
+  return (SHADOW_ROLES[normalizeShadowFamily(family)] || [])[0]?.value || "v3_main";
 }
 
 function normalizeShadowWindow(value) {
@@ -1146,6 +1264,7 @@ function normalizeShadowWindow(value) {
 function reviewStatusKey(run) {
   if (run?.reviewStatus) return run.reviewStatus;
   if (run?.sampleClass === "learning") return "learnable";
+  if (run?.sampleClass === "historical_learning") return "historical";
   if (["partial", "data_insufficient"].includes(run?.sampleClass)) return "partial";
   if (["usable", "zero_pick"].includes(run?.sampleClass)) return "reviewable";
   if (["waiting", "verifiable", "not_ready"].includes(run?.sampleClass)) return "waiting";
@@ -1156,6 +1275,7 @@ function reviewStatusLabel(run) {
   return run?.reviewStatusLabel || {
     reviewable: "可看结果",
     learnable: "可用于优化",
+    historical: "历史口径可分析",
     partial: "部分缺数据",
     waiting: "等待数据",
     diagnostic: "仅排查",
@@ -1167,6 +1287,7 @@ function reviewStatusTone(run) {
   return run?.reviewStatusTone || {
     reviewable: "neutral",
     learnable: "good",
+    historical: "neutral",
     partial: "warn",
     waiting: "warn",
     diagnostic: "bad",
@@ -1188,12 +1309,14 @@ function aiDecisionTone(run) {
 
 function learningScopeLabel(run) {
   if (run?.learningScopeLabel) return run.learningScopeLabel;
+  if (reviewStatusKey(run) === "historical") return "历史口径分析";
   return reviewStatusKey(run) === "learnable" ? "策略优化" : "不进入优化";
 }
 
 function learningScopeTone(run) {
   if (run?.learningScope === "full_ai_strategy") return "good";
   if (["candidate_rules_only", "rules_fallback_only", "data_only"].includes(run?.learningScope)) return "warn";
+  if (run?.learningScope === "historical_analysis") return "neutral";
   return reviewStatusKey(run) === "learnable" ? "good" : "neutral";
 }
 
@@ -1250,6 +1373,8 @@ function selectionModeLabel(value) {
     market_risk_zero_pick: "市场风险Top0",
     data_quality_zero_pick: "数据质量Top0",
     guardrail_zero_pick: "守门Top0",
+    v3_t1_official: "V3 T+1正式策略",
+    v3_active_top0: "V3主动空仓",
     invalid_non_trading_day: "非交易日"
   }[value] || value || "--";
 }

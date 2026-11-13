@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 ADAPTIVE_EXIT_VERSION = "adaptive_exit_shadow_v1"
 EXECUTION_PROFILE_VERSION = "execution_profile_v2_participation"
 MINUTE_SEMANTICS_VERSION = "minute_bar_semantics_v1"
+FORMAL_ENTRY_VERSION = "formal_entry_unit_return_v1"
 
 
 def normalize_minute_bars(
@@ -93,6 +94,55 @@ def simulate_entry_execution(
         submitted_at=submitted_at,
         normalized=normalized,
         reference_price=reference,
+    )
+
+
+def price_formal_entry(
+    *,
+    series: Iterable[Dict[str, Any]],
+    recommendation_date: str,
+    signal_published_at: str,
+    reference_price: Optional[float],
+    profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Price the formal unit-return entry without assuming portfolio capital or share quantity."""
+    normalized = normalize_minute_bars(series, recommendation_date)
+    signal_at = _parse_datetime(signal_published_at, recommendation_date)
+    if normalized["status"] != "ok" or not signal_at:
+        return _formal_entry_unavailable("minute_semantics_unknown", normalized, signal_published_at, reference_price)
+    reference = _number(reference_price)
+    if not reference or reference <= 0:
+        return _formal_entry_unavailable("reference_price_missing", normalized, signal_published_at, reference_price)
+    submitted_at = signal_at + timedelta(seconds=int(profile.get("orderLatencySeconds") or 5))
+    for bar in normalized["bars"]:
+        bar_start = datetime.fromisoformat(bar["barStart"])
+        if bar_start < submitted_at or _clock(bar["barEnd"]) > "15:00:00":
+            continue
+        if not _bar_tradeable(bar):
+            continue
+        price, price_source = _bar_price(bar)
+        if not price or price <= 0:
+            continue
+        return {
+            "version": FORMAL_ENTRY_VERSION,
+            "executable": True,
+            "status": "formal_entry_priced",
+            "label": "正式单位收益入场价已确认",
+            "signalPublishedAt": signal_published_at,
+            "orderSubmittedAt": submitted_at.isoformat(timespec="seconds"),
+            "entryTime": bar["barEnd"],
+            "price": round(price, 6),
+            "rawPrice": round(price, 6),
+            "priceSource": price_source,
+            "buyReferencePrice": reference,
+            "source": "post_publish_complete_minute",
+            "pricingModel": "first_complete_post_submit_minute_vwap",
+            "quantityModel": "unit_return_no_notional",
+            "minuteBarSemantics": normalized,
+        }
+    return _formal_entry_unavailable(
+        "entry_price_evidence_missing", normalized, signal_published_at, reference_price,
+        submitted_at=submitted_at,
     )
 
 
@@ -245,6 +295,8 @@ def _fill_order(bars: List[Dict[str, Any]], submitted_at: datetime, quantity: in
     remaining = quantity
     fills = []
     rate = float(profile.get("maxParticipationRate") or 0.01)
+    cumulative_volume = 0.0
+    cumulative_capacity = 0
     for bar in bars:
         start = datetime.fromisoformat(bar["barStart"])
         if start < submitted_at or _clock(bar["barEnd"]) > deadline or not _bar_tradeable(bar):
@@ -252,7 +304,10 @@ def _fill_order(bars: List[Dict[str, Any]], submitted_at: datetime, quantity: in
         volume = _volume_in_shares(bar)
         if volume is None or volume <= 0:
             continue
-        capacity = math.floor(volume * rate / lot) * lot
+        cumulative_volume += volume
+        next_capacity = math.floor(cumulative_volume * rate / lot) * lot
+        capacity = next_capacity - cumulative_capacity
+        cumulative_capacity = next_capacity
         fill_quantity = min(remaining, capacity)
         if fill_quantity <= 0:
             continue
@@ -317,6 +372,31 @@ def _sell_leg(index: int, instruction: Dict[str, Any], target: int, fills: List[
 def _execution_unavailable(status: str, normalized: Dict[str, Any], signal_published_at: str) -> Dict[str, Any]:
     return {"version": EXECUTION_PROFILE_VERSION, "executable": False, "status": status, "signalPublishedAt": signal_published_at,
             "price": None, "minuteBarSemantics": normalized, "reason": "信号后分钟成交证据不足。"}
+
+
+def _formal_entry_unavailable(
+    diagnostic_status: str,
+    normalized: Dict[str, Any],
+    signal_published_at: str,
+    reference_price: Optional[float],
+    submitted_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    return {
+        "version": FORMAL_ENTRY_VERSION,
+        "executable": False,
+        "status": "entry_price_evidence_missing",
+        "diagnosticStatus": diagnostic_status,
+        "label": "正式买入价格证据不足",
+        "signalPublishedAt": signal_published_at,
+        "orderSubmittedAt": submitted_at.isoformat(timespec="seconds") if submitted_at else "",
+        "price": None,
+        "buyReferencePrice": _number(reference_price),
+        "source": "",
+        "pricingModel": "first_complete_post_submit_minute_vwap",
+        "quantityModel": "unit_return_no_notional",
+        "minuteBarSemantics": normalized,
+        "reason": "缺少下单时点后的第一根完整可交易1分钟线，不能确认正式买入价格。",
+    }
 
 
 def _bar_price(bar: Dict[str, Any]) -> tuple[Optional[float], str]:

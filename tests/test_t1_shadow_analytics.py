@@ -6,7 +6,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backend.app.database import Database
-from backend.app.services.t1_shadow_analytics_service import T1ShadowAnalyticsService, _select_window
+from backend.app.services.t1_shadow_analytics_service import (
+    T1ShadowAnalyticsService,
+    _select_window,
+    _v3_main_fact,
+)
 from backend.app.services import t1_overnight_selection_service as selection
 
 
@@ -157,6 +161,49 @@ class T1ShadowAnalyticsTest(unittest.TestCase):
         self.assertEqual(risk_report["gateDiagnostics"][0]["gateKey"], "sector")
         self.assertEqual(risk_report["gateDiagnostics"][0]["hitCount"], 1)
         self.assertEqual(risk_report["gateDiagnostics"][0]["evidenceCoveragePct"], 100.0)
+
+    def test_v3_main_uses_exact_open15_replay_and_same_day_official_control(self):
+        self._run(
+            "2026-10-10",
+            {
+                "v3Strategy": {
+                    "pipelineVersion": "2026-11-06.t1_v3_shadow.v1",
+                    "decisionStatus": "selected",
+                    "holdingCount": 1,
+                    "cashSlotCount": 1,
+                    "slotLimit": 2,
+                    "picks": [{"code": "000003"}],
+                    "versionBundle": {"pipelineVersion": "2026-11-06.t1_v3_shadow.v1"},
+                },
+                "baselineComparison": {
+                    "v3Main": {
+                        "count": 1,
+                        "tradeableCount": 1,
+                        "portfolioReturnPct": 0.6,
+                        "componentRows": [{"code": "000003", "nextTradeDate": "2026-10-12", "netReturnPct": 0.6}],
+                    },
+                    "final": {
+                        "count": 1,
+                        "tradeableCount": 1,
+                        "portfolioReturnPct": -0.2,
+                        "componentRows": [{"code": "000001", "nextTradeDate": "2026-10-12", "netReturnPct": -0.2}],
+                    },
+                },
+            },
+        )
+        result = self.service.summary(
+            shadow_family="v3_main_experiment",
+            shadow_role="v3_main",
+            strategy_policy_version="2026-11-06.t1_v3_shadow.v1",
+        )
+        report = result["roles"][0]
+        self.assertEqual(report["avgDailyNetReturnPct"], 0.6)
+        self.assertEqual(report["avgPairedDeltaPct"], 0.8)
+        facts = self.database.list_t1_shadow_strategy_daily_facts(
+            shadow_family="v3_main_experiment", shadow_role="v3_main"
+        )
+        self.assertFalse(facts[0]["detail"]["usesProxyReturn"])
+        self.assertIn("开盘后15分钟", facts[0]["detail"]["outcomeBusinessMeaning"])
 
     def test_strategy_policy_shadow_does_not_change_official_selection(self):
         market = {
@@ -549,7 +596,9 @@ class T1ShadowAnalyticsTest(unittest.TestCase):
         self.assertEqual(after["roles"][0]["effectiveDays"], 1)
         second = self.service.run_due(trigger_source="test")
         self.assertEqual(second["processed"], [])
-        self.assertEqual(len(self.database.list_t1_shadow_strategy_daily_facts()), 1)
+        self.assertEqual(len(self.database.list_t1_shadow_strategy_daily_facts(
+            shadow_family="legacy_tail_rule", shadow_role="tail_rule"
+        )), 1)
 
     def test_sql_lease_and_retry_recover_without_duplicate_fact(self):
         class Clock:
@@ -591,7 +640,9 @@ class T1ShadowAnalyticsTest(unittest.TestCase):
         clock.value += timedelta(seconds=2)
         recovered = service.run_due(trigger_source="test")
         self.assertEqual(recovered["processed"][0]["status"], "done")
-        self.assertEqual(len(self.database.list_t1_shadow_strategy_daily_facts()), 1)
+        self.assertEqual(len(self.database.list_t1_shadow_strategy_daily_facts(
+            shadow_family="legacy_tail_rule", shadow_role="tail_rule"
+        )), 1)
 
     def test_fixed_reports_append_revision_and_cannot_be_overwritten(self):
         for index in range(20):
@@ -625,6 +676,7 @@ class T1ShadowAnalyticsTest(unittest.TestCase):
         )
         self.assertEqual(len(reports), 1)
         self.assertEqual(reports[0]["reportRevision"], 1)
+        self.assertEqual(reports[0]["metrics"]["calculationVersion"], "t1_shadow_analytics_v6")
         self.assertFalse(reports[0]["admission"]["automaticPromotion"])
 
         revised = self.database.list_t1_shadow_strategy_daily_facts(
@@ -693,6 +745,308 @@ class T1ShadowAnalyticsTest(unittest.TestCase):
         selected = _select_window(facts, "20d")
         self.assertEqual(len([item for item in selected if item["treatmentNetReturnPct"] is not None]), 20)
         self.assertEqual(len(selected), 25)
+
+    def test_confirmation_window_does_not_fall_back_to_all_facts(self):
+        for index in range(1, 11):
+            self.database.upsert_t1_shadow_strategy_daily_fact(
+                {
+                    "recommendationDate": f"2026-10-{index:02d}",
+                    "canonicalRunId": index,
+                    "shadowFamily": "policy_experiment",
+                    "shadowRole": "policy_market_gate",
+                    "scope": "market_gate",
+                    "strategyPolicyVersion": "policy-window-v1",
+                    "outcomeScenario": "open_15m",
+                    "executionProfileVersion": "execution-v1",
+                    "comparisonKey": "selection_policy_vs_market_gate",
+                    "holdingCount": 1,
+                    "stockOutcomeCount": 1,
+                    "coveragePct": 100,
+                    "treatmentNetReturnPct": 0.1,
+                    "controlNetReturnPct": 0,
+                    "pairedDailyDeltaPct": 0.1,
+                    "status": "ok",
+                    "sourceRevision": f"revision-{index}",
+                }
+            )
+        result = self.service.summary(
+            shadow_family="policy_experiment",
+            shadow_role="policy_market_gate",
+            strategy_policy_version="policy-window-v1",
+            window="confirmation60",
+        )
+        self.assertEqual(result["facts"], [])
+        self.assertEqual(result["roles"][0]["effectiveDays"], 0)
+
+    def test_empty_policy_experiments_are_not_reported_as_zero_return(self):
+        self._run(
+            "2026-10-14",
+            {
+                "strategyPolicy": {
+                    "strategyPolicyVersion": "policy-empty-v1",
+                    "executionProfileVersion": "execution-v1",
+                    "portfolioDiversityAudit": {"secondSlotOpen": False},
+                },
+                "baselineComparison": {
+                    "selectionPolicyTreatmentAdaptiveExit": {
+                        "status": "ok", "count": 0, "tradeableCount": 0, "portfolioReturnPct": 0,
+                    },
+                    "selectionPolicyTreatment": {
+                        "status": "data_insufficient", "count": 0, "tradeableCount": 0, "portfolioReturnPct": 0,
+                    },
+                    "portfolioDiversityTreatment": {
+                        "status": "ok", "count": 0, "tradeableCount": 0, "portfolioReturnPct": 0,
+                    },
+                    "portfolioDiversityControl": {
+                        "status": "data_insufficient", "count": 0, "tradeableCount": 0, "portfolioReturnPct": 0,
+                    },
+                },
+            },
+        )
+        for role in ("policy_adaptive_exit", "policy_diversity"):
+            result = self.service.summary(
+                shadow_family="policy_experiment",
+                shadow_role=role,
+                strategy_policy_version="policy-empty-v1",
+            )
+            self.assertEqual(result["roles"][0]["effectiveDays"], 0)
+            self.assertEqual(result["facts"][0]["status"], "not_applicable")
+            self.assertIsNone(result["facts"][0]["treatmentNetReturnPct"])
+
+    def test_comparative_control_curve_uses_only_same_day_pairs(self):
+        rows = [
+            (1, 1.0, 0.0, 1.0, "ok"),
+            (2, None, 10.0, None, "data_insufficient"),
+        ]
+        for run_id, treatment, control, delta, status in rows:
+            self.database.upsert_t1_shadow_strategy_daily_fact(
+                {
+                    "recommendationDate": f"2026-10-{run_id:02d}",
+                    "canonicalRunId": run_id,
+                    "shadowFamily": "policy_experiment",
+                    "shadowRole": "policy_market_gate",
+                    "scope": "market_gate",
+                    "strategyPolicyVersion": "policy-paired-v1",
+                    "outcomeScenario": "open_15m",
+                    "executionProfileVersion": "execution-v1",
+                    "comparisonKey": "selection_policy_vs_market_gate",
+                    "holdingCount": 1,
+                    "stockOutcomeCount": 1,
+                    "coveragePct": 100,
+                    "treatmentNetReturnPct": treatment,
+                    "controlNetReturnPct": control,
+                    "pairedDailyDeltaPct": delta,
+                    "status": status,
+                    "sourceRevision": f"revision-{run_id}",
+                }
+            )
+        report = self.service.summary(
+            shadow_family="policy_experiment",
+            shadow_role="policy_market_gate",
+            strategy_policy_version="policy-paired-v1",
+        )["roles"][0]
+        self.assertEqual(report["effectiveDays"], 1)
+        self.assertEqual(report["controlAvgDailyNetReturnPct"], 0.0)
+        self.assertEqual(report["avgPairedDeltaPct"], 1.0)
+
+    def test_holding_win_rate_excludes_active_cash_days(self):
+        rows = [
+            (1, 0, 0.0, -1.0, 1.0, "active_cash"),
+            (2, 1, 1.0, 0.0, 1.0, "ok"),
+        ]
+        for run_id, holdings, treatment, control, delta, status in rows:
+            self.database.upsert_t1_shadow_strategy_daily_fact(
+                {
+                    "recommendationDate": f"2026-10-{run_id:02d}",
+                    "canonicalRunId": run_id,
+                    "shadowFamily": "policy_experiment",
+                    "shadowRole": "policy_market_gate",
+                    "scope": "market_gate",
+                    "strategyPolicyVersion": "policy-cash-v1",
+                    "outcomeScenario": "open_15m",
+                    "executionProfileVersion": "execution-v1",
+                    "comparisonKey": "selection_policy_vs_market_gate",
+                    "holdingCount": holdings,
+                    "stockOutcomeCount": holdings,
+                    "coveragePct": 100 if holdings else None,
+                    "treatmentNetReturnPct": treatment,
+                    "controlNetReturnPct": control,
+                    "pairedDailyDeltaPct": delta,
+                    "status": status,
+                    "sourceRevision": f"revision-{run_id}",
+                }
+            )
+        report = self.service.summary(
+            shadow_family="policy_experiment",
+            shadow_role="policy_market_gate",
+            strategy_policy_version="policy-cash-v1",
+        )["roles"][0]
+        self.assertEqual(report["positiveHoldingDayRate"], 100.0)
+        self.assertEqual(report["positiveEffectiveDayRate"], 50.0)
+        self.assertEqual(report["activeCashDays"], 1)
+
+    def test_v3_missing_control_is_not_assumed_to_be_official_cash(self):
+        strategy = {
+            "pipelineVersion": "2026-11-06.t1_v3_shadow.v1",
+            "decisionStatus": "active_top0",
+            "holdingCount": 0,
+            "cashSlotCount": 2,
+        }
+        baseline = {"v3Main": {}, "final": {}}
+        missing_control = _v3_main_fact(
+            {"id": 1, "recommendationDate": "2026-10-15", "selectionMode": "ai_t1_overnight", "finalCount": 1},
+            strategy,
+            baseline,
+        )
+        self.assertIsNone(missing_control["controlNetReturnPct"])
+        self.assertEqual(missing_control["status"], "data_insufficient")
+        active_cash_control = _v3_main_fact(
+            {"id": 2, "recommendationDate": "2026-10-16", "selectionMode": "market_risk_zero_pick", "finalCount": 0},
+            strategy,
+            baseline,
+        )
+        self.assertEqual(active_cash_control["controlNetReturnPct"], 0.0)
+        self.assertEqual(active_cash_control["status"], "active_cash")
+
+    def test_empty_v3_summary_uses_v3_version_identity(self):
+        result = self.service.summary(shadow_family="v3_main_experiment", shadow_role="v3_main")
+        self.assertEqual(result["roles"][0]["strategyPolicyVersion"], "2026-11-06.t1_v3_shadow.v1")
+
+    def test_empty_adaptive_scenario_is_not_applicable_at_source(self):
+        result = selection._scenario_baseline_comparison([], "adaptive_exit_v1")
+        self.assertEqual(result["status"], "not_applicable")
+        self.assertIsNone(result["portfolioReturnPct"])
+
+    def test_coverage_includes_incomplete_holding_days(self):
+        for run_id, status, outcomes, missing, value in (
+            (1, "ok", 1, 0, 0.5),
+            (2, "data_insufficient", 0, 1, None),
+        ):
+            self.database.upsert_t1_shadow_strategy_daily_fact({
+                "recommendationDate": f"2026-10-{run_id:02d}",
+                "canonicalRunId": run_id,
+                "shadowFamily": "legacy_tail_rule",
+                "shadowRole": "tail_rule",
+                "scope": "role_diagnostic",
+                "strategyPolicyVersion": "coverage-v1",
+                "outcomeScenario": "open_15m",
+                "executionProfileVersion": "execution-v1",
+                "comparisonKey": "tail_rule_descriptive",
+                "holdingCount": 1,
+                "stockOutcomeCount": outcomes,
+                "missingCount": missing,
+                "treatmentNetReturnPct": value,
+                "status": status,
+                "sourceRevision": f"r-{run_id}",
+            })
+        report = self.service.summary(
+            shadow_family="legacy_tail_rule",
+            shadow_role="tail_rule",
+            strategy_policy_version="coverage-v1",
+        )["roles"][0]
+        self.assertEqual(report["effectiveDays"], 1)
+        self.assertEqual(report["stockOutcomeCount"], 1)
+        self.assertEqual(report["missingCount"], 1)
+        self.assertEqual(report["coveragePct"], 50.0)
+
+    def test_legacy_tail_identity_is_not_split_by_formal_policy_version(self):
+        for day, policy in (("2026-10-01", "formal-v1"), ("2026-10-02", "formal-v2")):
+            self._run(day, {
+                "selectionPolicyVersion": policy,
+                "shadowTop3": {"picks": [{"code": "000001"}]},
+                "shadowComparison": {"outcomeComparison": {"shadow": {
+                    "status": "ok", "count": 1, "tradeableCount": 1, "portfolioReturnPct": 0.2,
+                }}},
+            }, rebuild=False)
+        self.service.rebuild()
+        result = self.service.summary(shadow_family="legacy_tail_rule", shadow_role="tail_rule")
+        self.assertEqual(len(result["roles"]), 1)
+        self.assertEqual(result["roles"][0]["targetTradeDays"], 2)
+        self.assertEqual(result["roles"][0]["strategyPolicyVersion"], "legacy_shadow_open15m_v1")
+
+    def test_legacy_ai_keeps_active_cash_technical_failure_and_not_applicable_days(self):
+        self._run("2026-10-01", {
+            "shadowDeepSeekTailTop3": {"picks": [], "reason": "DeepSeek 尾盘影子返回 Top0"},
+        }, rebuild=False)
+        self._run("2026-10-02", {
+            "shadowDeepSeekTailTop3": {"picks": [], "error": "AI 上下文超过预算"},
+        }, mode="ai_technical_failure_zero_pick", rebuild=False)
+        self._run("2026-10-03", {}, rebuild=False)
+        self._run("2026-10-04", {
+            "legacyShadowArchive": {"status": "future_generation_stopped", "archivedRoles": ["tail_ai", "rules"]},
+            "shadowDeepSeekTailTop3": {"picks": [], "reason": "V3 上线后不再生成独立尾盘 Top3"},
+        }, mode="ai_technical_failure_zero_pick", rebuild=False)
+        self.service.rebuild()
+        result = self.service.summary(shadow_family="legacy_tail_ai", shadow_role="tail_ai")
+        statuses = [fact["status"] for fact in result["facts"]]
+        self.assertEqual(statuses, ["active_cash", "technical_failure", "not_applicable", "not_applicable"])
+        report = result["roles"][0]
+        self.assertEqual(report["activeCashDays"], 1)
+        self.assertEqual(report["technicalFailureDays"], 1)
+        self.assertEqual(report["notApplicableDays"], 2)
+        self.assertEqual(report["effectiveDays"], 1)
+
+    def test_legacy_incomplete_outcomes_are_not_filled_with_fake_cash_returns(self):
+        self._run("2026-10-05", {
+            "shadowDeepSeekTailTop3": {
+                "picks": [{"code": "000001"}, {"code": "000002"}, {"code": "000003"}],
+            },
+            "shadowComparison": {"outcomeComparison": {
+                "deepSeekTail": {
+                    "status": "ok",
+                    "count": 3,
+                    "tradeableCount": 1,
+                    "portfolioReturnPct": 0.5,
+                    "slotCount": 3,
+                    "cashSlots": 2,
+                },
+                "deepSeekTailRows": [
+                    {"code": "000001", "dataStatus": "ok"},
+                    {"code": "000002", "dataStatus": "minute_missing"},
+                    {"code": "000003", "dataStatus": "minute_missing"},
+                ],
+            }},
+        })
+        result = self.service.summary(shadow_family="legacy_tail_ai", shadow_role="tail_ai")
+        fact = result["facts"][0]
+        report = result["roles"][0]
+        self.assertEqual(fact["status"], "data_insufficient")
+        self.assertIsNone(fact["treatmentNetReturnPct"])
+        self.assertEqual(fact["holdingCount"], 3)
+        self.assertEqual(fact["cashSlotCount"], 0)
+        self.assertEqual(fact["missingCount"], 2)
+        self.assertEqual(report["effectiveDays"], 0)
+        self.assertEqual(report["coveragePct"], 33.33)
+
+    def test_legacy_ai_explicit_top0_is_not_overridden_by_formal_selector_failure(self):
+        self._run("2026-10-06", {
+            "shadowDeepSeekTailTop3": {
+                "status": "ai_zero_pick",
+                "picks": [],
+                "reason": "DeepSeek 尾盘影子返回 Top0，表示它认为没有足够合格的尾盘影子候选。",
+            },
+        }, mode="ai_technical_failure_zero_pick")
+        result = self.service.summary(shadow_family="legacy_tail_ai", shadow_role="tail_ai")
+        fact = result["facts"][0]
+        self.assertEqual(fact["status"], "active_cash")
+        self.assertEqual(fact["treatmentNetReturnPct"], 0.0)
+
+    def test_missed_profit_requires_profitable_control(self):
+        market = {
+            "strategyPolicy": {"strategyPolicyVersion": "policy-v1", "rank3Audit": {"available": True}},
+            "baselineComparison": {
+                "rank3": {"count": 3, "tradeableCount": 3, "portfolioReturnPct": -1.3,
+                          "componentRows": [{"netReturnPct": -1}, {"netReturnPct": -1}, {"netReturnPct": -1.9}]},
+                "rank3CashControl": {"count": 2, "tradeableCount": 2, "portfolioReturnPct": -1.0,
+                                     "componentRows": [{"netReturnPct": -1}, {"netReturnPct": -1}]},
+            },
+        }
+        self._run("2026-10-04", market)
+        row = self.database.list_t1_shadow_strategy_daily_facts(
+            shadow_family="policy_experiment", shadow_role="policy_rank3"
+        )[0]
+        self.assertEqual(row["missedProfitPct"], 0.0)
+        self.assertEqual(row["avoidedLossPct"], 0.0)
 
     def test_technical_failure_zero_pick_is_research(self):
         run = {

@@ -1,6 +1,6 @@
 import unittest
 
-from backend.app.engines.t1_exit_replay import replay_adaptive_exit, simulate_entry_execution
+from backend.app.engines.t1_exit_replay import price_formal_entry, replay_adaptive_exit, simulate_entry_execution
 from backend.app.services.t1_overnight_selection_service import _adaptive_exit_enabled_for_run
 
 
@@ -78,6 +78,31 @@ class T1ExitReplayTest(unittest.TestCase):
         self.assertEqual(result["status"], "executed_from_minute")
         self.assertEqual(result["filledQuantity"], 300)
         self.assertEqual({item["priceSource"] for item in result["fills"]}, {"minute_vwap"})
+
+    def test_participation_accumulates_volume_before_rounding_to_board_lots(self):
+        rows = [bar("2026-10-13", f"14:{minute:02d}", 100, volume=5000) for minute in range(41, 45)]
+        result = simulate_entry_execution(
+            series=rows,
+            recommendation_date="2026-10-13",
+            signal_published_at="2026-10-13T14:40:00",
+            reference_price=100,
+            profile=PROFILE,
+        )
+        self.assertEqual(result["status"], "partial_execution")
+        self.assertEqual(result["filledQuantity"], 100)
+
+    def test_formal_entry_uses_first_complete_bar_without_capital_or_quantity(self):
+        result = price_formal_entry(
+            series=[bar("2026-10-13", "14:41", 400, volume=1), bar("2026-10-13", "14:42", 401, volume=1)],
+            recommendation_date="2026-10-13",
+            signal_published_at="2026-10-13T14:40:30",
+            reference_price=400,
+            profile=PROFILE,
+        )
+        self.assertEqual(result["status"], "formal_entry_priced")
+        self.assertEqual(result["entryTime"], "2026-10-13T14:42:00")
+        self.assertEqual(result["quantityModel"], "unit_return_no_notional")
+        self.assertNotIn("targetQuantity", result)
 
     def test_strong_open_splits_exit_without_future_branch_selection(self):
         entry = self._entry()

@@ -10,8 +10,9 @@ from collections import Counter
 from typing import Any
 
 from backend.app.engines.filter_engine import tradeability
+from backend.app.engines.t1_selection_policy import quote_score, provenance
 
-VERSION = "2026-10-09.stratified.v1"
+VERSION = "2026-10-16.stratified.v2"
 GROUPS = ("core", "single", "boundary", "coverage", "explore")
 ROUND_QUOTAS = ({"core": 45, "single": 15, "boundary": 10, "coverage": 7, "explore": 3},
                 {"core": 10, "single": 5, "boundary": 10, "coverage": 8, "explore": 7})
@@ -30,16 +31,21 @@ def preliminary_candidate(stock: Any, identity: dict | None = None) -> dict:
     strength = max(0, min(100, stock.rel_strength))
     risk = min(100, len(stock.risk_flags) * 12 + max(0, stock.change - 6) * 8
                + max(0, stock.turnover - 12) * 3 + (30 if stock.limit_status in {"limit_up", "one_word_limit_up"} else 0))
-    score = round(max(0, liquidity * .25 + momentum * .25 + activity * .2 + strength * .3 - risk * .2), 4)
+    score, features = quote_score(stock)
+    liquidity, activity, risk = features["liquidity"], features["activity"], features["risk"]
     types = []
     if strength >= 80:
         types.append("relative_strength_leader")
-    if stock.volume_ratio >= 1.6 or stock.amount_factor >= 1.55:
+    if liquidity >= 60:
         types.append("high_volume_attention")
     if stock.change >= 7:
         types.append("limit_up_candidate")
     if 0 <= stock.change <= 4 and activity >= 40:
-        types.append("low_reversal_intraday")
+        types.append("recovery_clue")
+    if getattr(stock, "high", None) and stock.high > 0 and stock.price >= stock.high * .995:
+        types.append("near_high_clue")
+    if getattr(stock, "open", None) and stock.open > 0 and stock.price >= stock.open and stock.change <= 4:
+        types.append("support_clue")
     if risk >= 45:
         types.append("risk_high_but_active")
     types = types or ["quote_momentum"]
@@ -58,6 +64,8 @@ def preliminary_candidate(stock: Any, identity: dict | None = None) -> dict:
         "priceBasis": "unadjusted", "quoteAsOfTime": getattr(stock, "quote_time", ""),
         "quoteTradeDate": getattr(stock, "trade_date", ""),
         "allocationVersion": VERSION,
+        "amount": amount, "featureProvenance": provenance(stock),
+        "recallStage": "quote_clue_only", "setupStatus": "pending",
     }
 
 
@@ -106,18 +114,32 @@ def allocate_round(candidates: list[dict], round_number: int, seed: str,
             industry_scores.setdefault(item.get("industry"), []).append(observed.get("verifiedScore", 0))
         disagreement[item.get("industry")] += abs(observed.get("scoreDisagreement", 0))
     industry_strength = {key: sum(values) / len(values) for key, values in industry_scores.items()}
+    # Quote clues are hypotheses. Round-one failures/confirmed setups guide which
+    # hypotheses deserve the remaining budget; never pretend a quote is a setup.
+    clue_failures, confirmed = Counter(), Counter()
+    for item in previous:
+        observed = evidence.get(item["code"]) or {}
+        if observed.get("qualityEligible") and observed.get("setupEligible") is False:
+            clue_failures.update(item.get("recallReasons") or [])
+        confirmed.update(observed.get("confirmedTypes") or [])
+    related = {"near_high_clue": "breakout_hold", "support_clue": "vwap_support",
+               "recovery_clue": "low_reversal_intraday", "relative_strength_leader": "relative_strength_leader"}
+    def opportunity_key(item):
+        clues = item.get("recallReasons") or []
+        return (sum(clue_failures[c] for c in clues),
+                min((confirmed[related[c]] for c in clues if c in related), default=999)) if round_number == 2 else (0, 0)
     hash_key = lambda x: hashlib.sha256(f"{seed}:{x['code']}".encode()).hexdigest()
     queues = {
         "core": sorted(remaining, key=lambda x: (failed_industries[x.get("industry")] if round_number == 2 else 0,
                                                   -industry_strength.get(x.get("industry"), 0) if round_number == 2 else 0,
-                                                  x["preliminaryScoreRank"])),
+                                                  opportunity_key(x), x["preliminaryScoreRank"])),
         "single": sorted(remaining, key=lambda x: (-max(x["cheapFeatures"][k] for k in
-                           ("momentum", "activity", "relativeStrength")), x["preliminaryScoreRank"])),
+                           ("liquidity", "relativeStrength")), x["preliminaryScoreRank"])),
         "boundary": sorted(remaining, key=lambda x: (-disagreement[x.get("industry")] if round_number == 2 else 0,
-                                                      -abs(x["cheapFeatures"]["momentum"] - x["cheapFeatures"]["relativeStrength"]),
+                                                      -abs(x["cheapFeatures"]["liquidity"] - x["cheapFeatures"]["relativeStrength"]),
                                                       abs(x["preliminaryScoreRank"] - 120), x["code"])),
         "coverage": sorted(remaining, key=lambda x: (not bool(x.get("industry")), industries[x.get("industry")],
-                                                       x["preliminaryScoreRank"])),
+                                                       opportunity_key(x), x["preliminaryScoreRank"])),
         "explore": [],
     }
     # Freeze ten deterministic exploration positions across four rank bands (4/3/2/1).
@@ -132,7 +154,7 @@ def allocate_round(candidates: list[dict], round_number: int, seed: str,
     for group in GROUPS:
         queue = queues[group]
         if group == "coverage":
-            queue = sorted(queue, key=lambda x: (not bool(x.get("industry")), industries[x.get("industry")], x["preliminaryScoreRank"]))
+            queue = sorted(queue, key=lambda x: (not bool(x.get("industry")), industries[x.get("industry")], opportunity_key(x), x["preliminaryScoreRank"]))
         target = min(quota[group], max_count - len(allocated))
         for relax in (False, True):
             for item in queue:
@@ -155,6 +177,8 @@ def allocate_round(candidates: list[dict], round_number: int, seed: str,
                 result = dict(item, primaryGroup=group, groupTags=[group], allocationRound=round_number,
                               allocationPriority=len(previous) + len(allocated) + 1,
                               allocationReason=f"{group}:round{round_number}" + (":real_score_gate_feedback" if round_number == 2 else ""),
+                              opportunityFeedback={"clueFailureCount": opportunity_key(item)[0],
+                                  "confirmedOpportunityCounts": dict(confirmed)} if round_number == 2 else {},
                               relaxationReason=",".join(violations), minute15mStatus="planned")
                 allocated.append(result)
                 used.add(item["code"])
@@ -214,9 +238,13 @@ def select_tail_codes(pool: list[dict], semifinal: list[dict], limit: int = 30) 
               (sorted(ranked, key=lambda x: (abs(((x.get("t1Dimensions") or {}).get("intradayStructure") or 0) - 50), x["code"])), 5),
               (sorted(ranked, key=lambda x: (x.get("industry", ""), x["code"])), 3),
               ([x for x in ranked if x.get("primaryGroup") == "explore"], 2)]
-    result = []
+    # All semifinal candidates precede optional representatives, including when there are >15.
+    result = list(dict.fromkeys(x["code"] for x in sorted(semifinal,
+        key=lambda x: (-float(x.get("t1Score") or 0), x["code"]))))[:limit]
     for queue, quota in queues:
         count = 0
+        if len(result) >= limit:
+            break
         for item in queue:
             if item["code"] in result:
                 continue

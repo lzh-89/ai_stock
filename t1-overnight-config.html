@@ -172,6 +172,35 @@
         </div>
       </section>
 
+      <section class="panel governance-panel" data-t1-scope="config">
+        <div class="panel-head governance-head">
+          <div>
+            <span>V3 人工晋级</span>
+            <h2>正式策略切换</h2>
+          </div>
+          <a class="secondary-button" href="./t1-overnight-review.html">查看冻结评审报告</a>
+        </div>
+        <p class="config-help">这里确认的是整套 V3 策略从影子切换为正式，不是人工挑选某只股票。任何操作只影响计划生效日之后新建的 Run，不改写历史。</p>
+        <div id="strategyDeploymentSummary" class="governance-summary"><div class="governance-loading">正在加载正式策略切换状态...</div></div>
+        <div class="governance-columns">
+          <div class="governance-block">
+            <div class="governance-block-head"><h3>晋级条件</h3><span>全部满足才可批准</span></div>
+            <div id="strategyDeploymentBlockers" class="governance-list"></div>
+          </div>
+          <div class="governance-block">
+            <div class="governance-block-head"><h3>部署记录</h3><span>只追加、可追溯</span></div>
+            <div id="strategyDeploymentEvents" class="governance-list"></div>
+          </div>
+        </div>
+        <div class="governance-actions">
+          <button id="deploymentObserveButton" class="secondary-button" type="button">继续观察</button>
+          <button id="deploymentRejectButton" class="secondary-button" type="button">拒绝本次晋级</button>
+          <button id="deploymentApproveButton" class="primary-button" type="button" disabled>批准 V3 转为正式策略</button>
+          <button id="deploymentCancelButton" class="secondary-button" type="button" hidden>撤销待生效切换</button>
+          <button id="deploymentRollbackButton" class="danger-button" type="button" hidden>退回上一正式策略</button>
+        </div>
+      </section>
+
       <details id="advancedGovernance" class="advanced-governance" data-t1-scope="config">
         <summary>高级治理与测算设置</summary>
         <p>以下参数用于研究、复盘和系统维护。普通使用不需要调整；保存后只影响新的 Run，不改写历史。</p>

@@ -20,7 +20,7 @@ from backend.app.schema import RawStock
 from backend.app.services.t1_candidate_tracking_service import CandidateTrackingService, candidate_metric
 from backend.app.services import t1_overnight_selection_service as selection
 from backend.app.settings import Settings
-from backend.app.t1_candidate_store import CandidateStore
+from backend.app.t1_candidate_store import CandidateStore, v3_candidate_review
 
 
 def stock(i):
@@ -209,6 +209,200 @@ class ArchiveTrackingTest(unittest.TestCase):
         self.assertEqual(groups["requested120"]["total"], 1)
         self.assertEqual(groups["available15m"]["total"], 0)
 
+    def test_T1_RV_003_uses_distinct_allocation_request_availability_and_quality_denominators(self):
+        candidates = pool(10)
+        run_id = self.run_archive(candidates)
+        updates = []
+        for index, candidate in enumerate(candidates[:4]):
+            updates.append(dict(
+                code=candidate["code"], allocationRound=1, minute15mRequested=index < 3,
+                minute15mAvailable=index < 2, minute15mStatus="available" if index < 2 else "failed",
+                qualityEligible=index == 0,
+            ))
+        self.store.update(run_id, updates, "15m_result")
+        tracking = CandidateTrackingService(self.db, provider=SimpleNamespace(fetch=lambda *args: ({}, {})))
+        group = {item["group"]: item for item in tracking.summary(run_id)["groups"]}["all500"]
+        self.assertEqual(group["allocationCoveragePct"], 40)
+        self.assertEqual(group["requestCompletionPct"], 75)
+        self.assertAlmostEqual(group["dataAvailabilityPct"], 2 / 3 * 100)
+        self.assertEqual(group["dataQualityPassPct"], 50)
+
+    def test_T1_RV_001_and_002_terminal_stage_is_unique_and_identity_is_separate(self):
+        candidates = pool(4)
+        run_id = self.run_archive(candidates)
+        self.store.update(run_id, [
+            dict(code=candidates[0]["code"], allocationRound=0),
+            dict(code=candidates[1]["code"], allocationRound=1, minute15mRequested=True,
+                 minute15mAvailable=True, minute15mStatus="available", qualityEligible=True,
+                 setupEligible=False, setupEvidence={"reasons": ["形态未确认"]}),
+            dict(code=candidates[2]["code"], allocationRound=1, minute15mRequested=True,
+                 minute15mAvailable=True, minute15mStatus="available", qualityEligible=True,
+                 setupEligible=True, semifinalSelected=True, formalEligible=True, ruleShadowSelected=True),
+            dict(code=candidates[3]["code"], allocationRound=1, minute15mRequested=True,
+                 minute15mAvailable=True, minute15mStatus="available", qualityEligible=True,
+                 setupEligible=True, semifinalSelected=True, formalEligible=True, officialSelected=True),
+        ], "decision")
+        items = {item["code"]: item for item in self.store.all(run_id)}
+        self.assertEqual(items[candidates[0]["code"]]["terminalStage"], "legacy_validation_not_allocated")
+        self.assertEqual(items[candidates[1]["code"]]["terminalStage"], "legacy_setup_rejected")
+        self.assertEqual(items[candidates[2]["code"]]["terminalStage"], "legacy_final_not_selected")
+        self.assertIn("rule_shadow", items[candidates[2]["code"]]["identityTags"])
+        self.assertEqual(items[candidates[3]["code"]]["terminalStage"], "legacy_official_selected")
+        self.assertEqual(self.store.page(run_id, stage="legacy_setup_rejected")["total"], 1)
+        self.assertEqual(self.store.page(run_id, identity="rule_shadow")["total"], 1)
+
+    def test_v3_full_market_facts_expand_tracking_without_corrupting_coverage(self):
+        candidates = pool(10)
+        run_id = self.run_archive(candidates[:3])
+        facts = [
+            {
+                **item,
+                "hardFilterStatus": "eligible",
+                "formalTradeabilityEligible": True,
+                "v3RecallRank": index + 1 if index < 5 else None,
+                "v3ValidationRank": index + 1 if index < 2 else None,
+            }
+            for index, item in enumerate(candidates)
+        ]
+        self.store.freeze_v3_facts(run_id, "2026-10-09", facts)
+        tracking = CandidateTrackingService(self.db, provider=SimpleNamespace(fetch=lambda target, codes, deadline: ({code: bar(code, target) for code in codes}, {})))
+        job = tracking.ensure_job(run_id)
+        self.assertEqual(job["expected_count"], 10)
+        tracking.tick(datetime(2026, 10, 12, 15, 10))
+        summary = tracking.summary(run_id)
+        self.assertEqual(summary["coveragePct"], 100)
+        self.assertEqual(summary["v3"]["fullMarketFactCount"], 10)
+        self.assertEqual(summary["top10Coverage"]["close"]["sourcePool"], "v3_full_market_facts")
+        self.assertTrue(summary["missedOpportunities"])
+        self.assertTrue(all(item["closeProxyReturnPct"] > 0 for item in summary["missedOpportunities"]))
+        self.assertIn("收盘代理收益大于 0", summary["leaderDefinition"])
+        groups = {item["stage"]: item for item in summary["v3"]["groups"]}
+        self.assertEqual(groups["recall500"]["total"], 5)
+        self.assertEqual(groups["validation120"]["total"], 2)
+
+    def test_T1_RV_004_005_006_classifies_leaders_and_persists_elimination_stage(self):
+        candidates = pool(7)
+        run_id = self.run_archive(candidates[:3])
+        facts = []
+        for index, item in enumerate(candidates):
+            fact = {
+                **item,
+                "hardFilterStatus": "eligible",
+                "formalTradeabilityEligible": index != 2,
+                "v3RecallRank": index + 1 if index < 6 else None,
+                "v3ValidationRank": index + 1 if index < 2 else None,
+                "cheapFeatures": {**(item.get("cheapFeatures") or {}), "risk": 55 if index == 3 else 10},
+            }
+            if index < 2:
+                fact.update(minute15mStatus="available", dataEligible=True,
+                            netExpectationEstimate={"rankingEligible": False})
+            facts.append(fact)
+        self.store.freeze_v3_facts(run_id, "2026-10-09", facts)
+        def fetch(target, codes, deadline):
+            result = {}
+            for index, code in enumerate(codes):
+                row = bar(code, target)
+                if code == candidates[4]["code"]:
+                    row.update(open=9.8, close=10.7, high=10.9)
+                result[code] = row
+            return result, {}
+        tracking = CandidateTrackingService(self.db, provider=SimpleNamespace(fetch=fetch))
+        tracking.tick(datetime(2026, 10, 12, 15, 10))
+        summary = tracking.summary(run_id)
+        self.assertTrue(summary["v3"]["recorded"])
+        cases = {item["code"]: item for item in summary["leaderCases"]}
+        self.assertEqual(cases[candidates[2]["code"]]["leaderBusinessConclusion"], "hard_to_buy")
+        self.assertEqual(cases[candidates[3]["code"]]["leaderBusinessConclusion"], "high_risk")
+        self.assertEqual(cases[candidates[4]["code"]]["leaderBusinessConclusion"], "normal_tradeable_miss")
+        self.assertIn("intraday_close_leader", cases[candidates[4]["code"]]["leaderPerformanceTags"])
+        self.assertEqual(cases[candidates[2]["code"]]["terminalStage"], "validation_not_allocated")
+        self.assertEqual(cases[candidates[6]["code"]]["terminalStage"], "pool_not_recalled")
+        self.assertEqual(len(self.store.review_facts(run_id)), 7)
+
+    def test_T1_RV_005_missing_tradeability_or_risk_stays_unknown(self):
+        candidates = pool(2)
+        run_id = self.run_archive(candidates[:1])
+        facts = [{
+            **item,
+            "hardFilterStatus": "eligible",
+            "v3RecallRank": index + 1,
+            "v3ValidationRank": None,
+        } for index, item in enumerate(candidates)]
+        for fact in facts:
+            fact.pop("formalTradeabilityEligible", None)
+            fact.pop("cheapFeatures", None)
+            fact.pop("riskFlags", None)
+        self.store.freeze_v3_facts(run_id, "2026-10-09", facts)
+        tracking = CandidateTrackingService(
+            self.db,
+            provider=SimpleNamespace(fetch=lambda target, codes, deadline: (
+                {code: bar(code, target) for code in codes}, {}
+            )),
+        )
+        tracking.tick(datetime(2026, 10, 12, 15, 10))
+        summary = tracking.summary(run_id)
+        self.assertTrue(summary["leaderCases"])
+        self.assertTrue(all(item["leaderBusinessConclusion"] == "tradeability_unknown"
+                            for item in summary["leaderCases"]))
+
+    def test_T1_RV_002_candidate_detail_exposes_review_version_and_rebuild_time(self):
+        candidates = pool(1)
+        run_id = self.run_archive(candidates)
+        tracking = CandidateTrackingService(self.db)
+        tracking.summary(run_id)
+        detail = self.store.detail(run_id, candidates[0]["code"])["candidate"]
+        self.assertEqual(detail["reviewSchemaVersion"], "2026-11-07.v1")
+        self.assertTrue(detail["reviewComputedAt"])
+
+    def test_T1_RV_002_v3_terminal_stages_are_mutually_exclusive(self):
+        base = {
+            "hardFilterStatus": "eligible", "v3RecallRank": 1, "v3ValidationRank": 1,
+            "minute15mStatus": "available", "dataEligible": True,
+            "netExpectationEstimate": {"rankingEligible": True, "conservativeScorePct": 1},
+            "v3TailRank": 1, "minute1mStatus": "available", "v3TailGate": {},
+            "formalTradeabilityEligible": True, "terminalStage": "shortlist_not_portfolio",
+        }
+        cases = [
+            ({"hardFilterStatus": "rejected"}, "hard_filter_rejected"),
+            ({"v3RecallRank": None}, "pool_not_recalled"),
+            ({"v3ValidationRank": None}, "validation_not_allocated"),
+            ({"minute15mStatus": "failed"}, "minute15m_technical_failure"),
+            ({"minute15mStatus": "quality_rejected"}, "minute15m_quality_rejected"),
+            ({"netExpectationEstimate": {"rankingEligible": False}}, "model_observation_only"),
+            ({"v3TailRank": None}, "tail_not_allocated"),
+            ({"minute1mStatus": "failed"}, "minute1m_technical_failure"),
+            ({"v3TailGate": {"tailNegative": True}}, "tail_negative_rejected"),
+            ({"eventRiskHardBlocked": True}, "event_risk_rejected"),
+            ({"netExpectationEstimate": {"rankingEligible": True, "conservativeScorePct": 0}}, "non_positive_expectation"),
+            ({"formalTradeabilityEligible": False}, "tradeability_rejected"),
+            ({}, "shortlist_not_portfolio"),
+            ({"terminalStage": "v3_shadow_selected"}, "v3_shadow_selected"),
+        ]
+        for changes, expected in cases:
+            with self.subTest(expected=expected):
+                item = copy.deepcopy(base)
+                item.update(changes)
+                review = v3_candidate_review(item)
+                self.assertEqual(review["terminalStage"], expected)
+                self.assertTrue(review["terminalReason"])
+                self.assertTrue(review["terminalRuleVersion"])
+
+    def test_T1_RV_007_review_rebuild_is_idempotent(self):
+        run_id = self.run_archive(pool(3))
+        tracking = CandidateTrackingService(self.db)
+        first = tracking.rebuild_review_facts(run_id)
+        first_hashes = [item["reviewInputHash"] for item in self.store.review_facts(run_id)]
+        second = tracking.rebuild_review_facts(run_id)
+        second_hashes = [item["reviewInputHash"] for item in self.store.review_facts(run_id)]
+        self.assertEqual(first["factCount"], second["factCount"])
+        self.assertEqual(first_hashes, second_hashes)
+
+    def test_T1_RV_004_old_run_does_not_fabricate_v3_zero_stages(self):
+        run_id = self.run_archive(pool(5))
+        summary = CandidateTrackingService(self.db).summary(run_id)
+        self.assertFalse(summary["v3"]["recorded"])
+        self.assertEqual(summary["v3"]["groups"], [])
+
     def test_provisional_date_does_not_skip_and_expires(self):
         self.db.set_app_setting("t1_tracking_exchange_calendar", {})
         run_id = self.run_archive(pool(5))
@@ -301,8 +495,10 @@ class ArchiveTrackingTest(unittest.TestCase):
         self.db.upsert_t1_overnight_selection_items(run_id, [pick], "semifinal")
         self.db.update_t1_overnight_selection_run(run_id, dict(batchSize=80, batchPick=8, finalLimit=3,
             completedBatchCount=1, batchSummary=[dict(batchIndex=1,candidateCount=80,pickCount=1,picks=[pick])],
-            request=dict(poolSize=500,poolCandidateCodes=[x["code"] for x in candidates],selectionCandidateCodes=[x["code"] for x in candidates]),
-            market=dict(marketContext={},dataQualityStats={},validationAllocation={"version":"frozen"}), evidenceRunId=1))
+            request=dict(selectionPolicyVersion=selection.selection_policy.VERSION, poolSize=500,poolCandidateCodes=[x["code"] for x in candidates],selectionCandidateCodes=[x["code"] for x in candidates]),
+            actualSource="sina",
+            market=dict(marketContext={},dataQualityStats={},validationAllocation={"version":"frozen"},
+                        marketSnapshotFreeze={"snapshotDecisionUsable": True}), evidenceRunId=1))
         service._load_market_data_for_t1 = Mock(side_effect=AssertionError("resume must use checkpoint"))
         calls=[]
         def ai(chunk, market, limit, stage, batch_index):

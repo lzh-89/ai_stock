@@ -84,22 +84,28 @@ class T1EntryExecutionEvidenceTest(unittest.TestCase):
         )
         return run_id
 
-    def test_freezes_first_post_publish_minute_and_ignores_pre_signal_row(self):
+    def test_keeps_collecting_post_publish_minutes_until_deadline(self):
         run_id = self._run()
         jobs = self.service.register_today_jobs(self.clock())
         self.assertEqual([item["runId"] for item in jobs], [run_id])
         self.provider.rows["000001"] = [
             {"time": "2026-10-14 14:40", "open": 9.9, "close": 10.0, "volume": 1000},
             {"time": "2026-10-14 14:42", "open": 10.1, "close": 10.2, "volume": 1200},
+            {"time": "2026-10-14 14:43", "open": 10.2, "close": 10.3, "volume": 1400},
         ]
         self.clock.value = datetime.fromisoformat("2026-10-14T14:43:10")
+        first = self.service.run_due(now=self.clock())
+        self.assertEqual(first["processed"][0]["status"], "retry_wait")
+        self.assertEqual(self.database.load_t1_entry_execution_snapshots(run_id), {})
+
+        self.clock.value = datetime.fromisoformat("2026-10-14T14:56:31")
         result = self.service.run_due(now=self.clock())
         self.assertEqual(result["processed"][0]["status"], "done")
         snapshot = self.database.load_t1_entry_execution_snapshots(run_id)["000001"]
         self.assertTrue(snapshot["decisionEligible"])
         self.assertEqual(snapshot["entryTime"], "14:42")
         self.assertEqual(snapshot["price"], 10.1)
-        self.assertEqual(len(snapshot["series"]), 1)
+        self.assertEqual(len(snapshot["series"]), 2)
 
     def test_missing_minute_retries_then_succeeds_before_deadline(self):
         run_id = self._run()
@@ -114,7 +120,11 @@ class T1EntryExecutionEvidenceTest(unittest.TestCase):
         ]
         self.clock.value = datetime.fromisoformat("2026-10-14T14:44:00")
         second = self.service.run_due(now=self.clock())
-        self.assertEqual(second["processed"][0]["status"], "done")
+        self.assertEqual(second["processed"][0]["status"], "retry_wait")
+        self.assertEqual(self.database.load_t1_entry_execution_snapshots(run_id), {})
+        self.clock.value = datetime.fromisoformat("2026-10-14T14:56:31")
+        final = self.service.run_due(now=self.clock())
+        self.assertEqual(final["processed"][0]["status"], "done")
         self.assertTrue(self.database.load_t1_entry_execution_snapshots(run_id)["000001"]["decisionEligible"])
 
     def test_deadline_persists_auditable_unavailable_result(self):
@@ -137,7 +147,7 @@ class T1EntryExecutionEvidenceTest(unittest.TestCase):
         self.provider.rows["000001"] = [
             {"time": "2026-10-14 14:42", "open": 10.1, "close": 10.2, "volume": 1200}
         ]
-        self.clock.value = datetime.fromisoformat("2026-10-14T14:43:10")
+        self.clock.value = datetime.fromisoformat("2026-10-14T14:56:31")
         self.service.run_due(now=self.clock())
         snapshot = self.database.load_t1_entry_execution_snapshots(run_id)["000001"]
         self.assertEqual(snapshot["evidenceVersion"], ENTRY_EXECUTION_EVIDENCE_VERSION)

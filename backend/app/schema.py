@@ -45,6 +45,7 @@ class RawStock:
     trade_date: str = ""
     quote_time: str = ""
     price_basis: str = "unadjusted"
+    feature_provenance: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
